@@ -1,0 +1,1790 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 7 · Modern LLM Architectures</title>
+<meta name="volume" content="Volume 7 · Modern LLM Architectures">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 7</p>
+  <h1 class="no-toc">Modern LLM Architectures</h1>
+  <p class="tp-subtitle">Efficient Attention, Mixture of Experts and Long Context</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Understand and implement the architectural changes that separate a 2025 LLM from the 2017 Transformer built in Volume 4.</li>
+  <li>For each change, know the cost it removes (training FLOPs, inference memory, bandwidth, context length) and the cost it adds (quality, complexity, communication, tuning).</li>
+  <li>Implement every core mechanism in PyTorch or NumPy with a parity check against a reference: GQA, MLA, MoE, sliding-window attention, RoPE scaling, linear attention, a selective scan, multi-token prediction.</li>
+  <li>Read modern technical reports (Llama, Mixtral, DeepSeek, Qwen) with a disciplined separation of documented fact from inference and marketing.</li>
+  <li>Extend <code>forge.nn</code> with GQA/MLA, MoE, sliding-window attention, RoPE scaling and related blocks.</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>Volume 2 (attention, RoPE, the decoder block / <code>forge.nn</code>), Volume 4 (the from-scratch GPT and its training loop) and Volume 6 (parallelism, memory arithmetic).</li>
+  <li>You can read <code>einsum</code> and reason about tensor shapes without help.</li>
+</ul>
+
+<p class="facet">How to read the code</p>
+<ul>
+  <li>Every listing was executed on an Apple silicon laptop (CPU only; Python 3.12, PyTorch 2.10, NumPy 2.3, Transformers 5.6). Printed output is real.</li>
+  <li>Listings extend <code>src/forge/nn/</code>; parity tests against references stay mandatory.</li>
+  <li>The only model weights used are the cached open-weight <code>HuggingFaceTB/SmolLM2-135M</code> from Volume 1, for the attention-sink experiment in Chapter 4.</li>
+  <li>Toy runs illustrate mechanisms. They are not evidence about behaviour at scale; where scale matters, the chapter cites the paper that measured it.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1  Why architectures change   decode is memory-bound; the KV cache dominates
+Chapter 2  MQA, GQA, MLA              fewer or compressed KV heads
+Chapter 3  Mixture of experts         more parameters, same FLOPs per token
+Chapter 4  Sparse and local attention sliding windows, sinks, interleaved layers
+Chapter 5  Long context               PI, NTK, YaRN; needle tests; lost in the middle
+Chapter 6  Linear attention and SSMs  constant-size state; selective scan; hybrids
+Chapter 7  Other objectives           multi-token prediction, FIM, prefix LM
+Chapter 8  Reading model reports      documented vs inferred vs marketing</pre>
+<figcaption>Map of Volume 7.</figcaption>
+</figure>
+
+<pre class="mermaid">flowchart TD
+  A[2017 decoder: MHA + dense FFN + learned or sinusoidal positions] --> B[RoPE + RMSNorm + SwiGLU]
+  B --> C[KV pressure: MQA / GQA]
+  C --> D[MLA: latent KV]
+  B --> E[Sparse FFN: MoE]
+  E --> F[Fine-grained + shared experts]
+  B --> G[Local attention + sinks]
+  B --> H[RoPE scaling: PI / NTK / YaRN]
+  B --> I[Linear attention / SSM hybrids]
+  B --> J[Objectives: MTP, FIM]</pre>
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="why-change">Why Architectures Keep Changing</h2>
+<p class="chapter-lede">The 2017 Transformer was designed for training throughput on 512-token
+translation pairs. Today's models serve millions of users with 128K-token contexts, and most of
+their lifetime cost is inference. Nearly every architectural change in this volume is an answer
+to one question: how do we cut the bytes moved per generated token without losing quality?</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A 7B model with standard multi-head attention (MHA) serving 32 concurrent users at 32K context
+  needs about 550 GB of KV cache, seven H100s' worth of memory, just to remember the conversation.
+  The weights themselves are 15 GB. The model is not compute-bound, it is not even weight-bound:
+  it is bound by its own memory of past tokens.</p>
+</div>
+
+<p class="facet">The design drivers, in order of current importance</p>
+<ul>
+  <li><strong>Decode bandwidth.</strong> Each generated token reads all active weights and the whole KV cache from HBM. Arithmetic intensity is tiny, so tokens per second is set by bytes per step (Volume 1, Chapter 4).</li>
+  <li><strong>KV-cache capacity.</strong> Cache size limits batch size, and batch size sets cost per token. It grows linearly with context and with users.</li>
+  <li><strong>Training FLOPs per quality point.</strong> Mixture of experts adds parameters without adding FLOPs per token.</li>
+  <li><strong>Context length.</strong> Product demand (whole repositories, long documents, agent traces) pushes context from 2K to 128K–1M tokens. Attention is quadratic in prefill and linear per step in decode.</li>
+  <li><strong>Hardware fit.</strong> Features that map onto fused kernels (FlashAttention, grouped GEMMs) win; elegant ideas that do not are ignored.</li>
+</ul>
+
+<h3>Where the Bytes Go During Decode</h3>
+
+<p>The KV-cache size for one sequence is</p>
+<div class="math">\text{KV bytes} = 2 \cdot L \cdot n_{kv} \cdot d_h \cdot T \cdot b</div>
+<ul>
+  <li><span class="math">L</span> layers, <span class="math">n_{kv}</span> key/value heads, <span class="math">d_h</span> head dimension, <span class="math">T</span> tokens, <span class="math">b</span> bytes per element; the 2 counts K and V.</li>
+  <li>Weights are read once per decode step and shared across the batch. The cache is read once per sequence. So the cache share of traffic grows with both batch size and context.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Bytes read from HBM per decode step, and the resulting memory-bound token rate.</figcaption>
+<pre><code># Bytes read from HBM per decode step = weights (once per step) + KV cache (per sequence)
+def step_bytes(params_b, kv_bytes_per_tok, batch, ctx, w_bytes=2):
+    weights = params_b * 1e9 * w_bytes
+    kv = kv_bytes_per_tok * ctx * batch
+    return weights, kv
+
+HBM_BW = 3.35e12      # H100 SXM, bytes/s (spec sheet)
+print("config                      batch  ctx     weights GB  KV GB   KV share  "
+      "tok/s bound")
+for name, kv_tok in (("7B MHA (32 KV heads)", 524288), ("8B GQA-8", 131072)):
+    for batch, ctx in ((1, 4096), (32, 4096), (32, 32768)):
+        w, kv = step_bytes(7.5, kv_tok, batch, ctx)
+        tps = batch * HBM_BW / (w + kv)                    # memory-bound upper bound
+        print(f"{name:27s} {batch:5d} {ctx:6d} {w / 1e9:10.1f} {kv / 1e9:7.1f} "
+              f"{kv / (w + kv):8.0%} {tps:11.0f}")</code></pre>
+</figure>
+<pre class="output">config                      batch  ctx     weights GB  KV GB   KV share  tok/s bound
+7B MHA (32 KV heads)            1   4096       15.0     2.1      13%         195
+7B MHA (32 KV heads)           32   4096       15.0    68.7      82%        1280
+7B MHA (32 KV heads)           32  32768       15.0   549.8      97%         190
+8B GQA-8                        1   4096       15.0     0.5       3%         216
+8B GQA-8                       32   4096       15.0    17.2      53%        3331
+8B GQA-8                       32  32768       15.0   137.4      90%         703</pre>
+
+<ul>
+  <li>At batch 1 the weights dominate: this is the regime where quantising weights (Volume 12) helps most.</li>
+  <li>At serving batch sizes the cache dominates. GQA-8 buys 2.6× throughput at 4K context and 3.7× at 32K with no change to weights.</li>
+  <li>The 550 GB MHA row does not fit on any single node's GPU memory in bf16; the bandwidth bound is academic because the batch cannot be formed at all.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Prefill is compute-bound; decode is memory-bound. Architectures are now designed for decode.</li>
+    <li>Three levers reduce decode bytes: fewer KV bytes per token (MQA, GQA, MLA, quantised cache), fewer cached tokens (sliding windows, SSMs), and fewer active weight bytes per token (MoE).</li>
+    <li>Every lever trades something: quality, training stability, communication, or retrieval ability over long ranges.</li>
+  </ul>
+</aside>
+
+<h3>What Stayed the Same Since Llama</h3>
+<table>
+  <caption>The "Llama recipe" that most 2023–2025 open models share, versus the 2017 Transformer.</caption>
+  <thead><tr><th>Component</th><th>2017 Transformer</th><th>Modern default</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Positions</td><td>Sinusoidal, added</td><td>RoPE on Q and K</td><td>Relative, no learned table, extensible (Chapter 5)</td></tr>
+    <tr><td>Norm</td><td>Post-LayerNorm</td><td>Pre-RMSNorm</td><td>Stable deep training; cheaper</td></tr>
+    <tr><td>FFN</td><td>ReLU MLP</td><td>SwiGLU</td><td>Better loss at equal FLOPs</td></tr>
+    <tr><td>Attention</td><td>MHA</td><td>GQA (or MLA)</td><td>KV cache (Chapter 2)</td></tr>
+    <tr><td>Biases</td><td>Everywhere</td><td>Mostly removed</td><td>Stability, simplicity</td></tr>
+    <tr><td>FFN density</td><td>Dense</td><td>Dense or MoE</td><td>Parameters without FLOPs (Chapter 3)</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>Architecture changes are hard to evaluate. Improvements of 1–2% in loss at small scale can vanish or reverse at large scale. Treat any single-scale ablation, including the ones in this volume, as a hypothesis.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="mqa-gqa-mla">Multi-Query, Grouped-Query and Multi-Head Latent Attention</h2>
+<p class="chapter-lede">The cheapest way to shrink the KV cache is to cache fewer heads. MQA keeps
+one, GQA keeps a few, and MLA keeps a compressed latent from which all heads are reconstructed.
+This chapter implements all three, proves they reduce to MHA where they should, and prices
+them on real model shapes.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>In MHA each of <span class="math">H</span> heads caches its own key and value vectors. Queries
+  need per-head diversity to express different attention patterns, but it is not obvious that keys
+  and values do. If several query heads can share one K/V head, the cache shrinks by the sharing
+  factor while the query side keeps its expressiveness.</p>
+</div>
+
+<p class="facet">Possible solutions and what each does not solve</p>
+<ul>
+  <li><strong>Quantise the cache</strong> (FP8/INT4 KV): 2–4× saving, orthogonal to the rest, but adds error that grows at long context.</li>
+  <li><strong>MQA</strong> <cite>(Shazeer, 2019)</cite>: one shared K/V head. Up to <span class="math">H</span>× saving, measurable quality loss and some training instability.</li>
+  <li><strong>GQA</strong> <cite>(Ainslie et al., 2023)</cite>: <span class="math">G</span> K/V heads, each shared by <span class="math">H/G</span> query heads. Interpolates between MHA and MQA; the default since Llama 2 70B.</li>
+  <li><strong>MLA</strong> <cite>(DeepSeek-AI, 2024, DeepSeek-V2)</cite>: cache a low-rank latent per token; reconstruct per-head K and V. Cache comparable to small-G GQA with quality reported at or above MHA.</li>
+  <li>None of these reduce prefill FLOPs or quadratic attention cost; they target decode memory.</li>
+</ul>
+
+<h3>MHA, MQA and GQA as One Module</h3>
+
+<figure class="diagram">
+<pre class="ascii">MHA  (H=8, G=8)     MQA  (H=8, G=1)     GQA  (H=8, G=2)
+q: 0 1 2 3 4 5 6 7  q: 0 1 2 3 4 5 6 7  q: 0 1 2 3 | 4 5 6 7
+   | | | | | | | |     \ \ \ | / / / /     \ \ | / | \ \ | /
+kv:0 1 2 3 4 5 6 7  kv:        0         kv:    0   |    1
+cache: 8 heads      cache: 1 head       cache: 2 heads</pre>
+<figcaption>Query heads share key/value heads in groups. The cache stores only the KV heads.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption>One attention module covering MHA, MQA and GQA, with a KV cache and two parity checks.</figcaption>
+<pre><code>import torch, torch.nn as nn, torch.nn.functional as F
+
+class GroupedQueryAttention(nn.Module):
+    """n_kv_heads == n_heads -&gt; MHA; n_kv_heads == 1 -&gt; MQA; otherwise GQA."""
+    def __init__(self, d_model, n_heads, n_kv_heads):
+        super().__init__()
+        assert n_heads % n_kv_heads == 0
+        self.h, self.kv, self.dh = n_heads, n_kv_heads, d_model // n_heads
+        self.wq = nn.Linear(d_model, n_heads * self.dh, bias=False)
+        self.wk = nn.Linear(d_model, n_kv_heads * self.dh, bias=False)
+        self.wv = nn.Linear(d_model, n_kv_heads * self.dh, bias=False)
+        self.wo = nn.Linear(n_heads * self.dh, d_model, bias=False)
+
+    def forward(self, x, cache=None):
+        B, T, _ = x.shape
+        q = self.wq(x).view(B, T, self.h, self.dh).transpose(1, 2)   # (B, H, T, dh)
+        k = self.wk(x).view(B, T, self.kv, self.dh).transpose(1, 2)  # (B, KV, T, dh)
+        v = self.wv(x).view(B, T, self.kv, self.dh).transpose(1, 2)
+        if cache is not None:                        # decode: append to cache
+            k = torch.cat([cache[0], k], dim=2)
+            v = torch.cat([cache[1], v], dim=2)
+        new_cache = (k, v)                           # cache stores KV heads only
+        rep = self.h // self.kv                      # expand at compute time
+        k = k.repeat_interleave(rep, dim=1)          # (B, H, S, dh)
+        v = v.repeat_interleave(rep, dim=1)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=cache is None)
+        return self.wo(y.transpose(1, 2).reshape(B, T, -1)), new_cache
+
+torch.manual_seed(0)
+d, H = 256, 8
+x = torch.randn(2, 16, d)
+
+# Parity 1: GQA with n_kv_heads == n_heads is exactly MHA (PyTorch reference)
+gqa = GroupedQueryAttention(d, H, H)
+mha = nn.MultiheadAttention(d, H, bias=False, batch_first=True)
+with torch.no_grad():
+    mha.in_proj_weight.copy_(torch.cat([gqa.wq.weight, gqa.wk.weight, gqa.wv.weight]))
+    mha.out_proj.weight.copy_(gqa.wo.weight)
+mask = torch.triu(torch.ones(16, 16, dtype=torch.bool), 1)
+ref, _ = mha(x, x, x, attn_mask=mask, need_weights=False)
+out, _ = gqa(x)
+print(f"MHA parity   max|diff| = {(out - ref).abs().max():.2e}")
+
+# Parity 2: incremental decoding with cache equals full forward
+for kv in (8, 2, 1):
+    m = GroupedQueryAttention(d, H, kv)
+    full, _ = m(x)
+    _, cache = m(x[:, :15])
+    last, cache = m(x[:, 15:], cache)
+    print(f"kv_heads={kv}  decode parity {(full[:, 15:] - last).abs().max():.2e}"
+          f"  cache k shape {tuple(cache[0].shape)}"
+          f"  params {sum(p.numel() for p in m.parameters()):,}")</code></pre>
+</figure>
+<pre class="output">MHA parity   max|diff| = 0.00e+00
+kv_heads=8  decode parity 5.96e-08  cache k shape (2, 8, 16, 32)  params 262,144
+kv_heads=2  decode parity 1.19e-07  cache k shape (2, 2, 16, 32)  params 163,840
+kv_heads=1  decode parity 8.20e-08  cache k shape (2, 1, 16, 32)  params 147,456</pre>
+
+<ul>
+  <li>With <code>n_kv_heads == n_heads</code> the module is bit-identical to <code>nn.MultiheadAttention</code>: GQA is a strict generalisation.</li>
+  <li>Decode parity confirms the cache is correct for every grouping; the cache tensor has <span class="math">G</span> heads, not <span class="math">H</span>.</li>
+  <li>Parameters drop too (fewer K/V projections). Parameter-matched comparisons usually widen the FFN to compensate.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Implementation Note</span>
+  <ul>
+    <li><code>repeat_interleave</code> materialises the expanded K/V, which costs bandwidth at decode. Production kernels (FlashAttention, FlashInfer, the <code>enable_gqa</code> flag of recent SDPA) index the shared head directly instead.</li>
+    <li>Head ordering matters when loading checkpoints: query head <span class="math">i</span> uses KV head <span class="math">\lfloor i / (H/G) \rfloor</span>. A mismatch between <code>repeat_interleave</code> and <code>repeat</code> silently scrambles groups.</li>
+    <li>With tensor parallelism, <span class="math">G</span> should be divisible by the TP degree, or KV heads get replicated across ranks. This is one reason <span class="math">G = 8</span> is so common: it matches 8-GPU nodes.</li>
+  </ul>
+</aside>
+
+<h3>KV-Cache Memory for Real Model Shapes</h3>
+
+<table>
+  <caption>KV cache per sequence in bf16, computed from published configurations (<code>kvtable.py</code>). MLA rows cache <span class="math">d_c + d_h^R = 512 + 64</span> elements per layer.</caption>
+  <thead><tr><th>Model</th><th>Attention</th><th class="num">Layers</th><th class="num">KV heads × <span class="math">d_h</span></th><th class="num">KiB / token</th><th class="num">GiB @ 8K</th><th class="num">GiB @ 128K</th></tr></thead>
+  <tbody>
+    <tr><td>Llama 2 7B</td><td>MHA</td><td class="num">32</td><td class="num">32 × 128</td><td class="num">512</td><td class="num">4.00</td><td class="num">64.00</td></tr>
+    <tr><td>Falcon 7B</td><td>MQA</td><td class="num">32</td><td class="num">1 × 64</td><td class="num">8</td><td class="num">0.06</td><td class="num">1.00</td></tr>
+    <tr><td>Llama 3 8B / Mistral 7B</td><td>GQA-8</td><td class="num">32</td><td class="num">8 × 128</td><td class="num">128</td><td class="num">1.00</td><td class="num">16.00</td></tr>
+    <tr><td>Llama 2/3 70B</td><td>GQA-8</td><td class="num">80</td><td class="num">8 × 128</td><td class="num">320</td><td class="num">2.50</td><td class="num">40.00</td></tr>
+    <tr><td>DeepSeek-V2 (236B)</td><td>MLA</td><td class="num">60</td><td class="num">latent 576</td><td class="num">68</td><td class="num">0.53</td><td class="num">8.44</td></tr>
+    <tr><td>DeepSeek-V3 (671B)</td><td>MLA</td><td class="num">61</td><td class="num">latent 576</td><td class="num">69</td><td class="num">0.54</td><td class="num">8.58</td></tr>
+    <tr><td>DeepSeek-V2 shape as MHA</td><td>MHA</td><td class="num">60</td><td class="num">128 × (192 K + 128 V)</td><td class="num">4800</td><td class="num">37.50</td><td class="num">600.00</td></tr>
+  </tbody>
+</table>
+
+<pre class="output">model         attn   KiB/token  GiB @8k GiB @128k
+Llama 2 7B    MHA          512     4.00     64.00
+Falcon 7B     MQA            8     0.06      1.00
+Llama 3 8B    GQA-8        128     1.00     16.00
+Mistral 7B    GQA-8        128     1.00     16.00
+Llama 2 70B   GQA-8        320     2.50     40.00
+Llama 3 70B   GQA-8        320     2.50     40.00
+DeepSeek-V2   MLA           68     0.53      8.44
+DeepSeek-V3   MLA           69     0.54      8.58
+DS-V2 as MHA  MHA         4800    37.50    600.00</pre>
+
+<ul>
+  <li>A 671B MLA model caches less per token than Llama 3 8B. That is the headline result of MLA.</li>
+  <li>DeepSeek-V2 reports a 93.3% KV-cache reduction and 5.76× maximum generation throughput relative to DeepSeek 67B <span class="evidence documented">Documented</span> (DeepSeek-AI, 2024, V2 report). The comparison baseline is their own earlier dense model, not a GQA model of equal quality.</li>
+</ul>
+
+<h3>Quality Trade-offs and Uptraining MHA to GQA</h3>
+<ul>
+  <li><strong>MQA</strong> loses quality and can be unstable. Ainslie et al. report MQA below MHA on T5-XXL summarisation and translation benchmarks <span class="evidence documented">Documented</span>.</li>
+  <li><strong>GQA-8</strong> recovers most of the gap: close to MHA quality with inference time close to MQA <span class="evidence documented">Documented</span> (Ainslie et al., 2023).</li>
+  <li><strong>Uptraining</strong>: convert an MHA checkpoint by <em>mean-pooling</em> the K and V projection matrices within each group, then continue pretraining for a small fraction (they use 5%) of the original compute <span class="evidence documented">Documented</span>. Mean-pooling beat picking one head or random initialisation.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Converting MHA weights to GQA by mean-pooling K/V projections within each group (sketch using the module above).</figcaption>
+<pre><code>@torch.no_grad()
+def mha_to_gqa(mha: GroupedQueryAttention, n_kv: int) -&gt; GroupedQueryAttention:
+    H, dh = mha.h, mha.dh
+    g = GroupedQueryAttention(H * dh, H, n_kv)
+    g.wq.weight.copy_(mha.wq.weight); g.wo.weight.copy_(mha.wo.weight)
+    for src, dst in ((mha.wk, g.wk), (mha.wv, g.wv)):
+        w = src.weight.view(n_kv, H // n_kv, dh, -1)      # (G, H/G, dh, d_model)
+        dst.weight.copy_(w.mean(1).reshape(n_kv * dh, -1))
+    return g                                              # then uptrain ~5% of compute
+
+torch.manual_seed(0)
+m = GroupedQueryAttention(256, 8, 8); x = torch.randn(2, 16, 256)
+print((mha_to_gqa(m, 8)(x)[0] - m(x)[0]).abs().max().item())   # G = H: identity
+g = mha_to_gqa(m, 2); print(g(x)[0].shape, tuple(g.wk.weight.shape))</code></pre>
+</figure>
+<pre class="output">0.0
+torch.Size([2, 16, 256]) (64, 256)</pre>
+
+<aside class="callout warning"><span class="title">Warning</span>
+  <ul>
+    <li>A freshly pooled GQA model is noticeably worse than the source until uptrained. Never ship the conversion without the continued-pretraining step and a regression evaluation.</li>
+  </ul>
+</aside>
+
+<h3>Multi-Head Latent Attention</h3>
+
+<h4>The idea: cache a latent, not the heads</h4>
+<ul>
+  <li>GQA shares K/V across heads by a fixed grouping. MLA instead learns a low-rank bottleneck: a per-token latent <span class="math">c^{KV}_t \in \mathbb{R}^{d_c}</span> from which every head's K and V are reconstructed.</li>
+  <li>Only the latent is cached. With <span class="math">d_c \ll 2 H d_h</span> the cache shrinks while each head still gets its own K and V (as a different linear function of the latent).</li>
+</ul>
+
+<div class="math">c^{KV}_t = W^{DKV} h_t, \qquad k^{C}_{t} = W^{UK} c^{KV}_t, \qquad v^{C}_{t} = W^{UV} c^{KV}_t</div>
+
+<ul>
+  <li><span class="math">W^{DKV} \in \mathbb{R}^{d_c \times d}</span> is the down-projection; <span class="math">W^{UK}, W^{UV} \in \mathbb{R}^{H d_h \times d_c}</span> are up-projections.</li>
+  <li><strong>Absorption.</strong> Because <span class="math">q_{t,i}^\top k_{s,i} = q_{t,i}^\top W^{UK}_i c^{KV}_s = (W^{UK\top}_i q_{t,i})^\top c^{KV}_s</span>, the up-projection can be folded into the query side. At decode you never materialise K; you attend directly over the latents. The same trick folds <span class="math">W^{UV}</span> into the output projection.</li>
+  <li><strong>Decoupled RoPE.</strong> RoPE applies a position-dependent rotation between <span class="math">q</span> and <span class="math">k</span>, which breaks absorption (the rotation sits between <span class="math">W^{UK}</span> and the query). DeepSeek-V2 adds a small separate key <span class="math">k^R_t = \mathrm{RoPE}(W^{KR} h_t)</span>, shared across heads, of dimension <span class="math">d^R_h = 64</span>, and concatenates it to each head's content key.</li>
+  <li>Cached per token per layer: <span class="math">d_c + d_h^R = 512 + 64 = 576</span> elements. The report equates this to GQA with 2.25 groups <span class="evidence documented">Documented</span> (DeepSeek-AI, 2024).</li>
+  <li>Queries are also low-rank compressed in DeepSeek-V2 (<span class="math">d_c' = 1536</span>) to save activation memory in training; this does not affect the cache.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Minimal MLA (content path only, no decoupled RoPE): the latent is the cache, and an absorbed decode path attends over latents without materialising K or V.</figcaption>
+<pre><code>class MiniMLA(nn.Module):
+    """Latent KV compression (DeepSeek-V2 style), without the decoupled RoPE path."""
+    def __init__(self, d_model, n_heads, d_latent):
+        super().__init__()
+        self.h, self.dh = n_heads, d_model // n_heads
+        self.wq = nn.Linear(d_model, d_model, bias=False)
+        self.w_dkv = nn.Linear(d_model, d_latent, bias=False)   # down: x -&gt; c_kv
+        self.w_uk = nn.Linear(d_latent, d_model, bias=False)    # up: c_kv -&gt; K
+        self.w_uv = nn.Linear(d_latent, d_model, bias=False)    # up: c_kv -&gt; V
+        self.wo = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x, c_cache=None):
+        B, T, D = x.shape
+        c = self.w_dkv(x)                                        # (B, T, d_latent)
+        if c_cache is not None:
+            c = torch.cat([c_cache, c], dim=1)                   # cache is the latent
+        S = c.shape[1]
+        q = self.wq(x).view(B, T, self.h, self.dh).transpose(1, 2)
+        k = self.w_uk(c).view(B, S, self.h, self.dh).transpose(1, 2)
+        v = self.w_uv(c).view(B, S, self.h, self.dh).transpose(1, 2)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=c_cache is None)
+        return self.wo(y.transpose(1, 2).reshape(B, T, D)), c
+
+    def forward_absorbed(self, x, c_cache):
+        """Decode one token without materialising K: fold W_uk into the query."""
+        B, T, D = x.shape
+        c = torch.cat([c_cache, self.w_dkv(x)], dim=1)           # (B, S, d_latent)
+        q = self.wq(x).view(B, T, self.h, self.dh)               # (B, 1, H, dh)
+        W_uk = self.w_uk.weight.view(self.h, self.dh, -1)        # (H, dh, d_latent)
+        q_lat = torch.einsum("bthd,hdl-&gt;bhtl", q, W_uk)          # (B, H, 1, d_latent)
+        scores = q_lat @ c.unsqueeze(1).transpose(-1, -2) / self.dh**0.5  # (B,H,1,S)
+        ctx_lat = scores.softmax(-1) @ c.unsqueeze(1)            # (B, H, 1, d_latent)
+        W_uv = self.w_uv.weight.view(self.h, self.dh, -1)
+        y = torch.einsum("bhtl,hdl-&gt;bthd", ctx_lat, W_uv).reshape(B, T, D)
+        return self.wo(y), c
+
+torch.manual_seed(0)
+D, H, DL, T = 512, 8, 64, 32
+m = MiniMLA(D, H, DL)
+x = torch.randn(1, T, D)
+full, _ = m(x)
+_, c = m(x[:, :-1])
+step, _ = m(x[:, -1:], c)
+absorbed, _ = m.forward_absorbed(x[:, -1:], c)
+print("naive decode vs full   :", f"{(step - full[:, -1:]).abs().max():.2e}")
+print("absorbed decode vs full:", f"{(absorbed - full[:, -1:]).abs().max():.2e}")
+mha_elems = 2 * D          # K and V for all heads, per token per layer
+print(f"cache per token/layer: MHA {mha_elems} elems, MLA {DL} elems "
+      f"-&gt; {mha_elems / DL:.0f}x smaller")</code></pre>
+</figure>
+<pre class="output">naive decode vs full   : 5.96e-08
+absorbed decode vs full: 5.59e-08
+cache per token/layer: MHA 1024 elems, MLA 64 elems -&gt; 16x smaller</pre>
+
+<ul>
+  <li>The absorbed path gives the same output as full attention while touching only the <span class="math">(S, d_c)</span> latent cache: attention over a 64-dim latent instead of 8 × 64-dim heads.</li>
+  <li>Absorption changes the compute shape: every head now does a <span class="math">d_c</span>-dimensional dot product (512 in DeepSeek-V2, versus <span class="math">d_h = 128</span>). Decode becomes more compute-heavy and less bandwidth-heavy, which suits modern GPUs.</li>
+</ul>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">Advantages</p><ul>
+    <li>Cache near MQA/small-G GQA with per-head K/V diversity.</li>
+    <li>Reported quality on par with or above MHA at DeepSeek scale.</li>
+    <li>Moves decode from bandwidth-bound towards compute-bound.</li>
+  </ul></div>
+  <div class="cons"><p class="facet">Disadvantages</p><ul>
+    <li>Decoupled RoPE adds complexity; naive RoPE breaks absorption.</li>
+    <li>Needs custom kernels (FlashMLA and equivalents) to realise the saving.</li>
+    <li>Cannot be retrofitted cheaply; conversion from GQA requires substantial training.</li>
+  </ul></div>
+</div>
+
+<ul class="failure-modes">
+  <li><strong>Silent head mis-grouping</strong> when loading GQA checkpoints into a different implementation: loss looks plausible but degraded. Test logits against the reference implementation.</li>
+  <li><strong>KV heads not divisible by TP degree:</strong> replication wastes memory and complicates sharding.</li>
+  <li><strong>MLA with RoPE applied to the compressed key:</strong> absorption no longer holds; decode is either wrong or you fall back to materialising K.</li>
+  <li><strong>Reporting cache savings without quality:</strong> an MQA model with 32× less cache and 3 points lower accuracy is not a free win.</li>
+</ul>
+
+<p class="facet">Evaluation</p>
+<ul>
+  <li>Measure KV bytes per token (analytic and <code>torch.cuda.max_memory_allocated</code>), maximum batch at fixed context, and tokens per second at that batch.</li>
+  <li>Quality: held-out loss plus long-context retrieval (Chapter 5), because K/V sharing can hurt precise retrieval before it hurts perplexity.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="moe">Mixture of Experts</h2>
+<p class="chapter-lede">A mixture-of-experts (MoE) layer replaces one dense FFN with many expert
+FFNs and a router that sends each token to a few of them. Parameters, and therefore knowledge
+capacity, grow with the number of experts; FLOPs per token grow only with the number chosen. The
+price is paid in routing instability, load imbalance, memory and communication.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Loss improves with parameters, but in a dense model every parameter is used by every token, so
+  training and inference FLOPs scale with parameter count. We want a model with the capacity of
+  a 670B-parameter network and the per-token compute of a 37B one.</p>
+</div>
+
+<p class="facet">Possible solutions and what each does not solve</p>
+<ul>
+  <li><strong>Bigger dense model:</strong> better quality, linear increase in FLOPs and decode bytes.</li>
+  <li><strong>Sparsely-gated MoE</strong> <cite>(Shazeer et al., 2017)</cite>: conditional computation per token. Does not reduce <em>memory</em>: all experts must be resident somewhere.</li>
+  <li><strong>Top-1 routing</strong> <cite>(Fedus et al., 2021, Switch)</cite>: simplest and cheapest; more sensitive to imbalance.</li>
+  <li><strong>Fine-grained and shared experts</strong> <cite>(Dai et al., 2024, DeepSeekMoE)</cite>: more combinatorial flexibility and a dense path for common knowledge; more routing overhead.</li>
+</ul>
+
+<h3>How a Top-k Router Works</h3>
+
+<div class="math">p(x) = \mathrm{softmax}(W_r x) \in \mathbb{R}^E, \qquad \mathcal{T} = \mathrm{TopK}(p(x), k), \qquad y = \sum_{i \in \mathcal{T}} \frac{p_i(x)}{\sum_{j \in \mathcal{T}} p_j(x)} \, \mathrm{FFN}_i(x)</div>
+
+<ul>
+  <li>The router is a single linear layer; its output is a probability per expert.</li>
+  <li>The gate weights multiply expert outputs, so the router receives gradient only through the selected experts. Unselected experts get no signal for that token: the source of rich-get-richer collapse.</li>
+  <li>Renormalising over the top-k (Mixtral) versus using raw softmax values (Switch with <span class="math">k=1</span>; DeepSeek-V2) is a design choice; both appear in practice.</li>
+  <li>Shazeer et al. 2017 added tunable Gaussian noise to the logits before top-k (noisy top-k gating) to encourage exploration.</li>
+</ul>
+
+<h4>Load balancing: the Switch auxiliary loss</h4>
+
+<div class="math">\mathcal{L}_{\text{aux}} = \alpha \cdot E \cdot \sum_{i=1}^{E} f_i \, P_i, \qquad f_i = \frac{1}{N}\sum_{x} \mathbb{1}[\,i \in \mathcal{T}(x)\,], \qquad P_i = \frac{1}{N}\sum_{x} p_i(x)</div>
+
+<ul>
+  <li><span class="math">f_i</span> is the fraction of tokens dispatched to expert <span class="math">i</span> (not differentiable); <span class="math">P_i</span> is the mean router probability (differentiable). The product lets gradient push probability away from overloaded experts.</li>
+  <li>The loss equals 1 (before <span class="math">\alpha</span>) under perfectly uniform routing, and grows with imbalance. Switch uses <span class="math">\alpha = 10^{-2}</span> <span class="evidence documented">Documented</span> (Fedus et al., 2021).</li>
+  <li>ST-MoE <cite>(Zoph et al., 2022)</cite> adds a <strong>router z-loss</strong>, <span class="math">\frac{1}{N}\sum_x (\log \sum_i e^{z_i(x)})^2</span>, which keeps router logits small and was the main stabiliser in their runs.</li>
+  <li>DeepSeek-V3 replaces most of the auxiliary loss with <strong>auxiliary-loss-free balancing</strong>: a per-expert bias added to the scores for top-k selection only, nudged up or down each step depending on load <span class="evidence documented">Documented</span> (DeepSeek-AI, 2024, V3 report).</li>
+</ul>
+
+<h4>Capacity factor and token dropping</h4>
+<div class="math">C = \left\lfloor \mathrm{CF} \cdot \frac{N \cdot k}{E} \right\rfloor</div>
+<ul>
+  <li>Fixed-shape kernels and all-to-all buffers need a static per-expert size <span class="math">C</span>. Tokens beyond capacity are <strong>dropped</strong>: their MoE output is zero and only the residual connection carries them forward.</li>
+  <li>CF = 1.0 wastes no compute but drops under any imbalance; CF = 1.25–2.0 is common in training. Dropless implementations (MegaBlocks-style block-sparse grouped GEMMs) avoid dropping at the cost of variable shapes.</li>
+  <li>At inference, dropping makes outputs depend on what else is in the batch. Most serving stacks run dropless.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>MoE layer with top-k softmax router, Switch auxiliary loss and capacity-based token dropping, trained on a toy regression task with and without the auxiliary loss.</figcaption>
+<pre><code>import torch, torch.nn as nn, torch.nn.functional as F
+
+class MoE(nn.Module):
+    def __init__(self, d, d_ff, n_experts, top_k=2, capacity_factor=1.25):
+        super().__init__()
+        self.E, self.k, self.cf = n_experts, top_k, capacity_factor
+        self.router = nn.Linear(d, n_experts, bias=False)
+        self.w1 = nn.Parameter(torch.randn(n_experts, d, d_ff) * d**-0.5)
+        self.w2 = nn.Parameter(torch.randn(n_experts, d_ff, d) * d_ff**-0.5)
+
+    def forward(self, x):                                   # x: (N, d) flattened tokens
+        N, d = x.shape
+        probs = self.router(x).softmax(-1)                  # (N, E)
+        gate, idx = probs.topk(self.k, dim=-1)              # (N, k)
+        gate = gate / gate.sum(-1, keepdim=True)            # renormalise over top-k
+        # Switch aux loss: E * sum_i f_i * P_i  (f from hard routing, P from probs)
+        f = F.one_hot(idx, self.E).float().sum(1).mean(0) / self.k   # (E,)
+        P = probs.mean(0)                                            # (E,)
+        aux = self.E * (f * P).sum()
+        # capacity: each expert processes at most C token-slots
+        C = int(self.cf * N * self.k / self.E)
+        flat_e = idx.reshape(-1)                            # (N*k,) slot -&gt; expert
+        onehot = F.one_hot(flat_e, self.E)                  # (N*k, E)
+        pos = (onehot.cumsum(0) - 1)[torch.arange(N * self.k), flat_e]  # queue position
+        keep = pos &lt; C                                      # token dropping
+        out = torch.zeros_like(x)
+        tok = torch.arange(N).repeat_interleave(self.k)
+        g = gate.reshape(-1)
+        for e in range(self.E):
+            sel = (flat_e == e) &amp; keep
+            if sel.any():
+                h = F.gelu(x[tok[sel]] @ self.w1[e]) @ self.w2[e]
+                out.index_add_(0, tok[sel], g[sel, None] * h)
+        stats = dict(load=onehot.sum(0), dropped=(~keep).float().mean().item())
+        return out, aux, stats
+
+def run(aux_coef, steps=300, seed=0):
+    torch.manual_seed(seed)
+    d, E = 32, 8
+    moe = MoE(d, 64, E, top_k=2, capacity_factor=1.25)
+    with torch.no_grad():                    # small initial router skew, as in practice
+        moe.router.weight[0] += 0.3
+    teacher = nn.Sequential(nn.Linear(d, 128), nn.Tanh(), nn.Linear(128, d))
+    opt = torch.optim.Adam(moe.parameters(), lr=3e-3)
+    for step in range(steps):
+        x = torch.randn(512, d) + 0.5   # non-zero-mean activations
+        with torch.no_grad(): y = teacher(x)
+        out, aux, st = moe(x)
+        loss = F.mse_loss(out, y) + aux_coef * aux
+        opt.zero_grad(); loss.backward(); opt.step()
+    x = torch.randn(4096, d) + 0.5
+    with torch.no_grad():
+        out, aux, st = moe(x)
+        mse = F.mse_loss(out, teacher(x)).item()
+    share = st["load"].float() / st["load"].sum()
+    print(f"aux_coef={aux_coef:&lt;5} mse={mse:.4f} aux={aux:.3f} "
+          f"dropped={st['dropped']:.1%}")
+    print("  expert share:", " ".join(f"{s:.2f}" for s in share.tolist()))
+
+run(0.0)
+run(0.01)
+run(0.1)</code></pre>
+</figure>
+<pre class="output">aux_coef=0.0   mse=0.0212 aux=1.401 dropped=24.5%
+  expert share: 0.11 0.23 0.21 0.00 0.22 0.21 0.00 0.02
+aux_coef=0.01  mse=0.0035 aux=0.998 dropped=0.0%
+  expert share: 0.06 0.14 0.12 0.14 0.13 0.14 0.15 0.13
+aux_coef=0.1   mse=0.0041 aux=1.000 dropped=0.0%
+  expert share: 0.12 0.14 0.12 0.12 0.13 0.13 0.13 0.12</pre>
+
+<ul>
+  <li><strong>Without the auxiliary loss</strong> the router collapses: two experts receive no tokens and one receives 2%, four experts are overloaded at ~22% against a capacity of 15.6% (1.25 × 1/8), and 24.5% of token-slots are dropped. MSE is 6× worse because dead experts are wasted parameters and dropped tokens get no FFN.</li>
+  <li><strong>With <span class="math">\alpha = 0.01</span></strong> load is near uniform, the aux term sits at its minimum of 1.0, nothing is dropped and MSE is best.</li>
+  <li><strong>With <span class="math">\alpha = 0.1</span></strong> balance is tighter but MSE is slightly worse: the balance objective starts to fight the task. This is the tuning tension that motivated DeepSeek-V3's loss-free bias approach.</li>
+  <li>The collapse needed two realistic triggers: a small initial skew and non-zero-mean inputs (residual-stream activations are not centred). With zero-mean inputs and no skew, the same toy stayed roughly balanced; collapse is a dynamics problem, not a certainty.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Implementation Note</span>
+  <ul>
+    <li>The Python loop over experts is for clarity. Production code sorts token-slots by expert and runs one grouped GEMM (or a block-sparse kernel) over all experts.</li>
+    <li>Compute the router in float32. Switch Transformer's "selective precision" found bf16 routers unstable <span class="evidence documented">Documented</span> (Fedus et al., 2021).</li>
+    <li>Log per-expert load, dropped fraction and router entropy every step. They are the earliest signal of an unhealthy MoE run.</li>
+  </ul>
+</aside>
+
+<h3>Expert Parallelism and the All-to-All</h3>
+
+<figure class="diagram">
+<pre class="ascii">          GPU 0              GPU 1              GPU 2              GPU 3
+tokens    t0..t255           t256..t511         t512..t767         t768..t1023
+router    route locally      route locally      route locally      route locally
+             \______________ all-to-all DISPATCH (tokens -&gt; expert owner) ______/
+experts   E0, E1             E2, E3             E4, E5             E6, E7
+             /______________ all-to-all COMBINE (outputs -&gt; token owner) _______\
+output    weighted sum       weighted sum       weighted sum       weighted sum</pre>
+<figcaption>Expert parallelism: each GPU owns a subset of experts; two all-to-all exchanges per MoE layer.</figcaption>
+</figure>
+
+<ul>
+  <li>Attention and dense layers run data-parallel (or TP); experts are sharded across the expert-parallel group. GShard <cite>(Lepikhin et al., 2020)</cite> introduced this pattern at 600B parameters.</li>
+  <li>Communication per MoE layer per GPU is about <span class="math">2 \cdot N_{\text{local}} \cdot k \cdot d \cdot b</span> bytes (dispatch plus combine). With <span class="math">k=8</span> and <span class="math">d=7168</span> (DeepSeek-V3 shapes) that is ~230 KB per token per layer in bf16, which is why V3 dispatches in FP8 and limits each token to at most 4 nodes <span class="evidence documented">Documented</span> (V3 report).</li>
+  <li>All-to-all over InfiniBand is much slower than NVLink. Topology-aware routing (node-limited), overlapping communication with computation (DualPipe in V3) and larger micro-batches are the standard mitigations.</li>
+  <li>Load imbalance becomes a <em>latency</em> problem: the all-to-all waits for the slowest GPU. Balance matters for throughput even when nothing is dropped.</li>
+</ul>
+
+<h3>Fine-Grained and Shared Experts</h3>
+<ul>
+  <li><strong>Fine-grained segmentation:</strong> split each expert into <span class="math">m</span> smaller ones and route to <span class="math">mk</span> of them. Same FLOPs and parameters, far more possible expert combinations, so experts can specialise more narrowly <cite>(Dai et al., 2024)</cite>.</li>
+  <li><strong>Shared experts:</strong> one or more experts that every token always uses. They absorb common knowledge (syntax, frequent patterns) so routed experts do not all relearn it.</li>
+  <li>Configurations <span class="evidence documented">Documented</span>: Mixtral 8x7B uses 8 experts, top-2, no shared experts, 47B total / 13B active (Jiang et al., 2024). DeepSeek-V2 uses 2 shared + 160 routed, 6 active, 236B / 21B. DeepSeek-V3 uses 1 shared + 256 routed, 8 active, 671B / 37B.</li>
+  <li>Mixtral's authors found no obvious topic-level specialisation of experts; routing correlated more with syntax and token identity <span class="evidence documented">Documented</span>. Do not assume "the maths expert" exists.</li>
+</ul>
+
+<div class="frame simple"><p class="facet">Simple version</p>
+  <ul><li>Top-2 over 8 experts, Switch aux loss, CF 1.25, all experts on one GPU. Works up to a few billion parameters.</li></ul></div>
+<div class="frame production"><p class="facet">Production version</p>
+  <ul><li>Fine-grained plus shared experts, dropless grouped GEMM, float32 router with z-loss or bias balancing, expert parallelism across nodes with node-limited routing, FP8 dispatch, communication overlapped with compute, per-expert telemetry.</li></ul></div>
+<div class="frame why-complex"><p class="facet">Why it is complicated</p>
+  <ul>
+    <li>Routing is discrete, so balance and quality are coupled through a non-differentiable choice.</li>
+    <li>Serving needs all experts resident: a 671B MoE needs a multi-GPU deployment even though each token touches only 37B parameters. MoE lowers FLOPs per token, not the memory floor.</li>
+    <li>At small batch, each expert sees few tokens, so decode reads many expert weights for little work; MoE's advantage appears at high batch.</li>
+  </ul></div>
+
+<ul class="failure-modes">
+  <li><strong>Router collapse:</strong> a few experts take most tokens; others die. Detect via load entropy; fix with aux loss, z-loss, bias balancing, lower LR on the router.</li>
+  <li><strong>Loss spikes</strong> from exploding router logits in bf16. Use float32 routing and z-loss.</li>
+  <li><strong>Silent token dropping</strong> in evaluation or serving, making outputs batch-dependent. Run dropless at inference.</li>
+  <li><strong>Straggler experts</strong> in expert parallelism: throughput set by the hottest GPU.</li>
+  <li><strong>Fine-tuning instability:</strong> small SFT datasets can unbalance routers trained on trillions of tokens. Freeze the router or keep the aux loss on during fine-tuning.</li>
+</ul>
+
+<p class="facet">Evaluation</p>
+<ul>
+  <li>Compare against a dense model at equal <em>active</em> FLOPs and, separately, equal <em>total</em> parameters; both comparisons are needed to make an honest claim.</li>
+  <li>Track expert load histograms per layer, dropped-token rate, all-to-all time share and tokens per second per GPU.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="sparse-local">Sparse and Local Attention</h2>
+<p class="chapter-lede">Most attention mass in a trained model is local. Restricting each query to
+a window of recent keys bounds the KV cache and makes attention linear in sequence length. The
+catch is that models also depend on a few distant tokens in ways that are not obvious, and
+removing them can destroy the model.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Full causal attention costs <span class="math">O(T^2)</span> in prefill and an unbounded KV
+  cache in decode. For streaming applications (long chats, agents that run for hours) the cache
+  must stop growing. The obvious fix, evicting old tokens, turns out to break models badly.</p>
+</div>
+
+<p class="facet">Possible solutions and what each does not solve</p>
+<ul>
+  <li><strong>Sliding window (local) attention:</strong> each token sees the last <span class="math">W</span> keys. Bounded cache; information beyond <span class="math">W</span> travels only indirectly through layers (receptive field <span class="math">\approx L \cdot W</span>).</li>
+  <li><strong>Dilated and strided patterns</strong> <cite>(Child et al., 2019; Beltagy et al., 2020)</cite>: widen the receptive field at the same cost; irregular memory access, poor kernel support.</li>
+  <li><strong>Block-sparse with global tokens</strong> (Longformer, BigBird): a few tokens attend everywhere; good for encoders and documents, awkward for causal decode.</li>
+  <li><strong>Interleaved local and global layers</strong> (Gemma 2 alternates 1:1; Gemma 3 uses 5 local : 1 global) <span class="evidence documented">Documented</span> (Gemma Team, 2024; 2025): most layers get a small cache; the global layers keep long-range retrieval.</li>
+  <li><strong>Attention sinks</strong> <cite>(Xiao et al., 2023)</cite>: keep the first few tokens in the cache forever. Cheap fix for window eviction; does not restore access to evicted content.</li>
+</ul>
+
+<h3>The Sliding-Window Mask</h3>
+
+<figure class="listing">
+<figcaption>Causal sliding-window mask with optional sink tokens.</figcaption>
+<pre><code>import torch
+def sliding_window_mask(T, window, n_sink=0):
+    i = torch.arange(T)[:, None]                         # query positions
+    j = torch.arange(T)[None, :]                         # key positions
+    causal = j &lt;= i
+    local = (i - j) &lt; window
+    sink = j &lt; n_sink
+    return causal &amp; (local | sink)                       # (T, T) bool, True = attend
+m = sliding_window_mask(10, window=4, n_sink=1)
+for row in m.int().tolist():
+    print(" ".join("x" if v else "." for v in row))
+print("keys per query:", m.sum(1).tolist())</code></pre>
+</figure>
+<pre class="output">x . . . . . . . . .
+x x . . . . . . . .
+x x x . . . . . . .
+x x x x . . . . . .
+x x x x x . . . . .
+x . x x x x . . . .
+x . . x x x x . . .
+x . . . x x x x . .
+x . . . . x x x x .
+x . . . . . x x x x
+keys per query: [1, 2, 3, 4, 5, 5, 5, 5, 5, 5]</pre>
+
+<ul>
+  <li>Cost per query is bounded by <span class="math">W + n_{\text{sink}}</span>. In decode, a <strong>rolling buffer</strong> of size <span class="math">W</span> replaces the growing cache: position <span class="math">t</span> is written to slot <span class="math">t \bmod W</span>. Mistral 7B used <span class="math">W = 4096</span> with a rolling buffer <span class="evidence documented">Documented</span> (Jiang et al., 2023).</li>
+  <li>Never materialise the boolean mask at long context. FlashAttention supports windows natively (<code>window_size=(W-1, 0)</code>); the mask here is for understanding and tests.</li>
+</ul>
+
+<h3>Attention Sinks</h3>
+<ul>
+  <li><strong>Observation</strong> <cite>(Xiao et al., 2023)</cite>: trained LLMs put a large share of attention on the first token(s), regardless of their content. Softmax must sum to 1; when a head has nothing useful to attend to, it parks its mass on a token that every query can see, and the first token is the only such token in causal training.</li>
+  <li><strong>Consequence:</strong> evict the first tokens (plain sliding window over a cache) and the softmax redistributes that mass onto real tokens, corrupting every layer. Perplexity explodes.</li>
+  <li><strong>StreamingLLM fix:</strong> keep 4 initial tokens plus a rolling window. They report stable language modelling up to 4 million tokens and up to 22.2× speed-up over sliding window with recomputation <span class="evidence documented">Documented</span>.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Measuring sinks in a real model (SmolLM2-135M): attention mass on token 0, and perplexity under sliding-window masks with and without sink tokens.</figcaption>
+<pre><code>import re, math, torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+name = "HuggingFaceTB/SmolLM2-135M"
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name, attn_implementation="eager").eval()
+html = open("volumes/01-modern-ai-engineering.html").read()
+text = re.sub(r"\s+", " ", re.sub(r"&lt;[^&gt;]+&gt;", " ", html))
+ids = tok(text, return_tensors="pt").input_ids[:, 2000:2000 + 512]   # (1, T), mid-doc
+T = ids.shape[1]
+
+# 1) Where does attention mass go? Head-averaged, queries 128..255.
+with torch.no_grad():
+    out = model(ids[:, :256], output_attentions=True)
+for L in (0, 5, 15, 29):
+    a = out.attentions[L][0].mean(0)                        # (T, T) head-averaged
+    q = torch.arange(128, 256)
+    local = torch.stack([a[i, i - 15:i + 1].sum() for i in q]).mean()
+    print(f"layer {L:2d}: mass on token 0 = {a[q, 0].mean():.2f}   "
+          f"on 16 most recent keys = {local:.2f}")
+
+def sliding_mask(T, window, n_sink):
+    i = torch.arange(T)[:, None]; j = torch.arange(T)[None, :]
+    allowed = (j &lt;= i) &amp; ((i - j &lt; window) | (j &lt; n_sink))
+    m = torch.zeros(T, T).masked_fill(~allowed, float("-inf"))
+    return m[None, None]                                    # (1, 1, T, T)
+
+def ppl(mask):
+    with torch.no_grad():
+        logits = model(ids, attention_mask=mask).logits if mask is not None \
+            else model(ids).logits
+    nll = torch.nn.functional.cross_entropy(logits[0, 256:-1], ids[0, 257:])
+    return math.exp(nll.item())
+
+print(f"\nperplexity on tokens 256..{T} (window = 64 keys)")
+print(f"  full causal attention      {ppl(None):7.2f}")
+print(f"  sliding window, no sink    {ppl(sliding_mask(T, 64, 0)):7.2f}")
+print(f"  sliding window + 4 sinks   {ppl(sliding_mask(T, 64, 4)):7.2f}")</code></pre>
+</figure>
+<pre class="output">layer  0: mass on token 0 = 0.00   on 16 most recent keys = 0.25
+layer  5: mass on token 0 = 0.09   on 16 most recent keys = 0.18
+layer 15: mass on token 0 = 0.38   on 16 most recent keys = 0.30
+layer 29: mass on token 0 = 0.32   on 16 most recent keys = 0.40
+
+perplexity on tokens 256..512 (window = 64 keys)
+  full causal attention        41.21
+  sliding window, no sink     471.66
+  sliding window + 4 sinks     54.60</pre>
+
+<ul>
+  <li>Token 0 here is an arbitrary mid-document token (we sliced from position 2000), yet from layer 5 onwards it receives 9–38% of all attention: sinks are about <em>position</em>, not content.</li>
+  <li>A 64-key window without sinks multiplies perplexity by 11×. Adding back four tokens recovers most of it (54.6 vs 41.2). The remaining gap is genuine long-range information lost to the window.</li>
+  <li>This experiment masks rather than evicts, so positions keep their original RoPE indices. StreamingLLM re-indexes positions within the cache; the qualitative result is the same.</li>
+</ul>
+
+<aside class="callout advanced"><span class="title">Designing Sinks In</span>
+  <ul>
+    <li>Rather than relying on an emergent sink, models can be given one: a learnable sink token prepended in pretraining <cite>(Xiao et al., 2023)</cite>, or a per-head learnable logit added to the softmax denominator ("off-by-one" softmax, or sink logits as used in some recent open-weight models).</li>
+    <li>Sinks also explain massive activations and outlier features that complicate quantisation (Volume 12): the sink token's hidden state has a few huge dimensions.</li>
+  </ul>
+</aside>
+
+<table>
+  <caption>Sparse attention patterns compared.</caption>
+  <thead><tr><th>Pattern</th><th>Cost per query</th><th>Long-range access</th><th>Kernel support</th><th>Seen in</th></tr></thead>
+  <tbody>
+    <tr><td>Full causal</td><td><span class="math">O(T)</span></td><td>Direct</td><td>Excellent</td><td>Most models</td></tr>
+    <tr><td>Sliding window</td><td><span class="math">O(W)</span></td><td>Via depth only</td><td>Excellent</td><td>Mistral 7B</td></tr>
+    <tr><td>Window + sinks</td><td><span class="math">O(W+s)</span></td><td>Via depth only</td><td>Good</td><td>StreamingLLM serving</td></tr>
+    <tr><td>Dilated / strided</td><td><span class="math">O(\sqrt{T})</span>–<span class="math">O(W)</span></td><td>Sparse direct</td><td>Poor</td><td>Sparse Transformer, Longformer</td></tr>
+    <tr><td>Local + global layers</td><td>mixed</td><td>Direct in global layers</td><td>Excellent</td><td>Gemma 2/3, several hybrids</td></tr>
+  </tbody>
+</table>
+
+<ul class="failure-modes">
+  <li><strong>Evicting the first tokens</strong> of a cache (e.g. naive truncation of a long chat): perplexity collapse, as measured above.</li>
+  <li><strong>Window smaller than the task's dependency length:</strong> fluent output that ignores the instruction given 10K tokens ago. Needle tests (Chapter 5) catch this; perplexity does not.</li>
+  <li><strong>Mismatched windows</strong> between training and serving (a serving engine ignoring the model's window config) change outputs silently.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="long-context">Long Context</h2>
+<p class="chapter-lede">Pretraining at 128K tokens from the start is prohibitively expensive, so
+models are pretrained short (4K–8K) and extended late. Extension is mostly a question of what
+RoPE does beyond the trained length, followed by a short continued-pretraining phase on long
+data. Whether the model then <em>uses</em> the context is a separate question, answered only by
+evaluation.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>A model trained at 4K positions and run at 16K sees rotation angles in its slow RoPE
+  dimensions that it never saw in training. Attention scores for those dimensions become
+  out-of-distribution, and quality collapses within a few hundred tokens past the trained length.</p>
+</div>
+
+<h3>What RoPE Does Beyond the Trained Length</h3>
+<p>RoPE rotates each pair <span class="math">i</span> of query/key dimensions by angle <span class="math">m\theta_i</span> at position <span class="math">m</span>:</p>
+<div class="math">\theta_i = b^{-2i/d}, \quad i = 0,\dots,\tfrac{d}{2}-1, \qquad \lambda_i = \frac{2\pi}{\theta_i} \ \ (\text{wavelength in tokens})</div>
+<ul>
+  <li>Fast pairs (small <span class="math">i</span>) complete hundreds of rotations within the training length: every angle has been seen, so they extrapolate fine.</li>
+  <li>Slow pairs (large <span class="math">i</span>) have wavelengths longer than the training context: they never complete a rotation, and positions beyond <span class="math">L</span> produce angles the model has never seen.</li>
+</ul>
+
+<p class="facet">Scaling methods (extension factor <span class="math">s = L'/L</span>)</p>
+<ul>
+  <li><strong>Position interpolation (PI)</strong> <cite>(Chen et al., 2023)</cite>: <span class="math">\theta_i' = \theta_i / s</span> for all pairs. Every angle is in range, but fast pairs lose resolution: neighbouring tokens become 4× closer in angle. Needs fine-tuning (they used about 1000 steps to reach 32K on LLaMA).</li>
+  <li><strong>NTK-aware scaling</strong> (community proposal, 2023): change the base, <span class="math">b' = b \cdot s^{d/(d-2)}</span>. Fast pairs are nearly untouched; the slowest pair is interpolated by exactly <span class="math">s</span>; middle pairs partially. Works reasonably without fine-tuning; "dynamic NTK" recomputes <span class="math">s</span> from the current length.</li>
+  <li><strong>YaRN</strong> <cite>(Peng et al., 2023)</cite>: interpolate per pair depending on how many rotations it completes in <span class="math">L</span>, plus an attention temperature.</li>
+</ul>
+
+<div class="math">r_i = \frac{L}{\lambda_i}, \qquad \gamma(r) = \begin{cases} 0 &amp; r &lt; \alpha \\ 1 &amp; r &gt; \beta \\ \frac{r-\alpha}{\beta-\alpha} &amp; \text{otherwise} \end{cases}, \qquad \theta_i' = \big(1-\gamma(r_i)\big)\frac{\theta_i}{s} + \gamma(r_i)\,\theta_i</div>
+<div class="math">\text{softmax}\!\left(\frac{q^\top k}{t\sqrt{d}}\right), \qquad \sqrt{1/t} = 0.1 \ln s + 1</div>
+<ul>
+  <li>Pairs with many rotations (<span class="math">r &gt; \beta = 32</span>) are left alone; pairs with less than one rotation (<span class="math">r &lt; \alpha = 1</span>) are fully interpolated; a linear ramp in between. <span class="math">\alpha, \beta</span> are the values recommended for LLaMA <span class="evidence documented">Documented</span>.</li>
+  <li>The temperature compensates for attention entropy increasing as more keys compete. YaRN reports extension of LLaMA 2 to 128K with roughly 0.1% of the original pretraining data <span class="evidence documented">Documented</span>.</li>
+  <li>Other production variants: raising the RoPE base before long-context training ("ABF", Xiong et al., 2023; Code Llama uses <span class="math">b = 10^6</span>; Llama 3 uses <span class="math">5\times10^5</span>), and Llama 3.1's piecewise frequency scaling, which is YaRN-like in spirit.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>RoPE frequencies under PI, NTK-aware and YaRN scaling, and a count of pairs that see out-of-distribution angles when a 4K model runs at 16K.</figcaption>
+<pre><code>import math, torch
+
+def rope_freqs(dim, base=10000.0):
+    return base ** (-torch.arange(0, dim, 2).float() / dim)          # theta_i, (dim/2,)
+
+def pi_freqs(dim, s, base=10000.0):                                   # Chen et al. 2023
+    return rope_freqs(dim, base) / s
+
+def ntk_freqs(dim, s, base=10000.0):                                  # "NTK-aware"
+    return rope_freqs(dim, base * s ** (dim / (dim - 2)))
+
+def yarn_freqs(dim, s, L_train, base=10000.0, alpha=1.0, beta=32.0):  # Peng et al. 2023
+    theta = rope_freqs(dim, base)
+    r = L_train * theta / (2 * math.pi)            # rotations completed in L_train
+    gamma = ((r - alpha) / (beta - alpha)).clamp(0, 1)  # 0: interpolate, 1: keep
+    return (1 - gamma) * theta / s + gamma * theta
+
+def yarn_attn_scale(s):                            # multiply logits by 1/t
+    return (0.1 * math.log(s) + 1) ** 2
+
+dim, L, s = 128, 4096, 4
+theta = rope_freqs(dim)
+print("pair  wavelength  rotations@4k  max angle@4k  max angle@16k  seen?")
+for i in (0, 16, 32, 40, 44, 48, 56, 63):
+    wl = 2 * math.pi / theta[i]
+    a4, a16 = theta[i] * (L - 1), theta[i] * (s * L - 1)
+    seen = "yes" if a4 &gt;= 2 * math.pi else "NO"   # full circle covered in training?
+    print(f"{i:4d} {wl:11.0f} {L / wl:13.2f} {a4:13.2f} {a16:14.2f}  {seen}")
+
+def unseen(freqs):
+    """Pairs whose angle at 16k exceeds any angle seen during 4k training."""
+    a_new = freqs * (s * L - 1)
+    a_seen = theta * L          # largest angle seen (positions 0..L-1, +1 slack)
+    return int(((a_new &gt; a_seen) &amp; (theta * (L - 1) &lt; 2 * math.pi)).sum())
+
+def local_resolution(freqs):
+    """Angle between adjacent positions for the fastest pair (smaller = blurrier)."""
+    return freqs[0].item()
+
+print(f"\nextend {L} -&gt; {s * L}  ({dim // 2} pairs; "
+      f"{int((theta * (L - 1) &lt; 2 * math.pi).sum())} never completed a rotation)")
+print("method  unseen-angle pairs  fastest-pair step  slowest-pair freq")
+for name, f in [("none", theta), ("PI", pi_freqs(dim, s)), ("NTK", ntk_freqs(dim, s)),
+                ("YaRN", yarn_freqs(dim, s, L))]:
+    print(f"{name:6s} {unseen(f):19d} {local_resolution(f):18.3f} {f[-1].item():18.2e}")
+print(f"YaRN logit scale for s={s}: {yarn_attn_scale(s):.3f}")</code></pre>
+</figure>
+<pre class="output">pair  wavelength  rotations@4k  max angle@4k  max angle@16k  seen?
+   0           6        651.90       4095.00       16383.00  yes
+  16          63         65.19        409.50        1638.30  yes
+  32         628          6.52         40.95         163.83  yes
+  40        1987          2.06         12.95          51.81  yes
+  44        3533          1.16          7.28          29.13  yes
+  48        6283          0.65          4.10          16.38  NO
+  56       19869          0.21          1.29           5.18  NO
+  63       54410          0.08          0.47           1.89  NO
+
+extend 4096 -&gt; 16384  (64 pairs; 18 never completed a rotation)
+method  unseen-angle pairs  fastest-pair step  slowest-pair freq
+none                    18              1.000           1.15e-04
+PI                       0              0.250           2.89e-05
+NTK                     17              1.000           2.89e-05
+YaRN                     0              1.000           2.89e-05
+YaRN logit scale for s=4: 1.296</pre>
+
+<ul>
+  <li>18 of 64 pairs never complete a rotation in 4K training. Unscaled, all 18 see new angles at 16K: the root cause of the extrapolation cliff.</li>
+  <li><strong>PI</strong> fixes every pair but quarters the fastest pair's per-token step (1.0 → 0.25 rad), blurring local order. That is why PI needs fine-tuning.</li>
+  <li><strong>NTK</strong> preserves local resolution and exactly interpolates the slowest pair, but 17 middle pairs still receive angles slightly beyond their training range. It degrades gracefully rather than failing, and improves with a little fine-tuning.</li>
+  <li><strong>YaRN</strong> gets both: no unseen angles and full local resolution, at the cost of two hyperparameters and a logit temperature.</li>
+</ul>
+
+<h3>Long-Context Training Data</h3>
+<ul>
+  <li>Position scaling makes long inputs <em>possible</em>; continued pretraining on long documents makes them <em>useful</em>. Typical recipes use a few billion tokens at the target length.</li>
+  <li>Upsample naturally long documents (books, code repositories concatenated in dependency order, long papers) without distorting the domain mix; Fu et al. 2024 found per-source upsampling of long documents better than upsampling long-heavy domains <span class="evidence documented">Documented</span>.</li>
+  <li>Keep a share of short data to avoid short-context regressions; evaluate both.</li>
+  <li>Use document masking in packed sequences so attention does not cross document boundaries (Volume 4); otherwise "long context" training is mostly unrelated snippets.</li>
+  <li>Systems: long sequences need sequence or context parallelism (ring attention) and activation checkpointing (Volume 6).</li>
+</ul>
+
+<h3>Evaluating Long Context</h3>
+
+<h4>A needle-in-a-haystack harness</h4>
+<ul>
+  <li>Insert a unique fact (the needle) at a controlled depth in filler text of controlled length; ask for it; grade exactly. Sweep depth × length.</li>
+  <li>Add <strong>distractors</strong> (similar-looking facts) so that "return the only number" does not pass the test.</li>
+  <li>The model is behind an interface, so the same harness runs against a real endpoint. Here a mock with deliberately U-shaped recall and a cliff beyond its trained length stands in, to test the harness itself.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Needle-in-a-haystack harness with distractors and exact grading, run against a mock long-context model.</figcaption>
+<pre><code>import math, random, re, hashlib
+from dataclasses import dataclass
+
+FILLER = ("The committee reviewed the quarterly logistics summary and noted no "
+          "exceptions. Shipping volumes were in line with the seasonal forecast. ")
+
+@dataclass
+class Case:
+    length: int      # context length in (approximate) tokens
+    depth: float     # 0.0 = start of context, 1.0 = end
+    key: str
+    value: str
+
+def build_prompt(c: Case, n_distractors=2, rng=None) -&gt; str:
+    words = (FILLER * (c.length // len(FILLER.split()) + 1)).split()[: c.length]
+    needle = f"The access code for vault {c.key} is {c.value}."
+    distractors = [f"The access code for vault {rng.choice('XYZ')}{rng.randint(10, 99)} "
+                   f"is {rng.randint(100000, 999999)}." for _ in range(n_distractors)]
+    pos = int(c.depth * len(words))
+    for d in distractors:
+        words.insert(rng.randint(0, len(words)), d)
+    words.insert(pos, needle)
+    return (" ".join(words) +
+            f"\n\nQuestion: what is the access code for vault {c.key}? Answer:")
+
+class MockLongContextModel:
+    """Stands in for an LLM. Recall is U-shaped in depth and decays past L_train."""
+    def __init__(self, l_train=8192):
+        self.l_train = l_train
+    def p_recall(self, depth, length):
+        u = 0.55 + 0.45 * (2 * depth - 1) ** 2            # lost in the middle
+        decay = min(1.0, (self.l_train / length) ** 1.5)  # beyond trained length
+        return max(0.0, min(1.0, u * decay + 0.1 * (length &lt;= 2048)))
+    def generate(self, prompt: str) -&gt; str:
+        key = re.search(r"vault (\w+)\? Answer:", prompt).group(1)
+        facts = re.findall(r"vault (\w+) is (\d+)\.", prompt)
+        n_tok = len(prompt.split())
+        idx = next(i for i, (k, _) in enumerate(facts) if k == key)
+        depth = prompt.find(f"vault {key} is") / len(prompt)
+        seed = int(hashlib.sha256(prompt.encode()).hexdigest()[:8], 16)
+        if random.Random(seed).random() &lt; self.p_recall(depth, n_tok):
+            return f" {facts[idx][1]}"
+        wrong = [v for k, v in facts if k != key]          # confuse with a distractor
+        return f" {wrong[0] if wrong else '000000'}"
+
+def grade(answer: str, expected: str) -&gt; bool:
+    m = re.search(r"\d{6}", answer)
+    return bool(m) and m.group(0) == expected
+
+def run(model, lengths, depths, trials=20, seed=0):
+    rng = random.Random(seed)
+    grid = {}
+    for L in lengths:
+        for d in depths:
+            ok = 0
+            for t in range(trials):
+                c = Case(L, d, f"K{rng.randint(100, 999)}",
+                         str(rng.randint(100000, 999999)))
+                ok += grade(model.generate(build_prompt(c, rng=rng)), c.value)
+            grid[L, d] = ok / trials
+    return grid
+
+lengths = [1024, 4096, 8192, 16384, 32768]
+depths = [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0]
+grid = run(MockLongContextModel(), lengths, depths)
+print("length \\ depth " + " ".join(f"{d:5.2f}" for d in depths))
+for L in lengths:
+    print(f"{L:14d} " + " ".join(f"{grid[L, d]:5.2f}" for d in depths))</code></pre>
+</figure>
+<pre class="output">length \ depth  0.00  0.10  0.25  0.50  0.75  0.90  1.00
+          1024  1.00  0.95  0.70  0.70  0.60  0.90  1.00
+          4096  1.00  0.90  0.70  0.45  0.65  0.75  1.00
+          8192  1.00  0.95  0.50  0.45  0.75  0.80  1.00
+         16384  0.20  0.25  0.15  0.20  0.15  0.45  0.15
+         32768  0.20  0.05  0.10  0.15  0.15  0.00  0.05</pre>
+
+<ul>
+  <li>The grid recovers the two behaviours built into the mock: a U-shape over depth and a cliff past 8K. With 20 trials per cell, the standard error is about ±0.1, so single-cell differences below 0.2 are noise. Use at least 50–100 trials per cell for decisions.</li>
+  <li>Seeding the mock by a hash of the prompt makes results reproducible and cacheable; do the same with real endpoints by caching responses keyed on prompt hash and sampling parameters.</li>
+</ul>
+
+<h4>Lost in the middle</h4>
+<ul>
+  <li>Liu et al. 2023 placed the answer-bearing document at different positions among 20 retrieved documents. Accuracy was highest when it was first or last and lowest in the middle, a U-shaped curve, for every model tested, including ones marketed for long context <span class="evidence documented">Documented</span>.</li>
+  <li>In some settings, middle-position accuracy fell below the closed-book (no documents) baseline <span class="evidence documented">Documented</span>.</li>
+  <li><strong>Engineering consequence</strong> for RAG (Volume 9): put the most relevant chunks at the start and end of the context, retrieve fewer and better chunks, and never assume a longer context window reduces the need for ranking.</li>
+</ul>
+
+<h4>Beyond needles: RULER</h4>
+<ul>
+  <li>Single-needle retrieval is nearly solved and over-flatters models. RULER <cite>(Hsieh et al., 2024)</cite> adds multi-key and multi-value needles, variable tracking (multi-hop), aggregation (common and frequent words) and QA, with configurable length.</li>
+  <li>RULER found that most models claiming 32K+ contexts fell well below their short-context performance before reaching the claimed length; its "effective length" is often a fraction of the advertised one <span class="evidence documented">Documented</span>.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Warning</span>
+  <ul>
+    <li>Perplexity on long documents is a weak long-context metric: most tokens are predictable from local context, so a model that ignores everything beyond 4K can show good long-document perplexity.</li>
+    <li>Needle tests with filler that is semantically unrelated to the needle are easy. Use realistic haystacks and distractors from the same distribution as the needle.</li>
+  </ul>
+</aside>
+
+<ul class="failure-modes">
+  <li><strong>Scaling config lost in deployment:</strong> the serving engine loads the model without its <code>rope_scaling</code> block, so long prompts silently degrade.</li>
+  <li><strong>Static scaling hurting short prompts:</strong> PI-style scaling applied to all lengths slightly worsens short-context quality; dynamic scaling or YaRN avoids most of this.</li>
+  <li><strong>Claimed context ≠ usable context:</strong> accept a context length only after a RULER-style curve at your task's lengths.</li>
+  <li><strong>KV memory:</strong> a model that can read 128K tokens may not be <em>servable</em> at 128K at your batch size (Chapter 2).</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="linear-ssm">Linear Attention and State Space Models</h2>
+<p class="chapter-lede">Softmax attention keeps every past token. Recurrent models keep a
+fixed-size state. Linear attention and state space models (SSMs) are attempts to get a
+Transformer's parallel training with an RNN's constant-memory inference. The best current
+answer is not a replacement but a hybrid.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Decode memory and time per token for softmax attention grow linearly with context, and
+  prefill grows quadratically. A model with a constant-size state would have flat decode cost at
+  any length. RNNs had that, but trained sequentially and forgot. Can we train in parallel and
+  infer recurrently without forgetting what matters?</p>
+</div>
+
+<h3>Linear Attention as an RNN</h3>
+<p>Replace <span class="math">\exp(q^\top k)</span> with a kernel <span class="math">\phi(q)^\top\phi(k)</span> <cite>(Katharopoulos et al., 2020)</cite>. Associativity then lets the sum over past keys be accumulated once:</p>
+<div class="math">y_t = \frac{\sum_{s \le t} \phi(q_t)^\top \phi(k_s)\, v_s}{\sum_{s \le t} \phi(q_t)^\top \phi(k_s)} = \frac{\phi(q_t)^\top S_t}{\phi(q_t)^\top z_t}, \qquad S_t = S_{t-1} + \phi(k_t) v_t^\top, \quad z_t = z_{t-1} + \phi(k_t)</div>
+<ul>
+  <li>Training uses the parallel (masked matrix) form, or chunked forms that mix both; inference uses the recurrence with an <span class="math">O(d \cdot d_v)</span> state.</li>
+  <li><span class="math">\phi(x) = \mathrm{elu}(x) + 1</span> keeps scores positive.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Causal linear attention in parallel and recurrent form, with a parity check.</figcaption>
+<pre><code>import torch, torch.nn.functional as F
+torch.manual_seed(0)
+phi = lambda x: F.elu(x) + 1                        # positive feature map
+
+def linear_attn_parallel(q, k, v):                  # (T, d), (T, d), (T, dv)
+    A = phi(q) @ phi(k).T                           # (T, T) unnormalised scores
+    A = A.tril()                                    # causal mask (no softmax!)
+    return (A @ v) / A.sum(-1, keepdim=True)
+
+def linear_attn_recurrent(q, k, v):
+    S = torch.zeros(k.shape[1], v.shape[1])         # (d, dv) state: sum phi(k) v^T
+    z = torch.zeros(k.shape[1])                     # (d,)   normaliser: sum phi(k)
+    ys = []
+    for t in range(q.shape[0]):
+        S = S + torch.outer(phi(k[t]), v[t])
+        z = z + phi(k[t])
+        ys.append(phi(q[t]) @ S / (phi(q[t]) @ z))
+    return torch.stack(ys), S, z
+
+T, d, dv = 256, 64, 64
+q, k, v = torch.randn(T, d), torch.randn(T, d), torch.randn(T, dv)
+yp = linear_attn_parallel(q, k, v)
+yr, S, z = linear_attn_recurrent(q, k, v)
+print(f"parallel vs recurrent max|diff| = {(yp - yr).abs().max():.2e}")
+print(f"recurrent state: {S.numel() + z.numel()} floats, independent of T")
+print(f"softmax KV cache at T={T}: {2 * T * d} floats, grows with T")</code></pre>
+</figure>
+<pre class="output">parallel vs recurrent max|diff| = 5.96e-07
+recurrent state: 4160 floats, independent of T
+softmax KV cache at T=256: 32768 floats, grows with T</pre>
+
+<ul>
+  <li>The two forms agree to float precision: linear attention <em>is</em> an RNN.</li>
+  <li><strong>Why it underperforms softmax:</strong> the state only ever adds; nothing is forgotten, and a <span class="math">d \times d_v</span> matrix has limited capacity, so retrieval of specific past tokens degrades as the sequence grows. Softmax sharpness is also lost.</li>
+  <li>Later designs add decay or gating: RetNet (fixed decay), GLA (data-dependent gates), DeltaNet (delta-rule updates that overwrite rather than add), RWKV. These are all variations of "what should the state forget and when".</li>
+</ul>
+
+<h3>State Space Models: S4 to Mamba</h3>
+<p>A continuous linear SSM maps input <span class="math">x(t)</span> to output <span class="math">y(t)</span> through hidden state <span class="math">h(t)</span>; discretised with step <span class="math">\Delta</span>:</p>
+<div class="math">h_t = \bar{A} h_{t-1} + \bar{B} x_t, \qquad y_t = C h_t + D x_t, \qquad \bar{A} = \exp(\Delta A), \quad \bar{B} \approx \Delta B</div>
+<ul>
+  <li><strong>S4</strong> <cite>(Gu et al., 2021)</cite>: <span class="math">A, B, C, \Delta</span> are fixed per channel (linear time-invariant). The recurrence unrolls into a convolution with kernel <span class="math">K_j = C\bar{A}^j\bar{B}</span>, so training is a long FFT convolution and inference is a recurrence. Structured (HiPPO-initialised) <span class="math">A</span> gives long memory.</li>
+  <li><strong>The LTI limitation:</strong> the same dynamics apply to every token. The model cannot decide to ignore filler or to store one important token, so it is weak at content-based selection (copying, associative recall).</li>
+  <li><strong>Mamba</strong> <cite>(Gu &amp; Dao, 2023)</cite>: make <span class="math">\Delta_t, B_t, C_t</span> functions of the input (<span class="math">\Delta_t = \mathrm{softplus}(W_\Delta x_t + b)</span>). Large <span class="math">\Delta_t</span> means "reset and write this token"; small means "ignore it and keep the state". The convolution form is lost, so Mamba uses a hardware-aware parallel scan kept in SRAM.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>A minimal selective scan in NumPy: parity with the convolution form in the LTI case, and a demonstration of selectivity.</figcaption>
+<pre><code>import numpy as np
+rng = np.random.default_rng(0)
+
+def selective_scan(x, delta, A, B, C, D):
+    """x, delta: (T, Dm); A: (Dm, N); B, C: (T, N); returns y: (T, Dm)."""
+    T, Dm = x.shape
+    h = np.zeros((Dm, A.shape[1]))                           # (Dm, N) state
+    ys = np.empty_like(x)
+    for t in range(T):
+        dA = np.exp(delta[t][:, None] * A)                   # (Dm, N) ZOH for A
+        dB = delta[t][:, None] * B[t][None, :]               # (Dm, N) Euler for B
+        h = dA * h + dB * x[t][:, None]                      # input-dependent update
+        ys[t] = h @ C[t] + D * x[t]
+    return ys
+
+T, Dm, N = 64, 4, 8
+A = -np.exp(rng.normal(size=(Dm, N)))                        # stable: Re(A) &lt; 0
+x = rng.normal(size=(T, Dm))
+D = np.zeros(Dm)
+
+# 1) LTI special case (S4-like): constant delta, B, C -&gt; recurrence == convolution
+delta = np.full((T, Dm), 0.1); B = np.tile(rng.normal(size=N), (T, 1))
+C = np.tile(rng.normal(size=N), (T, 1))
+y_scan = selective_scan(x, delta, A, B, C, D)
+dA, dB = np.exp(0.1 * A), 0.1 * B[0]
+K = np.stack([(dA ** j * dB) @ C[0] for j in range(T)])     # (T, Dm) kernel
+y_conv = np.stack([(K[:t + 1][::-1] * x[:t + 1]).sum(0) for t in range(T)])
+print(f"LTI scan vs convolution max|diff| = {np.abs(y_scan - y_conv).max():.2e}")
+
+# 2) Selectivity: remember token 5 across a gap of 58 tokens
+def memory_of_token5(delta_seq):
+    x = np.zeros((T, 1)); x[5] = 1.0                         # a single 'fact'
+    A1 = np.array([[-1.0]]); B1 = np.ones((T, 1)); C1 = np.ones((T, 1))
+    return selective_scan(x, delta_seq, A1, B1, C1, np.zeros(1))[-1, 0]
+
+fixed = np.full((T, 1), 0.5)                                 # LTI: same step always
+selective = np.full((T, 1), 1e-3); selective[5] = 0.5        # write at 5, then skip
+print(f"trace of token 5 at t={T - 1}: fixed delta {memory_of_token5(fixed):.2e}, "
+      f"selective delta {memory_of_token5(selective):.3f}")
+# In Mamba delta_t = softplus(x_t W + b): the model learns WHEN to write and forget.</code></pre>
+</figure>
+<pre class="output">LTI scan vs convolution max|diff| = 6.66e-16
+trace of token 5 at t=63: fixed delta 1.27e-13, selective delta 0.472</pre>
+
+<ul>
+  <li>With constant parameters the scan equals a convolution: that is S4's training trick.</li>
+  <li>With a fixed step, a single fact decays to <span class="math">10^{-13}</span> over 58 tokens. With a token-dependent step (write at token 5, tiny steps afterwards) the same state keeps 47% of it. Selectivity is what lets a fixed-size state hold on to specific information.</li>
+  <li>The state is still finite. Mamba-class models lag attention on tasks that need exact recall of arbitrary earlier content (copying long strings, multi-key retrieval), which motivates hybrids.</li>
+</ul>
+
+<aside class="callout advanced"><span class="title">Mamba-2 and the Duality</span>
+  <ul>
+    <li>Mamba-2 <cite>(Dao &amp; Gu, 2024)</cite> restricts <span class="math">\bar{A}</span> to a scalar per head and shows the resulting SSM equals a form of masked linear attention with a decay mask ("structured state space duality"). Training can then use matrix multiplications (tensor cores) in chunks, which is much faster than a scan.</li>
+    <li>The families have converged: gated linear attention, RetNet, Mamba-2 and DeltaNet are all linear recurrences with different state-update rules.</li>
+  </ul>
+</aside>
+
+<h3>Hybrids</h3>
+<ul>
+  <li><strong>Jamba</strong> <cite>(Lieber et al., 2024)</cite>: one attention layer per eight (1:7 attention to Mamba), MoE in every other layer, 52B total / 12B active, 256K context. They report fitting 140K tokens of context on a single 80 GB GPU <span class="evidence documented">Documented</span>.</li>
+  <li>Several later open models (e.g. Zamba, Samba, NVIDIA's Nemotron-H, MiniMax-01 with lightning attention) combine a minority of softmax attention layers with a majority of linear-recurrent or local layers <span class="evidence documented">Documented</span> in their respective reports.</li>
+  <li><strong>Why hybrids work</strong> <span class="evidence inferred">Inferred</span>: a few global attention layers provide exact retrieval; recurrent layers provide cheap local and summarised context. The KV cache is only paid for the attention layers, so a 1:7 ratio cuts cache by about 8×.</li>
+</ul>
+
+<table>
+  <caption>Sequence-mixing families at decode time (per layer, per sequence).</caption>
+  <thead><tr><th>Mixer</th><th>State / cache</th><th>Decode cost per token</th><th>Exact recall of arbitrary past</th><th>Training form</th></tr></thead>
+  <tbody>
+    <tr><td>Softmax attention</td><td><span class="math">O(T)</span></td><td><span class="math">O(T)</span></td><td>Strong</td><td>Parallel</td></tr>
+    <tr><td>Sliding window</td><td><span class="math">O(W)</span></td><td><span class="math">O(W)</span></td><td>Within window only</td><td>Parallel</td></tr>
+    <tr><td>Linear attention</td><td><span class="math">O(d^2)</span></td><td><span class="math">O(d^2)</span></td><td>Weak</td><td>Parallel / chunked</td></tr>
+    <tr><td>Mamba / SSM</td><td><span class="math">O(d N)</span></td><td><span class="math">O(d N)</span></td><td>Moderate (selective)</td><td>Parallel scan / chunked</td></tr>
+    <tr><td>Hybrid (1:7)</td><td><span class="math">\approx O(T)/8</span></td><td>mixed</td><td>Strong</td><td>Mixed</td></tr>
+  </tbody>
+</table>
+
+<ul class="failure-modes">
+  <li><strong>Numerical drift in long recurrences:</strong> accumulating states in bf16 over 100K steps loses precision. Keep states in float32.</li>
+  <li><strong>Train/infer mismatch:</strong> the chunked training kernel and the recurrent decode kernel are different code; test parity as in the listings above.</li>
+  <li><strong>Serving support:</strong> engines optimised for paged KV caches need separate state management for recurrent layers; prefix caching is harder because state is not per-token.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="objectives">Multi-Token Prediction and Other Objectives</h2>
+<p class="chapter-lede">Next-token prediction is not the only way to train a decoder. Small changes
+to the objective or the input format give models new abilities (filling in code between a prefix
+and a suffix), denser training signal, or a built-in draft model for faster decoding.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Next-token loss gives one supervised signal per position and rewards short-horizon
+  prediction. Code editors need insertion, not continuation. Decoding produces one token per
+  forward pass, leaving compute idle. Each of these can be addressed by the objective rather
+  than by a new architecture.</p>
+</div>
+
+<h3>Multi-Token Prediction</h3>
+<ul>
+  <li><strong>Gloeckle et al. 2024:</strong> a shared trunk feeds <span class="math">n</span> independent output heads; head <span class="math">i</span> predicts token <span class="math">t+i</span>. The loss is the sum of the <span class="math">n</span> cross-entropies.</li>
+  <li>Reported effects <span class="evidence documented">Documented</span>: gains grow with model size; a 13B model solved 12% more HumanEval and 17% more MBPP problems than a next-token baseline; with self-speculative decoding, 4-token models ran up to 3× faster at inference.</li>
+  <li><strong>DeepSeek-V3</strong> uses <em>sequential</em> MTP modules (each extra prediction conditions on the previous one's representation, keeping a causal chain), depth 1. They report 85–90% acceptance for the second token and about 1.8× tokens per second when used for speculative decoding <span class="evidence documented">Documented</span> (V3 report).</li>
+</ul>
+
+<div class="math">\mathcal{L}_{\text{MTP}} = -\sum_{t} \sum_{i=1}^{n} \log p_{\theta_i}\!\left(x_{t+i} \mid h_t\right), \qquad h_t = f_{\text{trunk}}(x_{\le t})</div>
+
+<figure class="listing">
+<figcaption>A 4-head MTP model on a toy low-entropy language, with per-head loss and self-speculative decoding (heads draft, head 1 verifies).</figcaption>
+<pre><code>import torch, torch.nn as nn, torch.nn.functional as F
+torch.manual_seed(0)
+V, D, n_future = 64, 128, 4
+
+class MTPModel(nn.Module):
+    """Shared causal trunk + n independent output heads (Gloeckle et al. 2024)."""
+    def __init__(self):
+        super().__init__()
+        self.emb = nn.Embedding(V, D)
+        layer = nn.TransformerEncoderLayer(D, 4, 4 * D, batch_first=True,
+                                           norm_first=True)
+        self.trunk = nn.TransformerEncoder(layer, 2, enable_nested_tensor=False)
+        self.heads = nn.ModuleList(nn.Sequential(nn.Linear(D, D), nn.GELU(),
+                                                 nn.Linear(D, V))
+                                   for _ in range(n_future))
+    def forward(self, idx):                                   # (B, T)
+        T = idx.shape[1]
+        mask = nn.Transformer.generate_square_subsequent_mask(T)
+        h = self.trunk(self.emb(idx), mask=mask, is_causal=True)   # (B, T, D)
+        return [head(h) for head in self.heads]              # n x (B, T, V)
+
+def mtp_loss(logits, idx):
+    losses = []
+    for i, lg in enumerate(logits, start=1):                 # head i predicts t+i
+        losses.append(F.cross_entropy(lg[:, :-i].reshape(-1, V),
+                                      idx[:, i:].reshape(-1)))
+    return sum(losses), losses
+
+# toy language: a noisy, deterministic successor table (low entropy)
+succ = torch.randperm(V)
+def batch(B=32, T=64):
+    x = torch.randint(V, (B, 1))
+    seq = [x]
+    for _ in range(T - 1):
+        nxt = succ[seq[-1]]
+        noise = torch.rand(B, 1) &lt; 0.1
+        seq.append(torch.where(noise, torch.randint(V, (B, 1)), nxt))
+    return torch.cat(seq, 1)
+
+model = MTPModel()
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+for step in range(200):
+    idx = batch()
+    loss, parts = mtp_loss(model(idx), idx)
+    opt.zero_grad(); loss.backward(); opt.step()
+print("per-head loss:", " ".join(f"t+{i + 1}={l.item():.2f}" for i, l in enumerate(parts)))
+
+# self-speculative decoding: heads 1..4 draft, head 1 verifies (greedy)
+@torch.no_grad()
+def acceptance(prompt, n_rounds=50):
+    seq, accepted = prompt.clone(), []
+    for _ in range(n_rounds):
+        draft = [lg[0, -1].argmax().item() for lg in model(seq)]   # 4 tokens at once
+        cand = torch.cat([seq, torch.tensor([draft])], 1)
+        verify = model(cand)[0][0, seq.shape[1] - 1:-1].argmax(-1).tolist()
+        n = 1                                                  # draft[0] is head 1
+        while n &lt; n_future and verify[n] == draft[n]:
+            n += 1
+        accepted.append(n)
+        seq = torch.cat([seq, torch.tensor([draft[:n]])], 1)
+    return sum(accepted) / len(accepted)
+print(f"mean tokens accepted per forward pass: {acceptance(batch(1, 8)):.2f} "
+      f"(max {n_future})")</code></pre>
+</figure>
+<pre class="output">per-head loss: t+1=0.83 t+2=1.41 t+3=1.89 t+4=2.29
+mean tokens accepted per forward pass: 4.00 (max 4)</pre>
+
+<ul>
+  <li>Loss rises with horizon, as it must: with 10% noise per step, predicting 4 ahead compounds uncertainty. The entropy floor for <span class="math">t+1</span> here is about 0.73 nats, so head 1 is near optimal after 200 steps.</li>
+  <li>Acceptance is perfect only because greedy decoding on this toy follows the successor table deterministically. Real text gives lower acceptance; Gloeckle et al. report ~3× on code at best.</li>
+  <li>Verification uses the <em>same</em> model's head 1, so outputs are identical to plain greedy decoding: speculation changes speed, never content.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Implementation Note</span>
+  <ul>
+    <li>With a 128K–256K vocabulary, <span class="math">n</span> heads' logits dominate activation memory. Gloeckle et al. compute each head's forward and backward sequentially, accumulating gradient at the trunk output, so only one head's logits are alive at a time.</li>
+    <li>At inference, the extra heads can be dropped entirely; the trunk is a normal next-token model.</li>
+  </ul>
+</aside>
+
+<h3>Fill-in-the-Middle</h3>
+<ul>
+  <li><strong>Problem:</strong> a code editor's cursor sits between a prefix and a suffix. A left-to-right model cannot condition on the suffix.</li>
+  <li><strong>Bavarian et al. 2022</strong>: cut a document at two random points into prefix, middle and suffix; move the middle to the end with sentinel tokens; train normally. The model learns infilling with ordinary next-token loss.</li>
+  <li>Reported <span class="evidence documented">Documented</span>: at a FIM rate of 50%, left-to-right performance is essentially unchanged ("FIM for free"); character-level span selection works better than line- or token-level; applying FIM in pretraining is more effective than fine-tuning it in later.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>FIM transformation in PSM and SPM order, and a prefix-LM attention mask.</figcaption>
+<pre><code>import random, torch
+PRE, SUF, MID, EOT = ("&lt;|fim_prefix|&gt;", "&lt;|fim_suffix|&gt;", "&lt;|fim_middle|&gt;",
+                      "&lt;|endoftext|&gt;")
+
+def fim_transform(doc: str, rng: random.Random, fim_rate=0.5, spm_rate=0.5) -&gt; str:
+    """Bavarian et al. 2022: split at two random points, move the middle to the end."""
+    if rng.random() &gt; fim_rate:
+        return doc + EOT                                   # ordinary left-to-right
+    a, b = sorted(rng.sample(range(len(doc) + 1), 2))
+    prefix, middle, suffix = doc[:a], doc[a:b], doc[b:]
+    if rng.random() &lt; spm_rate:                            # SPM variant
+        return PRE + SUF + suffix + MID + prefix + middle + EOT
+    return PRE + prefix + SUF + suffix + MID + middle + EOT  # PSM variant
+
+rng = random.Random(4)
+doc = "def area(r):\n    return 3.14159 * r * r\n"
+for _ in range(3):
+    print(repr(fim_transform(doc, rng)))
+
+def prefix_lm_mask(T, n_prefix):
+    i = torch.arange(T)[:, None]; j = torch.arange(T)[None, :]
+    return (j &lt;= i) | (j &lt; n_prefix)                       # bidirectional prefix
+for row in prefix_lm_mask(7, 3).int().tolist():
+    print(" ".join("x" if v else "." for v in row))</code></pre>
+</figure>
+<pre class="output">'&lt;|fim_prefix|&gt;&lt;|fim_suffix|&gt;.14159 * r * r\n&lt;|fim_middle|&gt;def area(r):\n    return 3&lt;|endoftext|&gt;'
+'&lt;|fim_prefix|&gt;d&lt;|fim_suffix|&gt;.14159 * r * r\n&lt;|fim_middle|&gt;ef area(r):\n    return 3&lt;|endoftext|&gt;'
+'&lt;|fim_prefix|&gt;def&lt;|fim_suffix|&gt;   return 3.14159 * r * r\n&lt;|fim_middle|&gt; area(r):\n &lt;|endoftext|&gt;'
+x x x . . . .
+x x x . . . .
+x x x . . . .
+x x x x . . .
+x x x x x . .
+x x x x x x .
+x x x x x x x</pre>
+
+<ul>
+  <li><strong>PSM</strong> (prefix, suffix, middle) is the intuitive order. <strong>SPM</strong> here is the variant from Bavarian et al.'s appendix that places the suffix first but still opens with the prefix sentinel, so that the prefix and middle are contiguous and key-value caching of the prefix is reused across keystrokes.</li>
+  <li>At inference the editor sends <code>PRE prefix SUF suffix MID</code> and the model generates the middle until <code>EOT</code>. Sentinel names differ per model family (StarCoder, Code Llama, DeepSeek-Coder, Qwen-Coder); using the wrong tokens silently yields continuation, not infilling.</li>
+  <li>Split at the <strong>character</strong> level during training, but at inference the cursor may sit mid-token: tokenisation of the prefix boundary (Volume 3) is a real source of FIM quality bugs.</li>
+</ul>
+
+<h3>Prefix LM</h3>
+<ul>
+  <li>Tokens in the prefix (instruction, image patches, input document) attend bidirectionally; the rest is causal. Loss is computed only on the causal part. The mask printed above shows a 3-token bidirectional prefix.</li>
+  <li>Used by T5-style models, UniLM and several vision-language models for their image tokens. Wang et al. 2022 found non-causal decoders with an MLM-style objective strong for zero-shot after multitask fine-tuning, but causal decoders best for pure zero-shot generation <span class="evidence documented">Documented</span>.</li>
+  <li><strong>Why decoders stayed causal</strong> <span class="evidence inferred">Inferred</span>: causal training gives a loss on every token, one mask for all data, and trivially reusable KV caches in multi-turn chat. A bidirectional prefix invalidates the cache whenever the prefix changes.</li>
+</ul>
+
+<ul class="failure-modes">
+  <li><strong>FIM sentinel mismatch</strong> between training and the IDE plugin: model continues instead of infilling.</li>
+  <li><strong>FIM rate too high</strong> in non-code data: small left-to-right regressions; ablate per domain.</li>
+  <li><strong>MTP at small scale:</strong> Gloeckle et al. found MTP can <em>hurt</em> small models; gains appear at billions of parameters.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="reading-reports">Reading Modern Model Reports</h2>
+<p class="chapter-lede">Much of what the field knows about frontier architectures comes from
+technical reports written partly for engineers and partly for marketing. A senior engineer
+reads them like an incident report: extract the facts, record where each came from, mark what
+is inferred, and discard claims that cannot be checked.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Reports mix exact configuration tables, ablations at one scale, benchmark tables with
+  unspecified prompting, and adjectives. Decisions made from them (which architecture to adopt,
+  which model to serve) inherit whatever was not verified.</p>
+</div>
+
+<h3>A Structured Reading Method</h3>
+<ol>
+  <li><strong>Configuration first.</strong> Find the architecture table: layers, <span class="math">d_{\text{model}}</span>, heads, KV heads, head dim, FFN size, vocabulary, experts (total, active, shared), context length, RoPE base and scaling. Compute parameters and KV bytes per token yourself and check they match the headline numbers.</li>
+  <li><strong>Training budget.</strong> Tokens, data mixture description, sequence-length schedule, compute (GPU-hours), precision (FP8?), parallelism. Compute <span class="math">6ND</span> and compare with the stated GPU-hours for plausibility.</li>
+  <li><strong>What changed versus the previous version?</strong> List each change and whether an ablation supports it, at what scale.</li>
+  <li><strong>Evaluation hygiene.</strong> For every benchmark: shots, prompt format, chain-of-thought or not, sampling, pass@k, whether baselines were run by the authors or copied. Look for contamination analysis.</li>
+  <li><strong>Long-context claims.</strong> Is there a RULER-style curve or just a single-needle heatmap?</li>
+  <li><strong>Systems claims.</strong> Throughput numbers: which hardware, batch size, context, engine, precision, versus which baseline?</li>
+  <li><strong>What is missing.</strong> Data sources, failed runs, instabilities, safety evaluation details. Absence is information.</li>
+  <li><strong>Ledger.</strong> Record every claim as Documented (with section/table), Inferred (with your reasoning) or Marketing (no checkable evidence).</li>
+</ol>
+
+<figure class="listing">
+<figcaption>A claim ledger that refuses documented claims without a source and inferred claims without a basis.</figcaption>
+<pre><code>from dataclasses import dataclass, field
+
+@dataclass
+class Claim:
+    model: str
+    claim: str
+    status: str                  # "documented" | "inferred" | "marketing"
+    source: str = ""             # report + section/table for documented claims
+    basis: str = ""              # reasoning for inferred claims
+
+@dataclass
+class Ledger:
+    claims: list = field(default_factory=list)
+    def add(self, *a, **kw):
+        c = Claim(*a, **kw)
+        if c.status == "documented" and not c.source:
+            raise ValueError(f"documented claim without source: {c.claim}")
+        if c.status == "inferred" and not c.basis:
+            raise ValueError(f"inferred claim without basis: {c.claim}")
+        self.claims.append(c)
+    def report(self):
+        for c in self.claims:
+            ref = c.source if c.status == "documented" else c.basis
+            print(f"[{c.status[:3].upper()}] {c.model}: {c.claim}\n      -&gt; {ref}")
+
+L = Ledger()
+L.add("Mixtral 8x7B", "8 experts per layer, top-2 routing, 13B active of 47B",
+      "documented", source="Jiang et al. 2024, Sec. 2")
+L.add("DeepSeek-V3", "MLA + DeepSeekMoE, 671B total / 37B active, MTP objective",
+      "documented", source="DeepSeek-AI 2024 (V3 report), Sec. 2")
+L.add("DeepSeek-V3", "per-token decode FLOPs below a 70B dense model",
+      "inferred", basis="37B active vs 70B params; FLOPs ~ 2 x active params")
+L.add("Model X", "'best-in-class long context'", "marketing", basis="no eval named")
+L.report()
+try:
+    L.add("Model X", "trained on 15T tokens", "documented")
+except ValueError as e:
+    print("rejected:", e)</code></pre>
+</figure>
+<pre class="output">[DOC] Mixtral 8x7B: 8 experts per layer, top-2 routing, 13B active of 47B
+      -&gt; Jiang et al. 2024, Sec. 2
+[DOC] DeepSeek-V3: MLA + DeepSeekMoE, 671B total / 37B active, MTP objective
+      -&gt; DeepSeek-AI 2024 (V3 report), Sec. 2
+[INF] DeepSeek-V3: per-token decode FLOPs below a 70B dense model
+      -&gt; 37B active vs 70B params; FLOPs ~ 2 x active params
+[MAR] Model X: 'best-in-class long context'
+      -&gt; no eval named
+rejected: documented claim without source: trained on 15T tokens</pre>
+
+<h3>Worked Summaries</h3>
+<table>
+  <caption>Architecture facts from four report families. All entries are Documented in the cited report unless marked; verify against the version you deploy.</caption>
+  <thead><tr><th>Report</th><th>Attention</th><th>FFN</th><th>Context and positions</th><th>Notable</th></tr></thead>
+  <tbody>
+    <tr><td>Llama 3 (Grattafiori et al., 2024)</td><td>GQA, 8 KV heads</td><td>Dense SwiGLU; 405B largest</td><td>RoPE base 500K; 128K after long-context stage</td><td>Chose dense over MoE for training stability <span class="evidence documented">Documented</span></td></tr>
+    <tr><td>Mixtral (Jiang et al., 2024)</td><td>GQA (Mistral 7B base design)</td><td>8 experts, top-2</td><td>32K</td><td>Expert routing analysis shows little topic specialisation</td></tr>
+    <tr><td>DeepSeek-V2/V3 (DeepSeek-AI, 2024)</td><td>MLA</td><td>Fine-grained + shared experts</td><td>128K via YaRN</td><td>Aux-loss-free balancing and MTP (V3); FP8 training (V3)</td></tr>
+    <tr><td>Qwen2.5 (Qwen Team, 2024)</td><td>GQA</td><td>Dense and MoE variants</td><td>Long-context variants using YaRN and dual chunk attention</td><td>Open weights at many sizes; details vary per variant</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout warning"><span class="title">Warning</span>
+  <ul>
+    <li>Benchmark tables across reports are rarely comparable: different shots, prompts, CoT and evaluation harnesses. Re-run the benchmarks you care about in one harness (Volume 10) before comparing models.</li>
+    <li>"Trained on X tokens" without a data description is unverifiable. Treat undisclosed data as an unknown that may include benchmark contamination.</li>
+  </ul>
+</aside>
+
+<p class="facet">Red flags</p>
+<ul>
+  <li>Ablations only at the smallest scale, with the conclusion applied to the largest model.</li>
+  <li>Throughput comparisons against an unoptimised baseline (different engine, different precision).</li>
+  <li>Context length claims supported only by a single-needle heatmap.</li>
+  <li>Active-parameter comparisons of MoE against dense models without mentioning total parameters and serving memory.</li>
+</ul>
+</section>
+
+<!-- ================================================================ REVIEW -->
+<section class="review">
+<h1>Volume Review</h1>
+
+<h2>What You Learned</h2>
+<ul>
+  <li>Decode is memory-bound; at serving batch sizes the KV cache, not the weights, dominates bytes per step. <span class="math">\text{KV} = 2 L n_{kv} d_h T b</span>.</li>
+  <li>MQA, GQA and MLA reduce KV bytes per token by sharing or compressing heads; MLA's absorption trick attends directly over latents; decoupled RoPE keeps absorption valid.</li>
+  <li>MoE separates parameters from FLOPs; routers collapse without balancing; capacity factors trade compute for dropped tokens; expert parallelism turns balance into a latency problem.</li>
+  <li>Sliding windows bound the cache; attention sinks explain why naive eviction destroys models.</li>
+  <li>RoPE extrapolation fails in slow dimensions; PI, NTK and YaRN differ in which dimensions they interpolate.</li>
+  <li>Needle tests, RULER and "lost in the middle" measure whether context is used, not just accepted.</li>
+  <li>Linear attention is an RNN; selective SSMs add input-dependent forgetting; hybrids keep a few attention layers for exact recall.</li>
+  <li>MTP, FIM and prefix LM change the objective or format, not the architecture.</li>
+  <li>Reports are read with a ledger: Documented, Inferred, Marketing.</li>
+</ul>
+
+<h2>What You Built</h2>
+<ul>
+  <li><code>forge.nn</code>: a unified MHA/MQA/GQA module with KV cache, parity against <code>nn.MultiheadAttention</code>, and MHA-to-GQA conversion.</li>
+  <li>A KV-cache calculator for real model shapes, including MLA.</li>
+  <li>A minimal MLA with latent cache and absorbed decode path.</li>
+  <li>An MoE layer with top-k router, Switch auxiliary loss and capacity-based dropping.</li>
+  <li>Sliding-window and sink masks, and a sink measurement on SmolLM2-135M.</li>
+  <li>RoPE PI, NTK and YaRN frequency functions with an out-of-distribution angle audit.</li>
+  <li>A needle-in-a-haystack harness with distractors and exact grading.</li>
+  <li>Linear attention in parallel and recurrent form; a NumPy selective scan.</li>
+  <li>An MTP model with self-speculative decoding; FIM and prefix-LM utilities; a claim ledger.</li>
+</ul>
+
+<h2>Important Code</h2>
+<table>
+  <caption>Listings to keep; later volumes reuse them inside <code>forge.nn</code>.</caption>
+  <thead><tr><th>Component</th><th>Forge module</th><th>Key function</th><th>Reused in</th></tr></thead>
+  <tbody>
+    <tr><td>Attention</td><td><code>forge.nn</code></td><td><code>GroupedQueryAttention</code>, <code>MiniMLA</code></td><td>Volume 12</td></tr>
+    <tr><td>KV maths</td><td><code>forge.compute</code> / <code>forge.nn</code></td><td><code>kvtable.py</code>, <code>step_bytes</code></td><td>Volumes 12, 13</td></tr>
+    <tr><td>MoE</td><td><code>forge.nn</code></td><td><code>MoE</code> with aux loss and capacity</td><td>Volume 8</td></tr>
+    <tr><td>Positions</td><td><code>forge.nn</code></td><td><code>yarn_freqs</code>, <code>ntk_freqs</code></td><td>Long-context fine-tuning</td></tr>
+    <tr><td>Evaluation</td><td><code>forge.eval</code></td><td>needle harness, <code>grade</code></td><td>Volumes 9, 10</td></tr>
+    <tr><td>Objectives</td><td><code>forge.nn</code> / <code>forge.train</code></td><td><code>fim_transform</code>, <code>mtp_loss</code></td><td>Code models, speculation</td></tr>
+  </tbody>
+</table>
+
+<h2>Important Architecture</h2>
+<div class="arch">
+  <div class="arch-layer" data-label="Sequence mixer">
+    <div class="node model">GQA / MLA global layers</div><div class="node model">Sliding window + sinks</div><div class="node model">Linear / SSM layers</div>
+  </div>
+  <div class="arch-layer" data-label="Channel mixer">
+    <div class="node model">Shared expert</div><div class="node model">Router (fp32)</div><div class="node model">Fine-grained routed experts</div>
+  </div>
+  <div class="arch-layer" data-label="Positions and heads">
+    <div class="node model">RoPE + YaRN scaling</div><div class="node model">Next-token head</div><div class="node model">MTP head(s)</div>
+  </div>
+  <div class="arch-layer" data-label="Systems">
+    <div class="node gpu">Expert parallel all-to-all</div><div class="node store">Paged / latent KV cache</div><div class="node obs">Expert load telemetry</div><div class="node eval">RULER / needle evaluation</div>
+  </div>
+</div>
+
+<pre class="mermaid">flowchart TD
+  A[Serving target: context, batch, latency] --> B{KV cache fits?}
+  B -- no --> C[GQA with fewer groups, MLA, KV quantisation]
+  B -- no, very long --> D[Local layers + sinks or SSM hybrid]
+  B -- yes --> E{Need more quality at fixed FLOPs?}
+  C --> E
+  D --> E
+  E -- yes, memory available --> F[MoE with shared experts]
+  E -- no --> G[Dense]
+  F --> H[Extend context: YaRN + long data]
+  G --> H
+  H --> I[Evaluate: loss, RULER by position, throughput]</pre>
+
+<h2>Failure Modes</h2>
+<ul class="failure-modes">
+  <li><strong>KV heads mis-grouped</strong> on checkpoint load: plausible but degraded outputs.</li>
+  <li><strong>Router collapse and token dropping</strong> in MoE: dead experts, batch-dependent outputs.</li>
+  <li><strong>Cache eviction without sinks:</strong> perplexity collapse in streaming.</li>
+  <li><strong>Missing RoPE scaling config</strong> at serving: long-prompt degradation with no error.</li>
+  <li><strong>Long-context claims from single needles:</strong> effective length far below advertised.</li>
+  <li><strong>Recurrent-state precision loss</strong> in SSMs; train/infer kernel mismatch.</li>
+  <li><strong>FIM sentinel mismatch</strong> between model and editor.</li>
+  <li><strong>Unsourced report claims</strong> driving architecture decisions.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<ul>
+  <li>Parity tests for every efficient path: cached vs full, absorbed vs naive, recurrent vs parallel, scan vs convolution.</li>
+  <li>Analytic and measured KV bytes per token, maximum batch at target context, tokens per second.</li>
+  <li>MoE health: per-expert load, dropped fraction, router entropy, all-to-all time share.</li>
+  <li>Long context: RULER-style tasks by length and depth, with distractors and at least 50 trials per cell; short-context regression suite.</li>
+  <li>Quality comparisons at equal active FLOPs and at equal total parameters.</li>
+</ul>
+
+<h2>Practical Project</h2>
+<div class="frame exercise">
+  <p><strong>Architecture ablation.</strong></p>
+  <ul>
+    <li>Take the Volume 4 model (~30–100M parameters). Build three parameter-matched variants: dense MHA, dense GQA-2, and MoE (8 experts, top-2, one shared expert) with matched active FLOPs.</li>
+    <li>Train each on the same token budget from the Volume 5 mixture. Report validation loss, tokens per second in training, and decode throughput and KV bytes at 2K context and batch 32.</li>
+    <li>Log MoE load histograms per layer; run once without the aux loss and document the collapse.</li>
+    <li>Extend the best model's context 4× using YaRN with a short continued-pretraining phase on long documents. Run the needle harness against the real model at 1×, 2× and 4× the original length and plot accuracy by depth.</li>
+    <li>Write a one-page report in ledger form: what you measured, what you infer, and what you would need to check at larger scale.</li>
+  </ul>
+</div>
+
+<h2>Exercises</h2>
+<ol>
+  <li>Derive the KV bytes per token for Llama 3 405B (126 layers, 8 KV heads, <span class="math">d_h = 128</span>). How many 128K-token sequences fit in 640 GB after bf16 weights?</li>
+  <li>Implement decoupled RoPE in <code>MiniMLA</code> and show that the absorbed path still matches the naive path.</li>
+  <li>Replace the Switch auxiliary loss with DeepSeek-V3-style bias balancing (update rate <span class="math">\gamma</span>). Compare load and MSE on the toy task.</li>
+  <li>Measure dropped tokens as a function of capacity factor (1.0, 1.25, 2.0) for the collapsed and balanced routers.</li>
+  <li>Implement a rolling-buffer KV cache with sinks and positions re-indexed within the cache; verify it matches the masked version for the first <span class="math">W</span> tokens.</li>
+  <li>Add dynamic NTK scaling (<span class="math">s = \max(1, T/L)</span> recomputed per call) and compare its unseen-angle count with static NTK across lengths.</li>
+  <li>Add multi-key and variable-tracking tasks to the needle harness.</li>
+  <li>Add a scalar decay <span class="math">\gamma</span> to linear attention (RetNet-style) in both forms and keep the parity test passing.</li>
+  <li>Make <span class="math">\Delta_t</span> in the selective scan a learned function of <span class="math">x_t</span> and train it to copy a marked token across a gap.</li>
+  <li>Train the MTP toy with <span class="math">n = 1</span> and <span class="math">n = 4</span> and compare the next-token loss of head 1.</li>
+</ol>
+
+<h2>Research Papers</h2>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Fast Transformer Decoding: One Write-Head is All You Need</span>
+    <span class="paper-meta">Shazeer, 2019 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Incremental decoding is bottlenecked by loading keys and values.</dd>
+    <dt>Previous limitation</dt><dd>MHA caches K/V for every head.</dd>
+    <dt>Approach</dt><dd>Multi-query attention: all heads share one K and V.</dd>
+    <dt>Contribution</dt><dd>Large decoding speed-ups with minor quality loss.</dd>
+    <dt>Practical impact</dt><dd>Adopted by PaLM and Falcon; precursor to GQA.</dd>
+    <dt>Limitations</dt><dd>Quality loss and instability at scale.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</span>
+    <span class="paper-meta">Ainslie et al., 2023 · EMNLP</span></div>
+  <dl>
+    <dt>Problem</dt><dd>MQA is fast but loses quality; retraining is expensive.</dd>
+    <dt>Previous limitation</dt><dd>Binary choice between MHA and MQA.</dd>
+    <dt>Approach</dt><dd>Grouped K/V heads; uptrain MHA checkpoints by mean-pooling with ~5% extra compute.</dd>
+    <dt>Contribution</dt><dd>Near-MHA quality at near-MQA speed.</dd>
+    <dt>Practical impact</dt><dd>Default attention in most open LLMs since 2023.</dd>
+    <dt>Limitations</dt><dd>Evaluated on T5 encoder-decoder tasks.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model</span>
+    <span class="paper-meta">DeepSeek-AI, 2024 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>KV cache and training cost at frontier scale.</dd>
+    <dt>Previous limitation</dt><dd>GQA trades quality for cache; MoE balance costs quality.</dd>
+    <dt>Approach</dt><dd>Multi-head latent attention with decoupled RoPE; DeepSeekMoE.</dd>
+    <dt>Contribution</dt><dd>93.3% smaller KV cache and 5.76× generation throughput vs DeepSeek 67B.</dd>
+    <dt>Practical impact</dt><dd>MLA reused in V3 and R1; spawned MLA kernels.</dd>
+    <dt>Limitations</dt><dd>Complex; hard to retrofit into existing models.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer</span>
+    <span class="paper-meta">Shazeer et al., 2017 · ICLR</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Capacity limited by compute per example.</dd>
+    <dt>Previous limitation</dt><dd>Conditional computation was impractical on GPUs.</dd>
+    <dt>Approach</dt><dd>Noisy top-k gating between LSTM layers; importance and load losses.</dd>
+    <dt>Contribution</dt><dd>Models up to 137B parameters with modest compute.</dd>
+    <dt>Practical impact</dt><dd>Foundation of all modern MoE.</dd>
+    <dt>Limitations</dt><dd>Instability and communication cost left to later work.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity</span>
+    <span class="paper-meta">Fedus, Zoph and Shazeer, 2021 · JMLR 2022</span></div>
+  <dl>
+    <dt>Problem</dt><dd>MoE complexity, instability and communication.</dd>
+    <dt>Previous limitation</dt><dd>Top-2 or more routing assumed necessary.</dd>
+    <dt>Approach</dt><dd>Top-1 routing, simplified aux loss, capacity factor, float32 router, smaller init.</dd>
+    <dt>Contribution</dt><dd>Up to 7× pretraining speed-up over T5 at equal FLOPs; 1.6T parameters.</dd>
+    <dt>Practical impact</dt><dd>The aux loss used in most later MoEs.</dd>
+    <dt>Limitations</dt><dd>Fine-tuning instability; token dropping.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Mixtral of Experts</span>
+    <span class="paper-meta">Jiang et al., 2024 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Open models with strong quality per active parameter.</dd>
+    <dt>Previous limitation</dt><dd>Few open, competitive MoE LLMs.</dd>
+    <dt>Approach</dt><dd>Mistral 7B architecture with 8 experts per layer, top-2.</dd>
+    <dt>Contribution</dt><dd>47B total / 13B active, matching or beating Llama 2 70B on many benchmarks.</dd>
+    <dt>Practical impact</dt><dd>Made MoE mainstream in open-weight serving.</dd>
+    <dt>Limitations</dt><dd>Little training data disclosure.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Efficient Streaming Language Models with Attention Sinks</span>
+    <span class="paper-meta">Xiao et al., 2023 · ICLR 2024</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Infinite-length streaming with bounded memory.</dd>
+    <dt>Previous limitation</dt><dd>Window attention collapses once initial tokens are evicted.</dd>
+    <dt>Approach</dt><dd>Keep ~4 initial "sink" tokens plus a rolling window.</dd>
+    <dt>Contribution</dt><dd>Explained sinks; stable modelling to 4M tokens.</dd>
+    <dt>Practical impact</dt><dd>Supported in serving engines; influenced sink designs.</dd>
+    <dt>Limitations</dt><dd>Does not extend what the model can recall.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Extending Context Window of Large Language Models via Positional Interpolation</span>
+    <span class="paper-meta">Chen et al., 2023 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>RoPE models fail beyond trained length.</dd>
+    <dt>Previous limitation</dt><dd>Extrapolation is unstable.</dd>
+    <dt>Approach</dt><dd>Linearly downscale positions; brief fine-tuning.</dd>
+    <dt>Contribution</dt><dd>LLaMA extended to 32K with ~1000 steps.</dd>
+    <dt>Practical impact</dt><dd>First widely used extension method.</dd>
+    <dt>Limitations</dt><dd>Loses local positional resolution.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">YaRN: Efficient Context Window Extension of Large Language Models</span>
+    <span class="paper-meta">Peng et al., 2023 · ICLR 2024</span></div>
+  <dl>
+    <dt>Problem</dt><dd>PI blurs local positions; NTK partially extrapolates.</dd>
+    <dt>Previous limitation</dt><dd>Uniform treatment of RoPE dimensions.</dd>
+    <dt>Approach</dt><dd>Per-dimension ramp by wavelength plus attention temperature.</dd>
+    <dt>Contribution</dt><dd>128K LLaMA 2 with far less fine-tuning data.</dd>
+    <dt>Practical impact</dt><dd>Used by DeepSeek and Qwen long-context models.</dd>
+    <dt>Limitations</dt><dd>Hyperparameters tuned for LLaMA; usable length still needs evaluation.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Lost in the Middle: How Language Models Use Long Contexts</span>
+    <span class="paper-meta">Liu et al., 2023 · TACL 2024</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Do models use all of their context?</dd>
+    <dt>Previous limitation</dt><dd>Context length reported as a capability without position analysis.</dd>
+    <dt>Approach</dt><dd>Vary answer position in multi-document QA and key-value retrieval.</dd>
+    <dt>Contribution</dt><dd>U-shaped accuracy by position across models.</dd>
+    <dt>Practical impact</dt><dd>Changed RAG context ordering and evaluation practice.</dd>
+    <dt>Limitations</dt><dd>Models of 2023; newer models reduce but do not eliminate the effect.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention</span>
+    <span class="paper-meta">Katharopoulos et al., 2020 · ICML</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Quadratic attention cost.</dd>
+    <dt>Previous limitation</dt><dd>Efficient attention variants lacked constant-memory decoding.</dd>
+    <dt>Approach</dt><dd>Kernel feature maps; associativity gives a recurrent form.</dd>
+    <dt>Contribution</dt><dd>Linear-time training and constant-memory decode.</dd>
+    <dt>Practical impact</dt><dd>Basis of RetNet, GLA, DeltaNet and hybrid layers.</dd>
+    <dt>Limitations</dt><dd>Weaker recall than softmax attention.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Mamba: Linear-Time Sequence Modeling with Selective State Spaces</span>
+    <span class="paper-meta">Gu and Dao, 2023 · COLM 2024</span></div>
+  <dl>
+    <dt>Problem</dt><dd>LTI SSMs cannot select content.</dd>
+    <dt>Previous limitation</dt><dd>S4-style models lagged Transformers on language.</dd>
+    <dt>Approach</dt><dd>Input-dependent <span class="math">\Delta, B, C</span>; hardware-aware parallel scan.</dd>
+    <dt>Contribution</dt><dd>Transformer-competitive language modelling with linear scaling and ~5× inference throughput.</dd>
+    <dt>Practical impact</dt><dd>Used in hybrids such as Jamba.</dd>
+    <dt>Limitations</dt><dd>Finite state limits exact recall.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Better &amp; Faster Large Language Models via Multi-token Prediction</span>
+    <span class="paper-meta">Gloeckle et al., 2024 · ICML</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Next-token loss is a local, sample-inefficient signal.</dd>
+    <dt>Previous limitation</dt><dd>Earlier multi-token work at small scale.</dd>
+    <dt>Approach</dt><dd>Shared trunk with <span class="math">n</span> independent heads; memory-efficient sequential backward.</dd>
+    <dt>Contribution</dt><dd>Better code benchmarks at scale; up to 3× faster self-speculative decoding.</dd>
+    <dt>Practical impact</dt><dd>MTP adopted (sequentially) in DeepSeek-V3.</dd>
+    <dt>Limitations</dt><dd>Can hurt small models; gains mostly on code.</dd>
+  </dl>
+</section>
+<p>Also read: Lepikhin et al. 2020 (GShard); Zoph et al. 2022 (ST-MoE); Dai et al. 2024 (DeepSeekMoE); DeepSeek-AI 2024 (DeepSeek-V3); Child et al. 2019 (Sparse Transformers); Beltagy et al. 2020 (Longformer); Jiang et al. 2023 (Mistral 7B); Hsieh et al. 2024 (RULER); Fu et al. 2024 (data engineering for 128K context); Gu et al. 2021 (S4); Dao and Gu 2024 (Mamba-2); Lieber et al. 2024 (Jamba); Bavarian et al. 2022 (FIM); Grattafiori et al. 2024 (Llama 3).</p>
+
+<h2>Interview Questions</h2>
+<ol>
+  <li>Derive the KV-cache size formula and apply it to a 70B GQA-8 model at 32K context and batch 16.</li>
+  <li>Why is decode memory-bound? When does the KV cache dominate weights?</li>
+  <li>Show that GQA with <span class="math">G = H</span> is MHA and with <span class="math">G = 1</span> is MQA. Why is <span class="math">G = 8</span> common?</li>
+  <li>How would you convert an MHA checkpoint to GQA, and how would you validate it?</li>
+  <li>Explain MLA's absorption trick and why RoPE breaks it.</li>
+  <li>Derive the Switch auxiliary loss and explain why it uses both <span class="math">f_i</span> and <span class="math">P_i</span>.</li>
+  <li>What is a capacity factor? What happens at inference if tokens are dropped?</li>
+  <li>Describe expert parallelism. What limits its throughput?</li>
+  <li>Why do LLMs have attention sinks, and why does sliding-window eviction fail without them?</li>
+  <li>Compare PI, NTK-aware scaling and YaRN in terms of which RoPE dimensions they change.</li>
+  <li>Design a long-context evaluation that a single-needle test would miss.</li>
+  <li>Show that causal linear attention can be computed recurrently. Why does it underperform softmax?</li>
+  <li>What does selectivity add to S4, and what does it cost in training?</li>
+  <li>How does multi-token prediction enable self-speculative decoding without changing outputs?</li>
+  <li>How is FIM data constructed, and what breaks when the cursor is mid-token?</li>
+</ol>
+
+<h2>Next Volume</h2>
+<p>Volume 8, Fine-Tuning and Post-Training, turns the architectures of this volume into useful
+assistants. Architectural choices constrain post-training: MoE routers must stay balanced under
+small SFT datasets, LoRA target modules differ for GQA and MLA projections, and long-context
+abilities must survive instruction tuning.</p>
+<p class="facet">Prerequisites from this volume</p>
+<ul>
+  <li>The attention and MoE modules and their parity tests (Chapters 2 and 3).</li>
+  <li>RoPE scaling configuration and long-context evaluation (Chapter 5).</li>
+  <li>The Documented/Inferred ledger for reading post-training reports (Chapter 8).</li>
+</ul>
+</section>
+
+</body>
+</html>

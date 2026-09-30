@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Design System Demonstration</title>
+<meta name="volume" content="Design System Demonstration">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Design System</p>
+  <h1 class="no-toc">Design System Demonstration</h1>
+  <p class="tp-subtitle">Every component the book uses, rendered through the real PDF pipeline</p>
+</section>
+
+<nav class="toc"></nav>
+
+<!-- ============================================================ CHAPTER -->
+<section class="chapter">
+<h2 id="attention">Scaled Dot-Product Attention</h2>
+<p class="chapter-lede">A sample chapter showing the problem-first structure, bullet-first writing,
+callouts, code, tables, diagrams and maths.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A recurrent network must compress an entire prefix into a fixed-size state and process
+  tokens sequentially. Long-range dependencies degrade, and training cannot be parallelised
+  across time.</p>
+</div>
+
+<p class="facet">Possible Solutions</p>
+<ul>
+  <li><strong>Bigger recurrent state</strong>: more memory per step, still sequential.</li>
+  <li><strong>Convolutions</strong>: parallel, but receptive field grows only with depth.</li>
+  <li><strong>Attention</strong>: every token reads every other token directly, in parallel.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Attention is a differentiable key–value lookup.</li>
+    <li>Each query scores every key; the softmax of the scores weights the values.</li>
+    <li>Cost is <span class="math">O(T^2 d)</span> in sequence length <span class="math">T</span>.</li>
+  </ul>
+</aside>
+
+<h3>How It Works</h3>
+
+<p>Given queries <span class="math">Q</span>, keys <span class="math">K</span> and values
+<span class="math">V</span>, each of shape <span class="math">(T, d_k)</span>:</p>
+
+<div class="math">\operatorname{Attention}(Q, K, V) = \operatorname{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right)V</div>
+
+<ol>
+  <li>Score every query against every key: <code>scores = q @ k.T</code>.</li>
+  <li>Scale by <span class="math">1/\sqrt{d_k}</span> so score variance stays near 1.</li>
+  <li>Apply the causal mask (decoder models only).</li>
+  <li>Softmax over keys; multiply by values.</li>
+</ol>
+
+<h4>Scaling and numerical stability</h4>
+<p>Without the scale, dot products of unit-variance vectors have variance
+<span class="math">d_k</span>, which pushes softmax into saturation and shrinks gradients.</p>
+
+<h5>Why subtract the maximum in softmax</h5>
+<p>Softmax is shift-invariant, so subtracting the row maximum changes nothing mathematically
+but prevents <code>exp</code> overflow for large logits.</p>
+
+<h3>Implementation</h3>
+
+<figure class="listing">
+<figcaption>Scaled dot-product attention from scratch in NumPy.</figcaption>
+<pre><code>import numpy as np
+
+
+def softmax(x: np.ndarray, axis: int = -1) -&gt; np.ndarray:
+    shifted = x - x.max(axis=axis, keepdims=True)  # stability
+    exp = np.exp(shifted)
+    return exp / exp.sum(axis=axis, keepdims=True)
+
+
+def attention(q, k, v, causal: bool = False):
+    """q, k, v: (B, T, D). Returns output (B, T, D) and weights (B, T, T)."""
+    d = q.shape[-1]
+    scores = q @ k.transpose(0, 2, 1) / np.sqrt(d)  # (B, T, T)
+    if causal:
+        t = scores.shape[-1]
+        future = np.triu(np.ones((t, t), dtype=bool), k=1)
+        scores = np.where(future, -np.inf, scores)
+    weights = softmax(scores, axis=-1)
+    return weights @ v, weights</code></pre>
+</figure>
+
+<pre class="output">max |ours - torch.sdpa| = 4.4e-16   (B=2, T=5, D=8, causal=True)</pre>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Use <code>-np.inf</code>, not <code>-1e9</code>, so masked weights are exactly zero.</li>
+    <li>Check parity against <code>torch.nn.functional.scaled_dot_product_attention</code>.</li>
+  </ul>
+</aside>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>Materialising the <span class="math">T \times T</span> matrix costs memory quadratic in
+    context length; production kernels (FlashAttention) never store it.</li>
+  </ul>
+</aside>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>A missing causal mask leaks future tokens during training: loss looks excellent,
+    generation is useless. Always test that masked weights are zero.</li>
+  </ul>
+</aside>
+
+<aside class="callout advanced"><span class="title">Research Frontier</span>
+  <ul>
+    <li>Linear attention and state-space models trade exact attention for
+    <span class="math">O(T)</span> cost; see Volume 7.</li>
+  </ul>
+</aside>
+
+<h3>Trade-offs and Comparison</h3>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">Advantages</p>
+    <ul><li>Fully parallel across tokens.</li><li>Direct long-range paths.</li><li>Simple, well-understood gradients.</li></ul></div>
+  <div class="cons"><p class="facet">Disadvantages</p>
+    <ul><li>Quadratic memory and compute.</li><li>No inherent notion of order.</li><li>KV cache grows with context at inference.</li></ul></div>
+</div>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Softmax overflow from unscaled scores in FP16.</li>
+  <li>Padding tokens attended to because the padding mask is missing.</li>
+</ul>
+
+<table>
+  <caption>Attention variants and their KV-cache cost per token per layer.</caption>
+  <thead><tr><th>Variant</th><th>KV heads</th><th class="num">KV bytes (d=4096, BF16)</th><th>Quality</th></tr></thead>
+  <tbody>
+    <tr><td>Multi-head (MHA)</td><td>32</td><td class="num">16,384</td><td>Baseline</td></tr>
+    <tr><td>Grouped-query (GQA-8)</td><td>8</td><td class="num">4,096</td><td>≈ baseline</td></tr>
+    <tr><td>Multi-query (MQA)</td><td>1</td><td class="num">512</td><td>Small drop</td></tr>
+  </tbody>
+</table>
+
+<h3>Architecture Diagrams</h3>
+
+<figure class="diagram">
+<pre class="ascii">User
+ |
+ v
+API Gateway
+ |
+ v
+Request Classifier
+ |
+ +----------+----------+
+ |                     |
+ v                     v
+Simple              Complex
+ |                     |
+ v                     v
+Small Model      Reasoning Model
+ |                     |
+ +----------+----------+
+            |
+            v
+       Validation
+            |
+            v
+         Response</pre>
+<figcaption>ASCII flow chart: a two-tier model router.</figcaption>
+</figure>
+
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  U[User request] --> G[Gateway]
+  G --> IG{Input guardrail}
+  IG -->|blocked| R1[Refusal]
+  IG -->|allowed| RT{Router}
+  RT -->|simple| S[Small model]
+  RT -->|complex| L[Reasoning model]
+  S --> OG[Output guardrail]
+  L --> OG
+  OG --> A[Answer]</pre>
+<figcaption>Mermaid flow chart: guardrails around a routed model call.</figcaption>
+</figure>
+
+<figure class="diagram">
+  <div class="arch">
+    <div class="arch-layer" data-label="Edge">
+      <div class="node client">Web / Mobile</div>
+      <div class="node gateway">API Gateway<small>auth · rate limit</small></div>
+    </div>
+    <div class="arch-layer" data-label="Control">
+      <div class="node guard">Guardrails</div>
+      <div class="node service">Orchestrator</div>
+      <div class="node service">Router</div>
+    </div>
+    <div class="arch-layer" data-label="Models">
+      <div class="node model">Small model</div>
+      <div class="node gpu">vLLM · 1×H100</div>
+      <div class="node external">Hosted API</div>
+    </div>
+    <div class="arch-layer" data-label="Data">
+      <div class="node store">Vector store</div>
+      <div class="node store">Postgres</div>
+      <div class="node queue">Event queue</div>
+    </div>
+    <div class="arch-layer" data-label="Ops">
+      <div class="node eval">Evaluation</div>
+      <div class="node obs">Traces · Metrics</div>
+    </div>
+  </div>
+  <figcaption>HTML/CSS architecture diagram (HLD) of an AI application.</figcaption>
+</figure>
+
+<h3>Simple Versus Production</h3>
+
+<div class="frame simple"><p>One process computes attention over the full sequence for each request.</p></div>
+<div class="frame production"><p>Fused kernels, paged KV cache, continuous batching and tensor parallelism across GPUs.</p></div>
+<div class="frame why-complex">
+  <ul><li>Memory bandwidth, not FLOPs, limits decode.</li><li>Many concurrent requests share one GPU.</li></ul>
+</div>
+
+<h3>Real Products</h3>
+<p><span class="evidence documented">Documented</span> vLLM stores the KV cache in fixed-size
+blocks (PagedAttention), per Kwon et al. (2023).</p>
+<p><span class="evidence inferred">Inferred</span> Large hosted assistants very likely use
+prefix caching for long system prompts; providers expose it as a priced feature, but internals are not public.</p>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Attention Is All You Need</span>
+    <span class="paper-meta">Vaswani et al., 2017 · NeurIPS · arXiv:1706.03762</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Sequence transduction with RNNs is slow and struggles with long dependencies.</dd>
+    <dt>Approach</dt><dd>Replace recurrence entirely with multi-head self-attention.</dd>
+    <dt>Contribution</dt><dd>The Transformer: parallel training, state-of-the-art translation.</dd>
+    <dt>Limitations</dt><dd>Quadratic cost in sequence length; position handled by added encodings.</dd>
+  </dl>
+</section>
+
+<div class="frame exercise"><p>Implement multi-head attention by reshaping <code>(B, T, C)</code> to
+<code>(B, H, T, D)</code>; prove parity with the single-head version when <span class="math">H = 1</span>.</p></div>
+</section>
+
+<!-- ============================================================ REVIEW -->
+<section class="review">
+<h1>Volume Review</h1>
+<h2>What You Learned</h2>
+<ul><li>How attention turns similarity scores into weighted reads.</li><li>Why scaling and masking matter.</li></ul>
+<h2>Interview Questions</h2>
+<ol><li>Why is attention scaled by <span class="math">1/\sqrt{d_k}</span>, and what breaks without it?</li>
+<li>How does GQA reduce KV-cache memory, and what does it cost in quality?</li></ol>
+</section>
+
+</body>
+</html>

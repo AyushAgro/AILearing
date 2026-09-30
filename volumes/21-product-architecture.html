@@ -1,0 +1,2050 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 21 · AI Product Architecture and Case Studies</title>
+<meta name="volume" content="Volume 21 · AI Product Architecture and Case Studies">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 21</p>
+  <h1 class="no-toc">AI Product Architecture and Case Studies</h1>
+  <p class="tp-subtitle">HLD, LLD and Real-World AI Products</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Turn a product problem into an architecture: requirements, SLOs, risk register and ADRs that
+  survive design review.</li>
+  <li>Assemble the reference HLD used across the book into a deployable service graph:
+  gateway, orchestration, model, retrieval, agent, tool, eval and guardrail services, plus stores,
+  queues and caches.</li>
+  <li>Ship the continuous package as <code>services/</code>: gateway admission, request context,
+  model adapters, exact/semantic/prompt caches, error taxonomy and ADR helpers — all composing
+  Forge packages from Volumes 10–18.</li>
+  <li>Analyse six product classes with strict <span class="evidence documented">Documented</span>
+  versus <span class="evidence inferred">Inferred</span> labels. Public reports are evidence;
+  guessed internal topology is labelled as such.</li>
+  <li>Close with unit economics and a design-review checklist you can run on any AI system design.</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>Volumes 10–12: evaluation, inference arithmetic and serving SLOs.</li>
+  <li>Volumes 13–14: context construction and RAG with access control.</li>
+  <li>Volumes 15–16: agents and the harness (permissions, sandbox, traces).</li>
+  <li>Volumes 17–18: guardrails and routing on the quality–cost–latency frontier.</li>
+  <li>Volumes 19–20: multimodal paths appear as capability profiles, not as new maths.</li>
+</ul>
+
+<p class="facet">How to read the code</p>
+<ul>
+  <li>Every listing was executed with Python 3.12 on macOS. Printed output is real and unedited.</li>
+  <li>Listings seed <code>services/</code>: <code>gateway</code>, <code>orchestrator</code>,
+  <code>adapters</code>, <code>cache</code>, <code>errors</code>, <code>adr</code>,
+  <code>economics</code> and a support-agent sketch. They import Forge contracts
+  (<code>forge.router</code>, <code>forge.harness</code>, <code>forge.guard</code>) where those
+  packages exist; demos here use in-process fakes so the volume runs without hosted APIs.</li>
+  <li>Case-study diagrams mix documented public facts with inferred HLD. Read the evidence tags
+  before you copy a box into your own design doc.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Package layout</span>
+  <ul>
+    <li><code>services/gateway.py</code> — admission, quotas, request IDs, idempotency.</li>
+    <li><code>services/context.py</code> — <code>RequestContext</code>, deadlines, tenant scope.</li>
+    <li><code>services/adapters.py</code> — model adapter protocol, retries, streaming chunks.</li>
+    <li><code>services/cache.py</code> — exact, semantic and prompt-prefix caches.</li>
+    <li><code>services/orchestrator.py</code> — workflow and bounded-agent entry points.</li>
+    <li><code>services/errors.py</code> — error taxonomy and client-safe mapping.</li>
+    <li><code>services/adr.py</code> — ADR record and renderer.</li>
+    <li><code>services/economics.py</code> — conversation unit-cost model.</li>
+    <li><code>services/support_agent.py</code> — practical-project skeleton on Forge.</li>
+  </ul>
+</aside>
+
+<p class="facet">British English note</p>
+<ul>
+  <li>This volume uses <em>architecture</em>, <em>behaviour</em>, <em>defence</em>,
+  <em>normalise</em> and <em>organised</em> in prose; code identifiers stay ASCII where the
+  ecosystem expects them (<code>normalize_key</code>, <code>favor_cache</code> is never used —
+  prefer <code>prefer_cache</code>).</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1   Product → architecture   requirements, SLOs, risk, ADRs
+Chapter 2   Reference architecture   gateway … stores, queues, caches
+Chapter 3   LLD patterns             adapters, context, stream, retry, cache
+Chapter 4   Data architecture        conversation, feedback, vector, events
+Chapter 5   Case: general chat       ChatGPT / Claude / Gemini (+ evidence)
+Chapter 6   Case: code completion    Copilot, latency, FIM, telemetry
+Chapter 7   Case: coding agents      harness, sandbox, SWE-bench
+Chapter 8   Case: enterprise         ACL RAG, connectors, tenancy
+Chapter 9   Case: research           citations, long jobs
+Chapter 10  Case: support agents     workflows vs agents, escalation
+Chapter 11  Cost architecture        unit economics, cache, routing, capacity
+Chapter 12  Design review method     quality / safety / cost / ops checklist</pre>
+<figcaption>Map of Volume 21. Chapters 1–4 build the reusable HLD/LLD; 5–10 apply it with evidence
+discipline; 11–12 make the design reviewable and affordable.</figcaption>
+</figure>
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="product-to-architecture">From Product Problem to AI Architecture</h2>
+<p class="chapter-lede">An AI architecture that does not start from a product problem is a box
+diagram looking for a budget. This chapter turns a problem statement into requirements, SLOs, a
+risk register and ADRs that later chapters can implement.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A stakeholder asks for "a ChatGPT for our support tickets". Engineering sketches a chatbot.
+  Six months later the system cannot meet the refund SLA, leaks one tenant's policy into another's
+  answer, and the bill grows linearly with ticket volume. The failure was not the model. It was
+  the missing product-to-architecture translation.</p>
+</div>
+
+<p class="facet">Possible approaches</p>
+<ul>
+  <li><strong>Demo-first.</strong> Prompt a frontier API until a demo impresses. Fast; silent on
+  SLOs, tenancy and cost.</li>
+  <li><strong>Platform-first.</strong> Build every box in the reference HLD before a single user
+  journey works. Slow; often over-built for the first use case.</li>
+  <li><strong>Problem → contract → architecture.</strong> Write who the user is, what success and
+  failure look like, which risks are unacceptable, then choose only the boxes that enforce those
+  contracts. This volume's default.</li>
+</ul>
+
+<h3>Requirements That Survive Design Review</h3>
+
+<table>
+  <caption>Requirement kinds for AI products. Soft preference is not a requirement.</caption>
+  <thead><tr><th>Kind</th><th>Example</th><th>Test</th></tr></thead>
+  <tbody>
+    <tr><td>Functional</td><td>Answer "where is my order?" from the order API within policy</td><td>Golden tickets</td></tr>
+    <tr><td>Quality</td><td>≥ 85% helpful on a labelled set; ≤ 2% harmful on red-team set</td><td>Offline gates (Vol 10)</td></tr>
+    <tr><td>Latency</td><td>TTFT p95 ≤ 800&nbsp;ms; end-to-end p95 ≤ 4&nbsp;s for workflow answers</td><td>Load + canary</td></tr>
+    <tr><td>Cost</td><td>≤ $0.04 mean per resolved ticket at target mix</td><td>Cost ledger (Ch 11)</td></tr>
+    <tr><td>Safety / compliance</td><td>No cross-tenant retrieval; no refund above policy without approval</td><td>Probes + harness (Vol 16–17)</td></tr>
+    <tr><td>Operability</td><td>Every answer has a trace ID; on-call can replay a session</td><td>Incident drill</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Write the SLO before the model name. A model is a means; the SLO is the contract.</li>
+    <li>Separate <em>must never</em> (cross-tenant leak, unapproved refund) from <em>should usually</em>
+    (helpful tone). Architecture enforces the first; evaluation tracks the second.</li>
+  </ul>
+</aside>
+
+<h3>Risk Register for AI Products</h3>
+
+<ul>
+  <li><strong>Model risk.</strong> Hallucination, refusal gaps, capability cliffs on long context.</li>
+  <li><strong>Data risk.</strong> Training or retrieval leakage; retention past policy; poisoned
+  connectors.</li>
+  <li><strong>Agency risk.</strong> Tool side effects the harness cannot roll back.</li>
+  <li><strong>Cost risk.</strong> Unbounded agent loops; cache miss storms; frontier-only routing.</li>
+  <li><strong>Ops risk.</strong> Provider outage without a degraded mode; silent quality drift.</li>
+</ul>
+
+<p>Each risk needs an owner, a residual rating and a control that lives on a trust boundary — not
+only in a system prompt.</p>
+
+<h3>Architecture Decision Records</h3>
+
+<p>ADRs capture decisions that are expensive to reverse: where tenancy is enforced, whether the
+product is a workflow or an agent, which cache layers exist, and what "degraded" means to the
+user. Volume 1 introduced the habit; here it becomes a first-class artefact in
+<code>services/adr.py</code>.</p>
+
+<figure class="listing">
+<figcaption><code>services/adr.py</code>: a minimal ADR record and renderer.</figcaption>
+<pre><code>"""Architecture decision records for AI product choices."""
+from dataclasses import dataclass
+from datetime import date
+
+
+@dataclass(frozen=True)
+class ADR:
+    number: int
+    title: str
+    status: str  # Proposed | Accepted | Superseded | Deprecated
+    context: str
+    decision: str
+    consequences: tuple[str, ...]
+
+
+def render_adr(a: ADR) -> str:
+    lines = [
+        f"# ADR-{a.number:04d}: {a.title}",
+        f"Status: {a.status} · {date.today().isoformat()}",
+        "",
+        "## Context",
+        a.context,
+        "",
+        "## Decision",
+        a.decision,
+        "",
+        "## Consequences",
+    ]
+    lines += [f"- {c}" for c in a.consequences]
+    return "\n".join(lines)
+
+
+adr = ADR(
+    number=7,
+    title="Tenant ACL enforced in retrieval planner",
+    status="Accepted",
+    context=(
+        "Cross-tenant leakage was the highest residual risk "
+        "on the enterprise assistant."
+    ),
+    decision=(
+        "Filter by tenant_id and ACL before ranking; "
+        "never rely on the prompt to honour tenancy."
+    ),
+    consequences=(
+        "Extra join on every retrieval",
+        "Prompts stay tenant-agnostic",
+        "Eval must include cross-tenant probes",
+    ),
+)
+print(render_adr(adr))</code></pre>
+</figure>
+
+<pre class="output"># ADR-0007: Tenant ACL enforced in retrieval planner
+Status: Accepted · 2026-09-29
+
+## Context
+Cross-tenant leakage was the highest residual risk on the enterprise assistant.
+
+## Decision
+Filter by tenant_id and ACL before ranking; never rely on the prompt to honour tenancy.
+
+## Consequences
+- Extra join on every retrieval
+- Prompts stay tenant-agnostic
+- Eval must include cross-tenant probes</pre>
+
+<div class="frame exercise"><p>Write ADR-0001 for your product: workflow versus agent for the first journey.
+List three consequences you are accepting. If you cannot name a consequence, you do not yet have
+a decision.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="reference-architecture">Reference Architecture</h2>
+<p class="chapter-lede">Volume 1 drew the boxes. This chapter makes them services with contracts:
+what they own, what they refuse, and how a request crosses the graph without becoming a ball of mud.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A monolith that "calls the model" accumulates auth, RAG, tools, retries and billing in one
+  process. The first outage takes everything down; the first compliance review cannot find the
+  tenancy boundary. You need named services and named stores, even if day one deploys them as
+  modules in one binary.</p>
+</div>
+
+<h3>Service Graph</h3>
+
+<figure class="diagram">
+  <div class="arch">
+    <div class="arch-layer" data-label="Edge">
+      <div class="node client">Clients</div>
+      <div class="node gateway">Gateway<small>auth · quota · idempotency</small></div>
+    </div>
+    <div class="arch-layer" data-label="Control">
+      <div class="node guard">Guardrail service</div>
+      <div class="node service">Orchestrator<small>workflow / agent</small></div>
+      <div class="node service">Router<small>forge.router</small></div>
+      <div class="node eval">Eval sampler</div>
+    </div>
+    <div class="arch-layer" data-label="Capability">
+      <div class="node service">Model service</div>
+      <div class="node service">Retrieval service</div>
+      <div class="node service">Agent / harness<small>forge.harness</small></div>
+      <div class="node service">Tool service</div>
+    </div>
+    <div class="arch-layer" data-label="State">
+      <div class="node store">Conversation</div>
+      <div class="node store">Vector / search</div>
+      <div class="node store">Feedback</div>
+      <div class="node queue">Events</div>
+      <div class="node store">Caches</div>
+    </div>
+  </div>
+  <figcaption>Reference HLD for this volume. Edges are contracts; dashed trust is a bug.</figcaption>
+</figure>
+
+<table>
+  <caption>Service responsibilities and the Forge package each reuses.</caption>
+  <thead><tr><th>Service</th><th>Owns</th><th>Forge / prior volume</th></tr></thead>
+  <tbody>
+    <tr><td>Gateway</td><td>Identity, quotas, request IDs, idempotency keys</td><td><code>services/gateway</code>; Vol 12 SLOs</td></tr>
+    <tr><td>Orchestrator</td><td>Workflow graph or agent loop; context assembly</td><td>Vol 13, 15</td></tr>
+    <tr><td>Model service</td><td>Adapter protocol, batching, provider credentials</td><td>Vol 11–12</td></tr>
+    <tr><td>Retrieval</td><td>Hybrid search, ACL filters, rerank</td><td>Vol 14</td></tr>
+    <tr><td>Agent / harness</td><td>Permissions, sandbox, budgets, traces</td><td><code>forge.harness</code> (Vol 16)</td></tr>
+    <tr><td>Tool service</td><td>Schema validation, side-effect execution</td><td>Vol 15–16</td></tr>
+    <tr><td>Guardrail service</td><td>Pre/mid/post policy pipeline</td><td><code>forge.guard</code> (Vol 17)</td></tr>
+    <tr><td>Eval service</td><td>Offline gates, online sampling, judges</td><td>Vol 10</td></tr>
+    <tr><td>Router</td><td>Model choice under capability and budget</td><td><code>forge.router</code> (Vol 18)</td></tr>
+  </tbody>
+</table>
+
+<h3>Request Path</h3>
+
+<figure class="diagram">
+<pre class="ascii">Client
+  │  Authorization, Idempotency-Key
+  ▼
+Gateway ──► RequestContext (tenant, deadline, request_id)
+  │
+  ▼
+Guard (input) ──► Orchestrator
+                    │
+        ┌───────────┼───────────┐
+        ▼           ▼           ▼
+   Retrieval    Router      Cache lookup
+        │           │           │
+        └────► Model adapter ◄──┘
+                    │
+              Tool / harness (if needed)
+                    │
+              Guard (output) ──► stream to client
+                    │
+              Events + conversation + cost ledger</pre>
+<figcaption>Happy path. Cache hits may short-circuit the model; tools never bypass the harness.</figcaption>
+</figure>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>A service boundary exists when two teams (or two failure domains) need an explicit contract.
+    Deploying as one process is allowed; erasing the contract is not.</li>
+    <li>The orchestrator may call Forge libraries in-process. The gateway still issues the
+    <code>RequestContext</code> that every downstream call must carry.</li>
+  </ul>
+</aside>
+
+<h3>Queues, Caches and Stores</h3>
+
+<ul>
+  <li><strong>Queues.</strong> Long research jobs, offline eval batches and asynchronous tool
+  webhooks. Synchronous chat stays on the request path with a deadline.</li>
+  <li><strong>Caches.</strong> Exact response, semantic near-duplicate and prompt-prefix (provider
+  KV) — Chapter 3.</li>
+  <li><strong>Stores.</strong> Conversation, feedback, vectors and events — Chapter 4.</li>
+</ul>
+
+<h3>Orchestrator Entry Points</h3>
+
+<p>The orchestrator is the only component allowed to choose between a fixed workflow and a bounded
+agent loop. Callers never import <code>forge.harness</code> directly from the HTTP handler.</p>
+
+<figure class="listing">
+<figcaption><code>services/orchestrator.py</code>: dispatch by product mode.</figcaption>
+<pre><code>"""Orchestrator: workflow or bounded agent, never both by accident."""
+from dataclasses import dataclass
+from enum import Enum
+from typing import Callable
+
+
+class Mode(str, Enum):
+    WORKFLOW = "workflow"
+    AGENT = "agent"
+
+
+@dataclass(frozen=True)
+class TurnResult:
+    text: str
+    mode: Mode
+    steps: int
+
+
+def run_workflow(ctx_tenant: str, user_text: str) -&gt; TurnResult:
+    # FAQ / policy path — fixed steps
+    _ = ctx_tenant
+    answer = f"[workflow] ack: {user_text[:40]}"
+    return TurnResult(answer, Mode.WORKFLOW, steps=2)
+
+
+def run_agent(ctx_tenant: str, user_text: str, step_budget: int = 8) -&gt; TurnResult:
+    # Bounded loop; real code calls forge.harness
+    _ = (ctx_tenant, user_text)
+    return TurnResult("[agent] investigation complete", Mode.AGENT, steps=min(3, step_budget))
+
+
+def handle(
+    mode: Mode,
+    tenant: str,
+    text: str,
+    workflows: dict[Mode, Callable[..., TurnResult]] | None = None,
+) -&gt; TurnResult:
+    table = workflows or {
+        Mode.WORKFLOW: run_workflow,
+        Mode.AGENT: run_agent,
+    }
+    return table[mode](tenant, text)
+
+
+for m in (Mode.WORKFLOW, Mode.AGENT):
+    r = handle(m, "acme", "where is order 42?")
+    print(f"{r.mode.value:8s} steps={r.steps} text={r.text}")</code></pre>
+</figure>
+
+<pre class="output">workflow steps=2 text=[workflow] ack: where is order 42?
+agent    steps=3 text=[agent] investigation complete</pre>
+
+<aside class="callout impl"><span class="title">Composition with Forge</span>
+  <ul>
+    <li>Workflows call <code>forge.router</code> once per model step and <code>forge.guard</code> on
+    input/output.</li>
+    <li>Agent mode constructs a harness session (Volume 16) with the same <code>RequestContext</code>
+    tenant and deadline.</li>
+    <li>Eval sampling hooks after <code>TurnResult</code> — never inside the provider SDK callback.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Draw your product on the HLD above. Circle every box you will ship in
+the first pilot. Cross out every box that is hope. Write one sentence per crossed-out box stating
+which risk you are accepting by omitting it.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="lld-patterns">LLD Patterns</h2>
+<p class="chapter-lede">High-level boxes fail in production at the seams: adapters, deadlines,
+retries, idempotency and caches. This chapter implements those seams as small, testable modules
+under <code>services/</code>.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Two microservices each invent their own retry loop and cache key. One retries non-idempotent
+  refunds; the other caches across tenants. The incident report blames "the model". The LLD did not
+  exist.</p>
+</div>
+
+<h3>Request Context</h3>
+
+<figure class="listing">
+<figcaption><code>services/context.py</code>: every downstream call inherits tenant and deadline.</figcaption>
+<pre><code>"""Request-scoped context propagated from the gateway."""
+from dataclasses import dataclass, field
+from typing import Optional
+import time
+
+
+@dataclass
+class RequestContext:
+    request_id: str
+    tenant_id: str
+    user_id: str
+    idempotency_key: Optional[str] = None
+    deadline_ms: int = 8000
+    started_ms: float = field(default_factory=lambda: time.time() * 1000)
+
+    def remaining_ms(self) -&gt; float:
+        return self.deadline_ms - (time.time() * 1000 - self.started_ms)
+
+    def expired(self) -&gt; bool:
+        return self.remaining_ms() &lt;= 0
+
+
+ctx = RequestContext("abc123", "acme", "u1", deadline_ms=50)
+print(f"remaining≈{ctx.remaining_ms():.0f}ms expired={ctx.expired()}")
+time.sleep(0.06)
+print(f"after sleep expired={ctx.expired()}")</code></pre>
+</figure>
+
+<pre class="output">remaining≈50ms expired=False
+after sleep expired=True</pre>
+
+<h3>Gateway Admission</h3>
+
+<figure class="listing">
+<figcaption><code>services/gateway.py</code>: token-bucket quota and idempotency map.</figcaption>
+<pre><code>"""Edge admission: rate limit and idempotent request IDs."""
+from dataclasses import dataclass
+from typing import Optional
+import hashlib
+import time
+from services.context import RequestContext
+
+
+class GatewayError(Exception):
+    def __init__(self, code: str, msg: str):
+        super().__init__(msg)
+        self.code = code
+
+
+class Gateway:
+    def __init__(self, qps: float = 5.0):
+        self.qps = qps
+        self._tokens = qps
+        self._last = time.time()
+        self._seen: dict[str, str] = {}
+
+    def admit(
+        self, tenant: str, user: str, idem: Optional[str]
+    ) -&gt; RequestContext:
+        now = time.time()
+        self._tokens = min(self.qps, self._tokens + (now - self._last) * self.qps)
+        self._last = now
+        if self._tokens &lt; 1:
+            raise GatewayError("RATE_LIMITED", "quota exceeded")
+        self._tokens -= 1
+        rid = hashlib.sha256(
+            f"{tenant}:{user}:{time.time_ns()}".encode()
+        ).hexdigest()[:12]
+        if idem:
+            if idem in self._seen:
+                raise GatewayError(
+                    "IDEMPOTENT_REPLAY",
+                    f"replay of {idem} -&gt; {self._seen[idem]}",
+                )
+            self._seen[idem] = rid
+        return RequestContext(rid, tenant, user, idem)
+
+
+gw = Gateway(qps=3)
+for i in range(4):
+    try:
+        ctx = gw.admit("acme", "u1", f"k{i}" if i &lt; 3 else "k0")
+        print(f"admit ok request_id={ctx.request_id}")
+    except GatewayError as e:
+        print(f"admit fail code={e.code}")</code></pre>
+</figure>
+
+<pre class="output">admit ok request_id=516f59f641c4
+admit ok request_id=7aee04fab01d
+admit ok request_id=a91a7f2eca0c
+admit fail code=RATE_LIMITED</pre>
+
+<p>At higher QPS the same <code>k0</code> replay returns <code>IDEMPOTENT_REPLAY</code> instead.
+Both codes must map to distinct client behaviours: 429 versus 200-with-prior-body in a real HTTP
+gateway.</p>
+
+<h3>Model Adapters and Streaming</h3>
+
+<figure class="listing">
+<figcaption><code>services/adapters.py</code>: one protocol, retries with jitter, chunked stream.</figcaption>
+<pre><code>"""Vendor-neutral model adapter with retries and streaming."""
+from dataclasses import dataclass
+from typing import Iterator, Protocol
+import random
+import time
+
+
+@dataclass(frozen=True)
+class ChatRequest:
+    messages: tuple[tuple[str, str], ...]
+    model: str
+    max_tokens: int = 256
+
+
+@dataclass(frozen=True)
+class ChatChunk:
+    text: str
+    done: bool
+
+
+class ChatModel(Protocol):
+    def stream(self, req: ChatRequest) -&gt; Iterator[ChatChunk]: ...
+
+
+class ScriptedModel:
+    def __init__(self, text: str, fail_times: int = 0):
+        self.text = text
+        self._fails = fail_times
+
+    def stream(self, req: ChatRequest) -&gt; Iterator[ChatChunk]:
+        if self._fails &gt; 0:
+            self._fails -= 1
+            raise TimeoutError("upstream timeout")
+        for word in self.text.split():
+            yield ChatChunk(word + " ", False)
+        yield ChatChunk("", True)
+
+
+def with_retries(model: ChatModel, req: ChatRequest, attempts: int = 3) -&gt; str:
+    delay = 0.01
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return "".join(c.text for c in model.stream(req)).strip()
+        except TimeoutError as e:
+            last = e
+            time.sleep(delay * (0.5 + random.random()))
+            delay *= 2
+    raise last  # type: ignore[misc]
+
+
+req = ChatRequest((("user", "hi"),), "mid")
+m = ScriptedModel("hello from adapter", fail_times=1)
+print(with_retries(m, req))</code></pre>
+</figure>
+
+<pre class="output">hello from adapter</pre>
+
+<h3>Caching: Exact, Semantic and Prompt</h3>
+
+<figure class="listing">
+<figcaption><code>services/cache.py</code>: three cache layers with different trust assumptions.</figcaption>
+<pre><code>"""Exact LRU, semantic near-duplicate and prompt-prefix bookkeeping."""
+from collections import OrderedDict
+import hashlib
+import json
+import math
+
+
+class ExactCache:
+    def __init__(self, cap: int = 3):
+        self.cap = cap
+        self.store: OrderedDict[str, str] = OrderedDict()
+
+    def key(self, model: str, messages: list) -&gt; str:
+        raw = json.dumps({"m": model, "msg": messages}, sort_keys=True)
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def get(self, k: str) -&gt; str | None:
+        if k in self.store:
+            self.store.move_to_end(k)
+            return self.store[k]
+        return None
+
+    def put(self, k: str, v: str) -&gt; None:
+        self.store[k] = v
+        self.store.move_to_end(k)
+        while len(self.store) &gt; self.cap:
+            self.store.popitem(last=False)
+
+
+def cosine(a: list[float], b: list[float]) -&gt; float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a)) or 1e-9
+    nb = math.sqrt(sum(x * x for x in b)) or 1e-9
+    return dot / (na * nb)
+
+
+class SemanticCache:
+    def __init__(self, threshold: float = 0.92):
+        self.threshold = threshold
+        self.items: list[tuple[list[float], str]] = []
+
+    def lookup(self, emb: list[float]) -&gt; tuple[str | None, float]:
+        best, ans = -1.0, None
+        for e, a in self.items:
+            s = cosine(emb, e)
+            if s &gt; best:
+                best, ans = s, a
+        if best &gt;= self.threshold:
+            return ans, best
+        return None, best
+
+    def put(self, emb: list[float], answer: str) -&gt; None:
+        self.items.append((emb, answer))
+
+
+class PromptCacheLedger:
+    """Track provider prompt-cache hits; keys include tenant."""
+
+    def __init__(self):
+        self.hits = 0
+        self.misses = 0
+
+    def record(self, tenant: str, prefix_hash: str, hit: bool) -&gt; None:
+        # tenant is part of the key space — never share prefixes across tenants
+        _ = (tenant, prefix_hash)
+        if hit:
+            self.hits += 1
+        else:
+            self.misses += 1
+
+
+ec = ExactCache(3)
+k = ec.key("mid", [("user", "hi")])
+print("exact miss", ec.get(k))
+ec.put(k, "hello")
+print("exact hit", ec.get(k))
+sc = SemanticCache(0.9)
+sc.put([1.0, 0.0, 0.0], "Paris is the capital")
+ans, score = sc.lookup([0.99, 0.1, 0.0])
+print(f"semantic hit={ans!r} score={score:.3f}")
+ans2, score2 = sc.lookup([0.0, 1.0, 0.0])
+print(f"semantic miss ans={ans2} score={score2:.3f}")</code></pre>
+</figure>
+
+<pre class="output">exact miss None
+exact hit hello
+semantic hit='Paris is the capital' score=0.995
+semantic miss ans=None score=0.000</pre>
+
+<table>
+  <caption>When each cache is safe.</caption>
+  <thead><tr><th>Layer</th><th>Key includes</th><th>Safe for</th><th>Unsafe for</th></tr></thead>
+  <tbody>
+    <tr><td>Exact</td><td>tenant, model, full messages, tools version</td><td>Deterministic FAQ</td><td>Personalised or time-varying answers</td></tr>
+    <tr><td>Semantic</td><td>tenant, embedding, policy version</td><td>Paraphrased FAQ with review</td><td>High-stakes or ACL-sensitive content</td></tr>
+    <tr><td>Prompt / KV</td><td>tenant, system+tools prefix</td><td>Reducing TTFT on long system prompts</td><td>Cross-tenant prefix reuse</td></tr>
+  </tbody>
+</table>
+
+<h3>Error Taxonomy</h3>
+
+<figure class="listing">
+<figcaption><code>services/errors.py</code>: map internal failures to client-safe codes.</figcaption>
+<pre><code>"""Error taxonomy for AI product APIs."""
+from enum import Enum
+
+
+class ErrorClass(str, Enum):
+    VALIDATION = "validation"       # 400 — bad input
+    AUTH = "auth"                   # 401/403
+    RATE_LIMIT = "rate_limit"       # 429
+    UPSTREAM = "upstream"           # 502/504 — model/provider
+    POLICY = "policy"               # 422 — guardrail denial
+    BUDGET = "budget"               # 429 — token/£ budget
+    INTERNAL = "internal"           # 500
+
+
+CLIENT_SAFE = {
+    ErrorClass.VALIDATION: "invalid_request",
+    ErrorClass.AUTH: "unauthorized",
+    ErrorClass.RATE_LIMIT: "rate_limited",
+    ErrorClass.UPSTREAM: "model_unavailable",
+    ErrorClass.POLICY: "policy_denied",
+    ErrorClass.BUDGET: "budget_exceeded",
+    ErrorClass.INTERNAL: "internal_error",
+}
+
+
+def to_client(code: ErrorClass) -&gt; str:
+    return CLIENT_SAFE[code]
+
+
+for c in ErrorClass:
+    print(f"{c.value:12s} -&gt; {to_client(c)}")</code></pre>
+</figure>
+
+<pre class="output">validation   -&gt; invalid_request
+auth         -&gt; unauthorized
+rate_limit   -&gt; rate_limited
+upstream     -&gt; model_unavailable
+policy       -&gt; policy_denied
+budget       -&gt; budget_exceeded
+internal     -&gt; internal_error</pre>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Retries only on <code>UPSTREAM</code> with idempotent reads. Never retry a refund tool
+    without an idempotency key at the tool boundary (Volume 16).</li>
+    <li>Semantic cache misses must not fall back to another tenant's embedding index.</li>
+    <li>Stream cancellation must still write a terminal event so cost and eval samplers see the turn.</li>
+  </ul>
+</aside>
+
+<h3>Idempotency Across the Stack</h3>
+
+<table>
+  <caption>Where idempotency keys live. One key at the gateway is not enough for tools.</caption>
+  <thead><tr><th>Layer</th><th>Key scope</th><th>On replay</th></tr></thead>
+  <tbody>
+    <tr><td>Gateway</td><td>Client <code>Idempotency-Key</code> + tenant</td><td>Return prior response / request id</td></tr>
+    <tr><td>Orchestrator turn</td><td><code>session_id</code> + <code>turn_id</code></td><td>Skip duplicate model call if committed</td></tr>
+    <tr><td>Tool / harness</td><td>Tool name + business id (e.g. refund id)</td><td>Return prior tool result; no second side effect</td></tr>
+    <tr><td>Provider chat</td><td>Often none — treat as non-idempotent</td><td>Prefer cache hit or accept duplicate cost</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>Tool-level idempotency map used by the harness boundary.</figcaption>
+<pre><code>"""Remember side effects so harness replay is safe."""
+
+class ToolIdempotency:
+    def __init__(self):
+        self._done: dict[str, dict] = {}
+
+    def run(self, key: str, fn):
+        if key in self._done:
+            return self._done[key], True  # replay
+        result = fn()
+        self._done[key] = result
+        return result, False
+
+
+store = ToolIdempotency()
+calls = {"n": 0}
+
+def refund():
+    calls["n"] += 1
+    return {"status": "ok", "amount": 20}
+
+
+r1, replay1 = store.run("refund:ord-9", refund)
+r2, replay2 = store.run("refund:ord-9", refund)
+print(r1, "replay", replay1, "calls", calls["n"])
+print(r2, "replay", replay2, "calls", calls["n"])</code></pre>
+</figure>
+
+<pre class="output">{'status': 'ok', 'amount': 20} replay False calls 1
+{'status': 'ok', 'amount': 20} replay True calls 1</pre>
+
+<ul class="failure-modes">
+  <li><strong>Retrying chat completions</strong> without a cache, doubling cost on slow clients.</li>
+  <li><strong>Gateway idempotency only</strong> while the refund tool still double-charges.</li>
+  <li><strong>Semantic cache</strong> keyed without tenant, leaking answers across customers.</li>
+  <li><strong>Deadline ignored</strong> in the adapter so retries run after the client has gone.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="data-architecture">Data Architecture for AI Products</h2>
+<p class="chapter-lede">Models are ephemeral. The durable product is the data plane: conversations,
+feedback, vectors, events and retention rules. This chapter designs that plane so privacy and
+analytics do not fight each other.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Product wants "remember this user". Legal wants a 30-day retention clock. Analytics wants
+  six months of prompts for quality work. Security wants no prompts in the same lake as billing
+  identifiers. Without an explicit data architecture, one Postgres table absorbs all four demands
+  and satisfies none.</p>
+</div>
+
+<h3>Stores and Their Jobs</h3>
+
+<table>
+  <caption>Primary stores. Kleppmann's lesson applies: choose by access pattern, not by fashion.</caption>
+  <thead><tr><th>Store</th><th>Write pattern</th><th>Read pattern</th><th>Retention default</th></tr></thead>
+  <tbody>
+    <tr><td>Conversation</td><td>Append turns</td><td>By session / user</td><td>Product TTL + legal hold</td></tr>
+    <tr><td>Feedback</td><td>Sparse thumbs / labels</td><td>Join to turns for training</td><td>Longer than raw prompts if aggregated</td></tr>
+    <tr><td>Vector / search</td><td>Upsert chunks with ACL</td><td>k-NN + filter</td><td>Tied to source document lifecycle</td></tr>
+    <tr><td>Event log</td><td>Append-only spans</td><td>Trace replay, billing</td><td>Ops window (e.g. 14–90 days)</td></tr>
+    <tr><td>Analytics warehouse</td><td>ETL from events</td><td>Aggregates, no raw PII by default</td><td>Policy-driven</td></tr>
+  </tbody>
+</table>
+
+<figure class="diagram">
+<pre class="ascii">turn completed
+   │
+   ├──► conversation store  (messages, roles, tool I/O refs)
+   ├──► event log           (spans, tokens, route reason, guard codes)
+   ├──► feedback store      (later: rating, edit, human label)
+   │
+   └──► ETL ──► analytics (aggregates, slices) ──► eval / routing training
+
+retrieval corpus ──► vector store (chunk, embedding, tenant_id, ACL)
+                         ▲
+                         └── document connector sync / delete tombstones</pre>
+<figcaption>Write paths. Deletes and TTL jobs are first-class; "we forgot to delete vectors" is a
+breach pattern.</figcaption>
+</figure>
+
+<h3>Conversation and Feedback Schemas</h3>
+
+<figure class="listing">
+<figcaption>Minimal conversation and feedback records (teaching schemas).</figcaption>
+<pre><code>"""Conversation and feedback shapes used by services/."""
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass(frozen=True)
+class TurnRecord:
+    session_id: str
+    turn_id: str
+    tenant_id: str
+    role: str
+    content_ref: str      # pointer to blob / redacted text
+    model: Optional[str]
+    route_reason: Optional[str]
+    input_tokens: int
+    output_tokens: int
+    guard_codes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class FeedbackRecord:
+    turn_id: str
+    tenant_id: str
+    rating: Optional[int]   # -1, 0, 1
+    label: Optional[str]    # human rubric
+    edited_text: Optional[str]
+
+
+t = TurnRecord(
+    "s1", "t1", "acme", "assistant", "blob://t1",
+    "mid-open", "policy_table", 120, 40, (),
+)
+f = FeedbackRecord("t1", "acme", 1, "helpful", None)
+print(t.session_id, t.route_reason, f.rating)</code></pre>
+</figure>
+
+<pre class="output">s1 policy_table 1</pre>
+
+<h3>Retention and Privacy</h3>
+
+<ul>
+  <li><strong>Purpose limitation.</strong> Prompts used for debugging are not automatically licensed
+  for training. Separate consents and pipelines.</li>
+  <li><strong>Redaction at write.</strong> Store <code>content_ref</code> to a vault that can scrub
+  PII; events keep token counts and hashes, not free text, when policy requires.</li>
+  <li><strong>Right to erase.</strong> Deleting a conversation must tombstone vector chunks derived
+  from user-uploaded files for that tenant.</li>
+  <li><strong>Access control.</strong> Tenant isolation is a query filter, not a prompt instruction
+  (Chapter 8).</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Design the delete path on the same day as the write path.</li>
+    <li>Feedback that trains routers (Volume 18) should be preference-shaped and tenant-scoped —
+    the same discipline as conversation storage.</li>
+  </ul>
+</aside>
+
+<h3>Event Log Shape</h3>
+
+<p>Volume 22 will scrape these events into metrics. If the field is missing here, FinOps invents a
+spreadsheet later.</p>
+
+<figure class="listing">
+<figcaption>Append-only span record for one model or tool call.</figcaption>
+<pre><code>"""Event spans — teaching schema for the product event log."""
+from dataclasses import dataclass
+import json
+
+
+@dataclass(frozen=True)
+class SpanEvent:
+    request_id: str
+    tenant_id: str
+    session_id: str
+    name: str                 # model.chat | tool.refund | guard.input
+    status: str               # ok | error | denied
+    model: str | None
+    route_reason: str | None
+    input_tokens: int
+    output_tokens: int
+    latency_ms: float
+    cache_hit: bool
+    error_class: str | None
+
+
+def emit(span: SpanEvent) -&gt; str:
+    return json.dumps(span.__dict__, sort_keys=True)
+
+
+s = SpanEvent(
+    "req1", "acme", "s1", "model.chat", "ok",
+    "mid-open", "policy_table", 120, 40, 210.5, False, None,
+)
+print(emit(s))</code></pre>
+</figure>
+
+<pre class="output">{"cache_hit": false, "error_class": null, "input_tokens": 120, "latency_ms": 210.5, "model": "mid-open", "name": "model.chat", "output_tokens": 40, "request_id": "req1", "route_reason": "policy_table", "session_id": "s1", "status": "ok", "tenant_id": "acme"}</pre>
+
+<h3>Analytics Without Becoming a Second Product</h3>
+
+<ul>
+  <li><strong>Slice keys.</strong> Intent, model tier, cache hit, tenant tier, guard code — enough to
+  debug quality and cost without storing raw prompts in the warehouse by default.</li>
+  <li><strong>Join discipline.</strong> Feedback joins on <code>turn_id</code>; never re-embed free
+  text from analytics copies.</li>
+  <li><strong>Sampling.</strong> Online judges (Volume 10) read from the event stream with a rate
+  limit, not from a nightly dump of every prompt.</li>
+</ul>
+
+<div class="frame exercise"><p>For your product, write the retention row for each store in the table
+above. If legal and product disagree, that disagreement is an ADR, not a Slack thread.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="case-chat">Case Study: General Chat Assistants</h2>
+<p class="chapter-lede">ChatGPT, Claude and Gemini are the public face of general assistants.
+This chapter separates what their organisations have published from what engineers reasonably
+infer when designing similar products.</p>
+
+<h3>The Product Problem</h3>
+
+<div class="frame problem">
+  <p>A consumer or knowledge worker wants a conversational interface over a general model: ask,
+  refine, optionally browse or use tools, and continue across sessions. Latency must feel
+  interactive; safety and policy must hold at internet scale.</p>
+</div>
+
+<h3>Documented Versus Inferred</h3>
+
+<p class="facet">Documented (public artefacts)</p>
+<ul>
+  <li><span class="evidence documented">Documented</span> OpenAI's GPT-4 Technical Report and
+  System Card (2023) describe capability evaluations, safety evaluations and mitigation themes for
+  GPT-4-class models.</li>
+  <li><span class="evidence documented">Documented</span> The Gemini Team technical report (2023)
+  describes Gemini as multimodal natively and reports benchmark results across modalities.</li>
+  <li><span class="evidence documented">Documented</span> Anthropic publishes model cards and
+  product documentation describing Constitutional AI themes, tool use and products such as Projects
+  and computer-use previews as they ship.</li>
+  <li><span class="evidence documented">Documented</span> All three providers document streaming
+  token APIs, system/developer messages and (with varying APIs) tool or function calling.</li>
+</ul>
+
+<p class="facet">Inferred (architecture hypotheses)</p>
+<ul>
+  <li><span class="evidence inferred">Inferred</span> A multi-tier model fleet with routing by
+  capability, load and cost — consistent with public "Fast" / default / advanced product tiers, but
+  internal router details are not fully specified in system cards.</li>
+  <li><span class="evidence inferred">Inferred</span> Layered input/output classifiers and policy
+  engines in front of and behind the generative model — suggested by system-card mitigation
+  language, not a published service graph.</li>
+  <li><span class="evidence inferred">Inferred</span> Conversation stores with retention controls,
+  abuse-review pipelines and prompt-cache / KV reuse for long system prompts — standard for the
+  product class; exact schemas are proprietary.</li>
+  <li><span class="evidence inferred">Inferred</span> Memory features (saved facts, project files)
+  sit beside the context builder with retrieval and ACL, not only as "more tokens in the window".</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">[Documented]                      [Inferred HLD]
+streaming chat API                ┌─ gateway / abuse / auth
+tools / function calling          ├─ orchestrator + context builder
+system / developer roles          ├─ router across model tiers
+safety evals in system cards      ├─ generators + tool runtimes
+multimodal inputs (Gemini)        ├─ memory / files retrieval
+                                  └─ guards + conversation store</pre>
+<figcaption>Left: claim only what citations support. Right: a working HLD for <em>your</em> chat
+product, labelled inferred when inspired by public products.</figcaption>
+</figure>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Copying a marketing screenshot is not architecture. Copying a documented API contract is.</li>
+    <li>When you sketch "how ChatGPT works internally", tag every box. Untagged boxes become false
+    confidence in design review.</li>
+  </ul>
+</aside>
+
+<h3>LLD You Own (Even When Inspired by Them)</h3>
+
+<table>
+  <caption>Build decisions for a general chat product. None require knowing a vendor's private topology.</caption>
+  <thead><tr><th>Concern</th><th>Your LLD choice</th><th>Forge hook</th></tr></thead>
+  <tbody>
+    <tr><td>Streaming</td><td>Chunk protocol + cancel → terminal event</td><td><code>services/adapters</code></td></tr>
+    <tr><td>Tools</td><td>Schema validation; side effects via harness</td><td>Vol 15–16</td></tr>
+    <tr><td>Safety</td><td>Pre/mid/post pipeline with budgets</td><td><code>forge.guard</code></td></tr>
+    <tr><td>Routing</td><td>Capability + cost + confidence</td><td><code>forge.router</code></td></tr>
+    <tr><td>Memory</td><td>Retrieved facts with ACL, not infinite context</td><td>Vol 13–14</td></tr>
+  </tbody>
+</table>
+
+<div class="evidence-block">
+  <p><span class="evidence documented">Documented</span> System cards and model reports support claims
+  about evaluation suites and high-level mitigations.</p>
+  <p><span class="evidence inferred">Inferred</span> Multi-region active-active conversation stores,
+  specific classifier model names and exact abuse-queue SLAs are not in those artefacts — design
+  them for your threat model and label them as your architecture.</p>
+</div>
+
+<h3>What Your Chat Product Must Still Decide</h3>
+
+<ul>
+  <li>Workflow versus agent for tools (Volume 15): most consumer turns are single-shot or short
+  tool loops.</li>
+  <li>Routing (Volume 18): which tier for coding versus casual chat.</li>
+  <li>Guardrails (Volume 17): pre/post pipeline budgets at your traffic level.</li>
+  <li>Memory retention: Chapter 4's delete path.</li>
+</ul>
+
+<div class="frame exercise"><p>Take one feature from a public chat assistant (e.g. file upload).
+Write three <span class="evidence documented">Documented</span> bullets from primary sources and
+three <span class="evidence inferred">Inferred</span> HLD bullets. Reject any bullet that cannot
+be labelled.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="case-copilot">Case Study: Code Completion</h2>
+<p class="chapter-lede">Inline code completion is an inference product under a hard latency budget.
+GitHub Copilot is the reference product class; the engineering lessons are FIM-shaped context,
+telemetry and careful productivity measurement.</p>
+
+<h3>The Product Problem</h3>
+
+<div class="frame problem">
+  <p>As the developer types, the editor needs a suggestion within roughly a hundred milliseconds of
+  perceived delay. Context includes the current file, nearby files and the cursor position. Wrong
+  suggestions are cheap to dismiss; slow suggestions are ignored.</p>
+</div>
+
+<p class="facet">Documented</p>
+<ul>
+  <li><span class="evidence documented">Documented</span> Chen et al., 2021 (Codex) describe large
+  language models fine-tuned for code and evaluate on HumanEval-style benchmarks.</li>
+  <li><span class="evidence documented">Documented</span> Ziegler et al., 2022 report observational
+  measurements of Copilot users (acceptance rates and related productivity signals) in a peer-reviewed
+  study context.</li>
+  <li><span class="evidence documented">Documented</span> Peng et al., 2023 run a controlled
+  experiment on Copilot and report substantial task-time reductions for a HTTP-server implementation
+  task in their study setting.</li>
+  <li><span class="evidence documented">Documented</span> Public Copilot / model docs describe
+  fill-in-the-middle (FIM) style completion APIs used by coding models (prefix and suffix around the
+  cursor).</li>
+</ul>
+
+<p class="facet">Inferred</p>
+<ul>
+  <li><span class="evidence inferred">Inferred</span> Speculative local / small-model drafting with
+  optional cloud verification to hit interactive latency — common pattern; not a published Copilot
+  wiring diagram.</li>
+  <li><span class="evidence inferred">Inferred</span> Aggressive caching of prefix computations and
+  editor-side debounce / cancellation when the cursor moves.</li>
+  <li><span class="evidence inferred">Inferred</span> Telemetry pipelines that log accept / dismiss /
+  edit-after-accept for offline evaluation — consistent with published measurement papers, exact
+  schemas unknown.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">editor buffer
+   │  prefix ← cursor → suffix     (FIM)
+   │  + open tabs / repo hints     (context gather)
+   ▼
+completion service  ──► model (low max_tokens)
+   │                         │
+   ├─ cancel on keystroke    ├─ TTFT budget
+   └─ telemetry: shown/accept/dismiss/edit</pre>
+<figcaption>Completion HLD for a product you build. FIM is documented in model APIs; the surrounding
+cancellation and telemetry design is yours.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption>FIM prompt assembly for a completion adapter.</figcaption>
+<pre><code>"""Assemble a fill-in-the-middle request from editor state."""
+
+def fim_prompt(prefix: str, suffix: str, max_prefix: int = 2000) -&gt; str:
+    p = prefix[-max_prefix:]
+    s = suffix[:max_prefix]
+    # Provider-specific tokens vary; keep a clear structural split.
+    return f"&lt;PRE&gt;{p}&lt;SUF&gt;{s}&lt;MID&gt;"
+
+
+pre = "def add(a, b):\n    "
+suf = "\n\ndef sub(a, b):\n    return a - b\n"
+print(fim_prompt(pre, suf))
+print("chars", len(fim_prompt(pre, suf)))</code></pre>
+</figure>
+
+<pre class="output">&lt;PRE&gt;def add(a, b):
+    &lt;SUF&gt;
+def sub(a, b):
+    return a - b
+&lt;MID&gt;
+chars 72</pre>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Latency is the product. A brilliant 900&nbsp;ms completion loses to a good 80&nbsp;ms one.</li>
+    <li>Productivity claims need study design (Ziegler observational vs Peng experimental). Do not
+    cite a blog anecdote as if it were Peng et al.</li>
+  </ul>
+</aside>
+
+<h3>Telemetry Contract</h3>
+
+<ul>
+  <li><span class="evidence documented">Documented</span> Published Copilot studies rely on signals
+  such as whether a suggestion was shown and whether it was accepted — exact production schemas
+  remain private.</li>
+  <li><span class="evidence inferred">Inferred</span> Your editor extension should emit
+  <code>shown</code>, <code>accept</code>, <code>dismiss</code>, <code>edit_after_accept</code> with
+  latency and model id for offline evaluation.</li>
+  <li><span class="evidence inferred">Inferred</span> Ghost-text UI cancels in-flight requests on
+  each keystroke; the gateway still records a cancelled span for cost honesty.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Completion telemetry event (client → product analytics).</figcaption>
+<pre><code>"""Editor-side completion telemetry."""
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class CompletionEvent:
+    request_id: str
+    latency_ms: float
+    shown: bool
+    accepted: bool
+    chars_suggested: int
+    chars_kept_after_edit: int
+
+
+def keep_rate(e: CompletionEvent) -&gt; float:
+    if e.chars_suggested == 0:
+        return 0.0
+    return e.chars_kept_after_edit / e.chars_suggested
+
+
+e = CompletionEvent("c1", 72.0, True, True, 40, 36)
+print(f"latency={e.latency_ms}ms keep_rate={keep_rate(e):.2f}")</code></pre>
+</figure>
+
+<pre class="output">latency=72.0ms keep_rate=0.90</pre>
+
+<div class="frame exercise"><p>Set a p95 latency SLO for inline completion in your editor. Which
+context sources (open tabs, repo embeddings, LSP) are you willing to drop first when the budget
+burns?</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="case-coding-agents">Case Study: Coding Agents</h2>
+<p class="chapter-lede">Coding agents plan, edit, run tests and iterate. The product is the harness:
+permissions, sandbox, budgets and evaluation on repositories — not a single completion call.</p>
+
+<h3>The Product Problem</h3>
+
+<div class="frame problem">
+  <p>A user delegates a software task ("fix the flaky test", "implement the endpoint"). The system
+  must read the repo, edit files, run commands and stop when done or when the budget expires — without
+  exfiltrating secrets or destroying the machine.</p>
+</div>
+
+<p class="facet">Documented</p>
+<ul>
+  <li><span class="evidence documented">Documented</span> Yang et al., 2024 (SWE-agent) describe an
+  agent–computer interface for software engineering and evaluate on SWE-bench.</li>
+  <li><span class="evidence documented">Documented</span> SWE-bench (Jimenez et al., 2024 and
+  follow-ons) provides real GitHub issue–PR pairs as an evaluation harness for coding agents.</li>
+  <li><span class="evidence documented">Documented</span> Public docs for products such as Claude Code
+  describe permission prompts before commands and edits (Volume 16).</li>
+  <li><span class="evidence documented">Documented</span> The Model Context Protocol (Anthropic, 2024)
+  standardises tool list/call boundaries over JSON-RPC.</li>
+</ul>
+
+<p class="facet">Inferred</p>
+<ul>
+  <li><span class="evidence inferred">Inferred</span> Production isolation may use containers,
+  microVMs or remote executors depending on vendor and tier — treat blog specifics as
+  version-bound claims.</li>
+  <li><span class="evidence inferred">Inferred</span> Long jobs use durable session logs (Volume 16
+  lifecycle) with resume after disconnect.</li>
+  <li><span class="evidence inferred">Inferred</span> Patch ranking and test-gated commit loops sit
+  outside the base model as harness policy.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">user goal
+   ▼
+harness (forge.harness)
+   ├─ policy: allow / ask / deny
+   ├─ sandbox: run tests / linters
+   ├─ budget: steps, tokens, wall clock
+   └─ trace: every tool call
+   ▼
+model proposes edits / commands
+   ▼
+SWE-bench style scorer: tests pass on gold patch?</pre>
+<figcaption>Coding-agent HLD. SWE-bench measures outcomes; the harness enforces means.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption>Sketch: bind a coding turn to harness policy before shell runs.</figcaption>
+<pre><code>"""Permission gate before a shell tool — teaching sketch."""
+from enum import Enum
+
+
+class Decision(str, Enum):
+    ALLOW = "allow"
+    ASK = "ask"
+    DENY = "deny"
+
+
+def decide(command: str, auto_approve_tests: bool) -&gt; Decision:
+    if "rm -rf" in command or "curl " in command:
+        return Decision.DENY
+    if command.startswith("pytest") and auto_approve_tests:
+        return Decision.ALLOW
+    return Decision.ASK
+
+
+for cmd in ["pytest -q", "rm -rf /", "curl https://exfil"]:
+    print(cmd, "-&gt;", decide(cmd, True).value)</code></pre>
+</figure>
+
+<pre class="output">pytest -q -&gt; allow
+rm -rf / -&gt; deny
+curl https://exfil -&gt; deny</pre>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>SWE-bench success without a permission model is a research demo, not a product.</li>
+    <li>Volume 16's harness is the LLD; this chapter is the product framing and evidence map.</li>
+  </ul>
+</aside>
+
+<h3>Evaluation Packet</h3>
+
+<table>
+  <caption>What to measure for a coding-agent product.</caption>
+  <thead><tr><th>Signal</th><th>Source</th><th>Evidence note</th></tr></thead>
+  <tbody>
+    <tr><td>Issue resolved / tests pass</td><td>SWE-bench-style harness</td><td><span class="evidence documented">Documented</span> benchmark protocol</td></tr>
+    <tr><td>Permission prompts / denials</td><td>Harness audit log</td><td><span class="evidence inferred">Inferred</span> product schema</td></tr>
+    <tr><td>Sandbox escapes attempted</td><td>Runtime telemetry</td><td><span class="evidence inferred">Inferred</span> red-team suite</td></tr>
+    <tr><td>Tokens and wall time per task</td><td>Cost ledger</td><td>Your SLO, not the paper's</td></tr>
+  </tbody>
+</table>
+
+<div class="evidence-block inferred">
+  <p><span class="evidence inferred">Inferred</span> Commercial coding agents likely mix local and
+  remote execution, cached repo indexes and model cascades. Treat any specific claim about a named
+  vendor's sandbox hypervisor as version-bound and cite the primary post — or leave it out of your
+  ADR.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="case-enterprise">Case Study: Enterprise Assistants</h2>
+<p class="chapter-lede">Enterprise assistants fail first on permissions, connectors and tenancy —
+not on eloquence. ACL-aware RAG is the load-bearing design.</p>
+
+<h3>The Product Problem</h3>
+
+<div class="frame problem">
+  <p>Employees ask questions over SharePoint, tickets and wikis. Answers must respect document ACLs,
+  tenant isolation and compliance logging. A fluent wrong-tenant answer is a security incident.</p>
+</div>
+
+<p class="facet">Documented</p>
+<ul>
+  <li><span class="evidence documented">Documented</span> Major cloud assistants document connectors
+  to enterprise content sources and admin controls for enabling them (product docs; exact ACL
+  propagation differs by vendor).</li>
+  <li><span class="evidence documented">Documented</span> RAG literature and Volume 14 treat retrieved
+  documents as untrusted text that still requires access control at query time.</li>
+  <li><span class="evidence documented">Documented</span> Amershi et al., 2019 publish guidelines for
+  human–AI interaction that enterprise UX teams routinely cite (timing, recovery, mental models).</li>
+</ul>
+
+<p class="facet">Inferred</p>
+<ul>
+  <li><span class="evidence inferred">Inferred</span> A connector framework with incremental sync,
+  tombstones and per-document ACL fields in the index.</li>
+  <li><span class="evidence inferred">Inferred</span> Query planner applies <code>tenant_id</code> and
+  user principal filters <em>before</em> similarity ranking (ADR-0007 in Chapter 1).</li>
+  <li><span class="evidence inferred">Inferred</span> Separate eval slices for cross-tenant probes and
+  "user should not see this doc" regressions.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">user principal + tenant
+        │
+        ▼
+connector sync ──► index(chunk, vector, acl, tenant)
+        │
+        ▼
+retrieve: filter(acl) THEN rank
+        │
+        ▼
+context builder ──► model ──► answer + citations
+        │
+        └── audit event (doc ids, not only text)</pre>
+<figcaption>Enterprise assistant HLD. The filter-before-rank rule is non-negotiable.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption>ACL filter before ranking — never "retrieve then hope".</figcaption>
+<pre><code>"""Permission-aware retrieval sketch."""
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Chunk:
+    doc_id: str
+    text: str
+    tenant_id: str
+    acl: frozenset[str]  # group ids
+    score: float
+
+
+def retrieve(
+    index: list[Chunk], tenant: str, groups: set[str], k: int = 2
+) -&gt; list[Chunk]:
+    allowed = [
+        c for c in index
+        if c.tenant_id == tenant and c.acl &amp; groups
+    ]
+    return sorted(allowed, key=lambda c: -c.score)[:k]
+
+
+index = [
+    Chunk("a", "salary band A", "acme", frozenset({"hr"}), 0.99),
+    Chunk("b", "pto policy", "acme", frozenset({"all"}), 0.80),
+    Chunk("c", "secret", "other", frozenset({"all"}), 0.95),
+]
+hits = retrieve(index, "acme", {"all", "eng"})
+print([(h.doc_id, h.text) for h in hits])</code></pre>
+</figure>
+
+<pre class="output">[('b', 'pto policy')]</pre>
+
+<p>Chunk <code>a</code> is excluded despite higher score (wrong group). Chunk <code>c</code> is
+excluded (wrong tenant). That is the product.</p>
+</section>
+
+<!-- ================================================================ CHAPTER 9 -->
+<section class="chapter">
+<h2 id="case-research">Case Study: Research Assistants</h2>
+<p class="chapter-lede">Research assistants browse, read and synthesise under a long deadline.
+Citations and job orchestration matter more than a single chat turn's TTFT.</p>
+
+<h3>The Product Problem</h3>
+
+<div class="frame problem">
+  <p>A user asks for a brief with sources. The system may run for minutes: search, open pages,
+  extract claims, verify quotes and write a structured report. Mid-job failure must be resumable;
+  fabricated citations are unacceptable.</p>
+</div>
+
+<p class="facet">Documented</p>
+<ul>
+  <li><span class="evidence documented">Documented</span> Nakano et al., 2021 (WebGPT) study
+  browser-assisted question answering with human feedback and citations.</li>
+  <li><span class="evidence documented">Documented</span> Provider "deep research" product blogs
+  describe multi-step browsing and report generation as product behaviour (treat marketing depth
+  claims cautiously).</li>
+</ul>
+
+<p class="facet">Inferred</p>
+<ul>
+  <li><span class="evidence inferred">Inferred</span> Asynchronous job queue with progress events,
+  not a single HTTP request held open for ten minutes without a job id.</li>
+  <li><span class="evidence inferred">Inferred</span> Citation verifier: every URL/quote checked
+  against fetched text before display.</li>
+  <li><span class="evidence inferred">Inferred</span> Source-quality priors (domain allowlists,
+  paywall handling) as orchestrator policy.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">research request ──► job queue
+                       │
+                       ▼
+              planner / agent loop
+                       │
+              fetch ──► extract ──► verify quote
+                       │
+                       ▼
+              report + citation list ──► conversation store
+                       │
+                       └── partial progress events to UI</pre>
+<figcaption>Long-job HLD. The gateway returns a job id; the orchestrator owns the loop.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption>Citation verification sketch.</figcaption>
+<pre><code>"""Accept a citation only if the quote appears in fetched text."""
+
+def verify_citation(quote: str, page_text: str, max_gap: int = 0) -&gt; bool:
+    q = " ".join(quote.lower().split())
+    t = " ".join(page_text.lower().split())
+    if max_gap == 0:
+        return q in t
+    # teaching: exact match only; fuzzy match belongs in tests
+    return q in t
+
+
+page = "The Treaty of Waitangi was first signed on 6 February 1840."
+print(verify_citation("6 February 1840", page))
+print(verify_citation("6 February 1841", page))</code></pre>
+</figure>
+
+<pre class="output">True
+False</pre>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>A research assistant without citation verification is a storytelling engine.</li>
+    <li>Job SLOs are different from chat SLOs: time-to-first-progress and time-to-final-report.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 10 -->
+<section class="chapter">
+<h2 id="case-support">Case Study: Customer Support Agents</h2>
+<p class="chapter-lede">Support is where workflows usually beat open-ended agents — until the ticket
+needs investigation. Escalation, policy compliance and deflection metrics define success.</p>
+
+<h3>The Product Problem</h3>
+
+<div class="frame problem">
+  <p>Customers ask about orders, refunds and outages. Many tickets are repetitive; some need tools;
+  a few need a human. The business cares about deflection, handle time, CSAT and policy breaches —
+  not perplexity.</p>
+</div>
+
+<p class="facet">Documented</p>
+<ul>
+  <li><span class="evidence documented">Documented</span> Brynjolfsson et al., 2023 study generative
+  AI in customer support and report productivity gains for agents, especially less-experienced
+  workers, in their setting.</li>
+  <li><span class="evidence documented">Documented</span> Anthropic's <em>Building effective agents</em>
+  (2024) argues for starting with workflows and adding agency only when needed — directly applicable
+  to support.</li>
+  <li><span class="evidence documented">Documented</span> Volume 15's workflow-versus-agent framing
+  and Volume 18's escalation/abstention utilities are the engineering counterparts.</li>
+</ul>
+
+<p class="facet">Inferred</p>
+<ul>
+  <li><span class="evidence inferred">Inferred</span> A classifier or rules router sends FAQ to a
+  workflow, complex tickets to a bounded agent, and high-risk intents to humans.</li>
+  <li><span class="evidence inferred">Inferred</span> Refund tools require harness approval above a
+  threshold; transcripts feed quality review.</li>
+  <li><span class="evidence inferred">Inferred</span> Deflection is measured as resolved-without-human
+  among tickets that would have entered the queue — not as "model replied".</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">ticket
+  │
+  ▼
+intent + risk ──► FAQ workflow ──► retrieve policy ──► answer
+  │                 │
+  │                 └► tool: get_order / track_shipment
+  │
+  ├──────────────► bounded agent (investigate) ──► harness tools
+  │
+  └──────────────► escalate to human (utility / policy)
+
+
+metrics: deflection, CSAT, policy_violation_rate, $/ticket</pre>
+<figcaption>Support HLD. Default to workflow; agent is a branch, not the trunk.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption><code>services/support_agent.py</code>: workflow-first triage.</figcaption>
+<pre><code>"""Support triage: workflow, agent or escalate."""
+from enum import Enum
+
+
+class Path(str, Enum):
+    WORKFLOW = "workflow"
+    AGENT = "agent"
+    HUMAN = "human"
+
+
+def triage(intent: str, risk: str, confidence: float) -&gt; Path:
+    if risk == "high" or intent == "legal_threat":
+        return Path.HUMAN
+    if intent in {"where_is_order", "reset_password", "hours"}:
+        return Path.WORKFLOW
+    if confidence &lt; 0.55:
+        return Path.HUMAN
+    return Path.AGENT
+
+
+cases = [
+    ("where_is_order", "low", 0.9),
+    ("billing_dispute", "medium", 0.7),
+    ("legal_threat", "high", 0.95),
+    ("weird_edge", "low", 0.4),
+]
+for intent, risk, conf in cases:
+    print(f"{intent:16s} -&gt; {triage(intent, risk, conf).value}")</code></pre>
+</figure>
+
+<pre class="output">where_is_order   -&gt; workflow
+billing_dispute  -&gt; agent
+legal_threat     -&gt; human
+weird_edge       -&gt; human</pre>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Deflection without policy compliance is a liability metric.</li>
+    <li>The practical project at the end of this volume builds on this triage.</li>
+  </ul>
+</aside>
+
+<h3>Metrics That Matter</h3>
+
+<table>
+  <caption>Support KPIs and how they relate to the architecture.</caption>
+  <thead><tr><th>Metric</th><th>Definition</th><th>Architecture lever</th></tr></thead>
+  <tbody>
+    <tr><td>Deflection</td><td>Resolved without human among queue-eligible tickets</td><td>Workflow coverage, FAQ cache</td></tr>
+    <tr><td>Policy violation rate</td><td>Refunds / disclosures outside policy</td><td>Harness + guards</td></tr>
+    <tr><td>Escalation precision</td><td>Human tickets that truly needed a human</td><td>Triage thresholds</td></tr>
+    <tr><td>$ / resolved ticket</td><td>Model + tool + human cost</td><td>Routing, cache, agency bounds</td></tr>
+    <tr><td>CSAT / thumbs</td><td>Customer feedback on AI-handled turns</td><td>Quality eval slices</td></tr>
+  </tbody>
+</table>
+
+<div class="evidence-block">
+  <p><span class="evidence documented">Documented</span> Brynjolfsson et al. measure agent
+  productivity with generative assistance — a reason to instrument human+AI handle time, not only
+  bot deflection.</p>
+  <p><span class="evidence inferred">Inferred</span> Your deflection dashboard must exclude tickets
+  the model answered incorrectly and then bounced to a human; otherwise the metric rewards
+  confident wrong answers.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 11 -->
+<section class="chapter">
+<h2 id="cost-architecture">Cost Architecture</h2>
+<p class="chapter-lede">Unit economics turn architecture choices into a bill. Caching, routing and
+capacity planning are cost controls with quality side constraints — not afterthoughts for finance.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Traffic grows 3×. The model bill grows 3×. Leadership asks why routing and caches from Volumes
+  12 and 18 are not visible in the invoice. Nobody owned conversation-level unit economics.</p>
+</div>
+
+<h3>Cost Model</h3>
+
+<p>Expected cost per conversation with <span class="math">T</span> turns, cache hit rate
+<span class="math">h</span>, and frontier fraction <span class="math">f</span> among misses:</p>
+
+<div class="math">
+C = T \big[(1-h)\big((1-f)\,c_{\mathrm{mid}} + f\,c_{\mathrm{frontier}}\big) + h\,c_{\mathrm{cache}}\big]
+</div>
+
+<figure class="listing">
+<figcaption><code>services/economics.py</code>: conversation unit-cost calculator.</figcaption>
+<pre><code>"""Unit economics for multi-turn conversations."""
+
+def conversation_cost(
+    n_turns: int,
+    cache_hit_rate: float,
+    frontier_frac: float,
+    mid_cost: float = 0.02,
+    frontier_cost: float = 0.12,
+    cache_cost: float = 0.001,
+) -&gt; float:
+    miss = 1.0 - cache_hit_rate
+    per = miss * ((1 - frontier_frac) * mid_cost + frontier_frac * frontier_cost)
+    per += cache_hit_rate * cache_cost
+    return n_turns * per
+
+
+for h in (0.0, 0.3, 0.5):
+    for f in (1.0, 0.3):
+        c = conversation_cost(8, h, f)
+        print(f"turns=8 cache={h:.0%} frontier={f:.0%}  $/conv≈{c:.3f}")</code></pre>
+</figure>
+
+<pre class="output">turns=8 cache=0% frontier=100%  $/conv≈0.960
+turns=8 cache=0% frontier=30%  $/conv≈0.400
+turns=8 cache=30% frontier=100%  $/conv≈0.674
+turns=8 cache=30% frontier=30%  $/conv≈0.282
+turns=8 cache=50% frontier=100%  $/conv≈0.484
+turns=8 cache=50% frontier=30%  $/conv≈0.204</pre>
+
+<p>Routing from 100% frontier to 30% frontier at 30% cache hits cuts the illustrative bill from
+$0.96 to $0.28 per eight-turn conversation — before capacity discounts.</p>
+
+<h3>Levers</h3>
+
+<table>
+  <caption>Cost levers and what they risk.</caption>
+  <thead><tr><th>Lever</th><th>How</th><th>Risk if naive</th></tr></thead>
+  <tbody>
+    <tr><td>Exact / semantic cache</td><td>Chapter 3</td><td>Stale or cross-tenant answers</td></tr>
+    <tr><td>Prompt / KV cache</td><td>Stable system+tools prefix per tenant</td><td>Prefix bleed across tenants</td></tr>
+    <tr><td>Routing / cascades</td><td>Volume 18</td><td>Quality floor missed on hard slice</td></tr>
+    <tr><td>Workflow over agent</td><td>Chapter 10</td><td>Under-automation on long-tail tickets</td></tr>
+    <tr><td>Capacity reservations</td><td>Volume 22</td><td>Idle spend if traffic misforecast</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Report <span class="math">\$</span>/successful-task, not only <span class="math">\$</span>/1M
+    tokens. Tokens ignore retries, tools and human escalations.</li>
+    <li>Export route reasons and cache hit flags on every turn so next week's FinOps review has data.</li>
+  </ul>
+</aside>
+
+<h3>Capacity Sketch</h3>
+
+<p>Let peak QPS be <span class="math">\lambda</span>, mean tokens out per request
+<span class="math">o</span>, and one replica sustain <span class="math">\mu</span> tokens/s decode.
+A first-cut replica count is <span class="math">\lceil \lambda o / \mu \rceil</span> before KV and
+queueing headroom — Volume 22 refines this with GPU realities.</p>
+
+<figure class="listing">
+<figcaption>Back-of-envelope capacity for a chat tier.</figcaption>
+<pre><code>"""Replica estimate before queueing theory."""
+import math
+
+
+def replicas(qps: float, out_tokens: float, tokens_per_sec: float, headroom: float = 1.3) -&gt; int:
+    return max(1, math.ceil(headroom * qps * out_tokens / tokens_per_sec))
+
+
+for qps in (5, 20, 80):
+    n = replicas(qps, out_tokens=200, tokens_per_sec=80)
+    print(f"qps={qps:3d} -&gt; replicas≈{n}")</code></pre>
+</figure>
+
+<pre class="output">qps=  5 -&gt; replicas≈17
+qps= 20 -&gt; replicas≈65
+qps= 80 -&gt; replicas≈260</pre>
+
+<p>Those numbers are deliberately sobering: without caching and routing, "just scale the frontier
+tier" becomes a capital plan, not a sprint task.</p>
+
+<div class="frame exercise"><p>Plug your measured <span class="math">h</span>, <span class="math">f</span>
+and <span class="math">T</span> into <code>conversation_cost</code>. Which single lever moves you
+under the product cost SLO with the least quality risk on your eval slices?</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 12 -->
+<section class="chapter">
+<h2 id="design-review">Design Review Method</h2>
+<p class="chapter-lede">A design review is a structured argument that quality, safety, cost and
+operability hold — not a slide aesthetic contest. This chapter gives the checklist.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Two teams present HLDs. Both have boxes labelled "guardrails" and "eval". Only one can answer:
+  where is tenancy enforced, what is the degraded mode, and which golden tests gate launch? Review
+  without a checklist rewards confidence.</p>
+</div>
+
+<p>Two pieces of evidence shape the checklist. Parnin et al. (2023) interviewed engineers building
+product copilots and found the same pain points across teams: prompt fragility, no testing
+methodology for non-deterministic output, and evaluation built after launch rather than before.
+Shankar et al. (2024) showed that LLM graders need their own validation: reviewers' criteria shift as
+they read outputs (<em>criteria drift</em>), so evaluator assertions must be aligned with human
+grades on a sample and re-checked as the product changes. A design review therefore asks not only
+"is there an eval?" but "who validated the evaluator, and when?"</p>
+
+<h3>Checklist</h3>
+
+<table>
+  <caption>Design-review checklist for AI products.</caption>
+  <thead><tr><th>Axis</th><th>Questions the design must answer</th></tr></thead>
+  <tbody>
+    <tr><td>Quality</td><td>Offline gates? Slices? Online sampling? Who owns false-good?</td></tr>
+    <tr><td>Safety</td><td>Trust boundaries? Must-never list? Red-team plan? Tool permissions?</td></tr>
+    <tr><td>Cost</td><td>Unit economics model? Cache/routing levers? Budget alarms?</td></tr>
+    <tr><td>Ops</td><td>SLOs and error budget? Traces? Degraded mode? Runbook?</td></tr>
+    <tr><td>Data</td><td>Stores, retention, delete path, ACL in retrieval?</td></tr>
+    <tr><td>Evidence</td><td>Which peer products are documented vs inferred inspiration?</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>Machine-checkable subset: required ADR titles before launch.</figcaption>
+<pre><code>"""Fail review if mandatory ADRs are missing."""
+REQUIRED = {
+    "tenancy enforcement",
+    "workflow vs agent",
+    "degraded mode",
+    "retention and delete",
+}
+
+
+def review_adrs(titles: set[str]) -&gt; list[str]:
+    return sorted(r for r in REQUIRED if not any(r in t.lower() for t in titles))
+
+
+have = {
+    "ADR-0007 Tenant ACL enforced in retrieval planner",
+    "ADR-0001 Workflow-first support triage",
+    "ADR-0003 Degraded mode returns cached FAQ only",
+}
+print("missing:", review_adrs(have))
+have.add("ADR-0004 Retention and delete for conversations")
+print("missing:", review_adrs(have))</code></pre>
+</figure>
+
+<pre class="output">missing: ['retention and delete']
+missing: []</pre>
+
+<p class="facet">Review outcomes</p>
+<ul>
+  <li><strong>Launch.</strong> All must-never controls tested; SLOs and cost model signed.</li>
+  <li><strong>Launch with waivers.</strong> Named residual risks with expiry dates.</li>
+  <li><strong>Rework.</strong> Missing boundary, missing delete path, or unlabelled inferred claims
+  presented as fact.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Amershi-style interaction guidelines belong in review for UX recovery paths, not only model
+    quality scores.</li>
+    <li>If a claim about a vendor product cannot wear an evidence tag, it does not belong in the
+    decision record.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ REVIEW -->
+<section class="review">
+<h1>Review and Next Steps</h1>
+
+<h2>What You Learned</h2>
+<ul>
+  <li>Product problems become architectures through requirements, SLOs, risk registers and ADRs
+  (Chapter 1).</li>
+  <li>The reference HLD is a service graph: gateway, orchestration, model/retrieval/agent/tool/eval/
+  guardrail services, stores, queues and caches (Chapter 2).</li>
+  <li>LLD seams — context, adapters, streaming, retries, idempotency, three cache layers and an
+  error taxonomy — live under <code>services/</code> (Chapter 3).</li>
+  <li>Data architecture separates conversation, feedback, vectors, events and analytics with
+  retention and delete paths (Chapter 4).</li>
+  <li>General chat, completion, coding agents, enterprise, research and support each need
+  documented/inferred discipline (Chapters 5–10).</li>
+  <li>Unit economics quantify caching and routing; design review checks quality, safety, cost and
+  ops with evidence labels (Chapters 11–12).</li>
+</ul>
+
+<h2>What You Built</h2>
+<ul>
+  <li><code>services/adr.py</code> — ADR dataclass and renderer.</li>
+  <li><code>services/context.py</code> / <code>gateway.py</code> — deadlines, quotas, idempotency.</li>
+  <li><code>services/adapters.py</code> — streaming model protocol with retries.</li>
+  <li><code>services/cache.py</code> — exact, semantic and prompt-cache ledger.</li>
+  <li><code>services/errors.py</code> — client-safe error taxonomy.</li>
+  <li><code>services/economics.py</code> — conversation cost model.</li>
+  <li><code>services/support_agent.py</code> — triage for the practical project.</li>
+</ul>
+
+<h2>Important Code</h2>
+<table>
+  <caption>Invariants the contract tests should keep green.</caption>
+  <thead><tr><th>Piece</th><th>Invariant</th></tr></thead>
+  <tbody>
+    <tr><td>Gateway</td><td>Over-quota admits fail with <code>RATE_LIMITED</code>.</td></tr>
+    <tr><td>Exact cache</td><td>Keys include model and messages; LRU respects capacity.</td></tr>
+    <tr><td>Semantic cache</td><td>Below-threshold lookups miss.</td></tr>
+    <tr><td>ACL retrieve</td><td>Wrong tenant or group never appears in hits.</td></tr>
+    <tr><td>Support triage</td><td>High risk always escalates to human.</td></tr>
+    <tr><td>ADR review</td><td>Missing mandatory titles fail the checklist.</td></tr>
+  </tbody>
+</table>
+
+<h2>Important Architecture</h2>
+<figure class="diagram">
+<pre class="ascii">Product problem → SLOs / risk / ADRs
+        ↓
+Gateway → RequestContext → Guards → Orchestrator
+        ↓                      ↓
+   Cache / Router / Retrieval / Harness / Tools
+        ↓
+   Model adapters (stream) → Guards → Client
+        ↓
+Conversation · Events · Feedback · Cost ledger
+        ↓
+Design review: quality · safety · cost · ops · evidence</pre>
+<figcaption>Volume 21 control loop from problem to reviewable service graph.</figcaption>
+</figure>
+
+<h2>Failure Modes</h2>
+<ul class="failure-modes">
+  <li>HLD boxes without ADRs or owners.</li>
+  <li>Inferred vendor internals presented as documented fact.</li>
+  <li>Cache keys missing tenant or policy version.</li>
+  <li>Retries on non-idempotent tool calls.</li>
+  <li>RAG without ACL filter-before-rank.</li>
+  <li>Open-ended support agents where a workflow suffices.</li>
+  <li>Token bills without <span class="math">\$</span>/successful-task.</li>
+  <li>No delete path for vectors when conversations are erased.</li>
+  <li>Design review that never asks for degraded mode or traces.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<ul>
+  <li>Golden journeys per product class (chat, completion latency, SWE-bench-style for coding agents,
+  cross-tenant probes for enterprise, citation checks for research, deflection+policy for support).</li>
+  <li>Online: sample traces into judges; alert on policy denials and cost anomalies.</li>
+  <li>Contract tests on <code>services/</code> invariants above in CI.</li>
+</ul>
+
+<h2>Practical Project</h2>
+<div class="frame exercise" data-title="Design and build a support agent">
+  <p>Produce a launch packet and a working skeleton on Forge.</p>
+  <ol>
+    <li>Write requirements and SLOs (quality, latency, cost, must-never).</li>
+    <li>Draw the HLD from Chapter 2; mark day-one boxes.</li>
+    <li>Author ADRs: workflow vs agent, tenancy, degraded mode, retention.</li>
+    <li>Implement triage in <code>services/support_agent.py</code>; wire FAQ workflow with ACL
+    retrieval; bound the agent path with <code>forge.harness</code> permissions.</li>
+    <li>Add gateway admission, exact cache for FAQ, and <code>forge.router</code> for model tier.</li>
+    <li>Guard with <code>forge.guard</code>; escalate high-risk intents to humans.</li>
+    <li>Ship an evaluation plan (golden tickets, policy probes) and a cost model from Chapter 11.</li>
+    <li>Run the Chapter 12 checklist; record waivers with expiry dates.</li>
+  </ol>
+</div>
+
+<h2>Exercises</h2>
+<ol>
+  <li>Extend <code>Gateway</code> so idempotent replay returns the prior <code>request_id</code>
+  without consuming an extra token when under quota.</li>
+  <li>Add policy version to <code>ExactCache.key</code> and show a miss after a policy bump.</li>
+  <li>Compute <span class="math">C</span> for <span class="math">T=12</span>, <span class="math">h=0.4</span>,
+  <span class="math">f=0.2</span> with your own mid/frontier prices.</li>
+  <li>Label ten claims about a public coding agent as documented or inferred; discard two that
+  cannot be sourced.</li>
+  <li>Write a cross-tenant probe test that fails if <code>retrieve</code> drops the tenant filter.</li>
+</ol>
+
+<h2>Research Papers</h2>
+<table>
+  <caption>Primary sources for this volume's case studies and method.</caption>
+  <thead><tr><th>Source</th><th>Why it is here</th></tr></thead>
+  <tbody>
+    <tr><td>Amershi et al., 2019. Guidelines for Human-AI Interaction.</td><td>Design-review UX criteria (Ch 8, 12).</td></tr>
+    <tr><td>Ziegler et al., 2022; Peng et al., 2023. Copilot productivity studies.</td><td>Code completion measurement (Ch 6).</td></tr>
+    <tr><td>Yang et al., 2024. SWE-agent; Jimenez et al., SWE-bench.</td><td>Coding agents and evaluation (Ch 7).</td></tr>
+    <tr><td>Kleppmann, 2017. Designing Data-Intensive Applications.</td><td>Store choice and access patterns (Ch 4).</td></tr>
+    <tr><td>Brynjolfsson et al., 2023. Generative AI at Work.</td><td>Support productivity evidence (Ch 10).</td></tr>
+    <tr><td>Nakano et al., 2021. WebGPT.</td><td>Cited research assistants (Ch 9).</td></tr>
+    <tr><td>OpenAI GPT-4 report/System Card 2023; Gemini Team 2023; Anthropic model cards.</td><td>Documented chat-assistant evidence (Ch 5).</td></tr>
+    <tr><td>Chen et al., 2021. Codex.</td><td>Code model baseline (Ch 6).</td></tr>
+    <tr><td>Parnin et al., 2023. <em>Building Your Own Product Copilot: Challenges, Opportunities, and Needs</em>. arXiv:2312.14231.</td><td>Interview evidence on how product copilots are built and tested (Ch 1, 12).</td></tr>
+    <tr><td>Shankar et al., 2024. <em>Who Validates the Validators? Aligning LLM-Assisted Evaluation of LLM Outputs with Human Preferences</em>. UIST.</td><td>Criteria drift; validating graders in design review (Ch 12).</td></tr>
+  </tbody>
+</table>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Guidelines for Human-AI Interaction</span>
+    <span class="paper-meta">Amershi et al., 2019 · CHI</span></div>
+  <dl>
+    <dt>Problem</dt><dd>AI products need consistent interaction principles beyond model accuracy.</dd>
+    <dt>Previous limitation</dt><dd>Ad hoc UX advice without a validated guideline set.</dd>
+    <dt>Approach</dt><dd>Eighteen guidelines covering timing, control, mental models and recovery.</dd>
+    <dt>Contribution</dt><dd>A shared checklist enterprise and consumer assistants still reuse.</dd>
+    <dt>Practical impact</dt><dd>Chapter 12 review asks for recovery paths and appropriate confidence.</dd>
+    <dt>Limitations</dt><dd>Guidelines are not a substitute for threat models or SLOs.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Productivity Assessment of Neural Code Completion</span>
+    <span class="paper-meta">Ziegler et al., 2022 · MAPS / Copilot study</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Do neural completions change real developer behaviour?</dd>
+    <dt>Previous limitation</dt><dd>Benchmark pass rates without in-editor telemetry.</dd>
+    <dt>Approach</dt><dd>Observational measurements of acceptance and related signals in Copilot use.</dd>
+    <dt>Contribution</dt><dd>Grounded productivity proxies for the completion product class.</dd>
+    <dt>Practical impact</dt><dd>Chapter 6's insistence on telemetry and careful citation of study design.</dd>
+    <dt>Limitations</dt><dd>Observational — complements, does not replace, controlled experiments.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">The Impact of AI on Developer Productivity: Evidence from GitHub Copilot</span>
+    <span class="paper-meta">Peng et al., 2023</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Causal evidence for Copilot's effect on task completion time.</dd>
+    <dt>Previous limitation</dt><dd>Anecdotes and observational acceptance rates alone.</dd>
+    <dt>Approach</dt><dd>Controlled experiment on a standardised programming task.</dd>
+    <dt>Contribution</dt><dd>Large reported speed-up in their experimental setting.</dd>
+    <dt>Practical impact</dt><dd>Chapter 6 measurement discipline; do not over-generalise beyond the task.</dd>
+    <dt>Limitations</dt><dd>One task family; industry tasks vary in review and compliance overhead.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering</span>
+    <span class="paper-meta">Yang et al., 2024</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Generic tool APIs are a poor interface for repository-scale engineering agents.</dd>
+    <dt>Previous limitation</dt><dd>Agents failing from interface friction rather than model limits alone.</dd>
+    <dt>Approach</dt><dd>Design an agent–computer interface specialised for software engineering; evaluate on SWE-bench.</dd>
+    <dt>Contribution</dt><dd>Shows interface design as a first-class lever for coding agents.</dd>
+    <dt>Practical impact</dt><dd>Chapter 7 harness framing; ACI beside permissions and sandbox.</dd>
+    <dt>Limitations</dt><dd>Benchmark success ≠ production permission and isolation story.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">BOOK</span>
+    <span class="paper-title">Designing Data-Intensive Applications</span>
+    <span class="paper-meta">Kleppmann, 2017 · O'Reilly</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Reliable data systems require matching storage engines to access patterns.</dd>
+    <dt>Previous limitation</dt><dd>One-database-for-everything designs that satisfy no workload well.</dd>
+    <dt>Approach</dt><dd>Systematic treatment of replication, partitioning, logs and query models.</dd>
+    <dt>Contribution</dt><dd>Vocabulary Chapter 4 uses for conversation, events and analytics split.</dd>
+    <dt>Practical impact</dt><dd>Choose stores by write/read/retention, then put vectors and feedback beside them.</dd>
+    <dt>Limitations</dt><dd>Pre-dates LLM-specific prompt retention debates; apply principles, not 2017 product picks.</dd>
+  </dl>
+</section>
+
+<h2>Interview Questions</h2>
+<ol class="questions">
+  <li>Walk from a product problem to three ADRs you would require before coding.</li>
+  <li>Where does tenancy get enforced in your HLD, and what test proves it?</li>
+  <li>Compare exact, semantic and prompt caches: keys, risks and when each is forbidden.</li>
+  <li>How do you label a claim about ChatGPT's internal router as documented vs inferred?</li>
+  <li>Why is FIM central to code completion latency design?</li>
+  <li>What does SWE-bench measure, and what must a product harness add on top?</li>
+  <li>Filter-before-rank: write the failing test for a missing tenant predicate.</li>
+  <li>Design citation verification for a research assistant job queue.</li>
+  <li>When does a support ticket escalate to a human under a utility framing?</li>
+  <li>Derive conversation cost <span class="math">C</span> and pick a lever under a quality floor.</li>
+  <li>What is your degraded mode when the frontier provider's breaker opens?</li>
+  <li>How does Amershi's guideline set change a design review agenda?</li>
+  <li>Map gateway → orchestrator → harness for a refund tool call end to end.</li>
+  <li>What retention conflict between legal and analytics do you resolve with an ADR?</li>
+  <li>Why might Peng et al.'s Copilot speed-up not transfer to your regulated codebase?</li>
+</ol>
+
+<h2>Next Volume</h2>
+<p>Volume 22 takes the service graph you designed here and operates it: GPUs, cloud building blocks,
+Kubernetes scheduling, OpenTelemetry, Prometheus/Grafana, reliability under SLO error budgets, and
+FinOps attribution. The unit-economics model from Chapter 11 becomes a live cost ledger; the
+gateway's request IDs become trace roots. <code>services/</code> stays the product edge;
+<code>forge.ops</code> instruments and watches it.</p>
+<p class="facet">Prerequisites from this volume</p>
+<ul>
+  <li>Named SLOs and degraded modes (Chapters 1 and 12).</li>
+  <li>Request context and error taxonomy (Chapter 3).</li>
+  <li>Event log fields rich enough for metrics and billing (Chapter 4).</li>
+  <li>Cost model inputs: cache hits, route reasons, tokens (Chapter 11).</li>
+</ul>
+<p class="facet">Continuous project checkpoint</p>
+<ul>
+  <li>Keep the support-agent ADRs and golden tickets next to the code.</li>
+  <li>Export per-turn cost and route reason in the shape Volume 22's ledger will ingest.</li>
+  <li>Do not advance to multi-region until cross-tenant probes are green.</li>
+</ul>
+</section>
+
+<!-- end of Volume 21 · AI Product Architecture and Case Studies -->
+<p class="no-toc" hidden>Volume 21 complete.</p>
+<!-- services/ seeds: adr context gateway adapters cache errors economics support_agent orchestrator -->
+
+</body>
+</html>

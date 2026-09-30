@@ -1,0 +1,2203 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 25 · Reference: Research Roadmap, Glossary and Interview Bank</title>
+<meta name="volume" content="Volume 25 · Reference">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 25</p>
+  <h1 class="no-toc">Reference: Research Roadmap, Glossary and Interview Bank</h1>
+  <p class="tp-subtitle">The Index Layer of the Book</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>This volume is the <strong>index layer</strong> of the book: it does not teach new systems, and it does not ship a new <code>forge</code> package.</li>
+  <li>Collect research papers into thematic and chronological roadmaps with cross-references to the volumes that teach them.</li>
+  <li>Provide a curated set of paper cards spanning the curriculum, plus a dense catalogue of further high-impact work.</li>
+  <li>Define the terminology stack precisely, with volume pointers for every core term and dozens of engineering terms used throughout.</li>
+  <li>Bank advanced interview questions by volume, each with a short answer outline and one follow-up.</li>
+  <li>Consolidate the FLOPs, memory, KV-cache, throughput and cost formulas and the latency numbers every AI engineer should know by heart.</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>You have worked through (or can jump into) Volumes 1–24. Definitions here are precise summaries, not first-principles derivations.</li>
+  <li>You use this volume as a lookup: before an interview, when reading a new paper, or when reviewing capacity numbers.</li>
+</ul>
+
+<p class="facet">How to use this reference</p>
+<ul>
+  <li><strong>Chapters 1–2</strong>: orient yourself in the research literature by theme or by year.</li>
+  <li><strong>Chapter 3</strong>: deepen on a paper; jump to the teaching volume for implementation.</li>
+  <li><strong>Chapter 4</strong>: settle terminology disputes (agent versus workflow, harness versus framework).</li>
+  <li><strong>Chapter 5</strong>: rehearse interview answers volume by volume.</li>
+  <li><strong>Chapter 6</strong>: check arithmetic before writing a design doc or a capacity plan.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1  Roadmap by Theme     Transformers → … → reasoning, with Vol refs
+Chapter 2  Roadmap by Year      2013–present timeline
+Chapter 3  Paper Cards          catalogue + full cards spanning the book
+Chapter 4  Glossary             core stack + 50+ engineering terms
+Chapter 5  Interview Bank       ~100 advanced Qs grouped by Volumes 1–24
+Chapter 6  Formulas &amp; Numbers   FLOPs, memory, KV, cost, latency cheat-sheet</pre>
+<figcaption>Map of Volume 25 — an index, not a teaching arc.</figcaption>
+</figure>
+
+<aside class="callout advanced"><span class="title">Index vs encyclopaedia</span>
+  <ul>
+    <li>An encyclopaedia tries to be complete. This volume is an <em>index</em>: dense pointers, curated cards, and arithmetic you reuse.</li>
+    <li>If a topic needs a derivation, leave Volume 25 and open the teaching volume listed in the table.</li>
+    <li>If a topic needs a production implementation, open the corresponding <code>forge.*</code> package rather than copying card prose into code.</li>
+  </ul>
+</aside>
+
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="roadmap-theme">Research Roadmap by Theme</h2>
+<p class="chapter-lede">Papers are organised by the engineering problem they unlocked, not by
+citation count alone. Each table lists key works and the volume that teaches the idea in depth.</p>
+
+<aside class="callout core"><span class="title">How to read these tables</span>
+  <ul>
+    <li>Rows are ordered roughly by influence on practice, then chronologically within a cluster.</li>
+    <li><strong>Vol</strong> is the primary teaching volume; many papers also appear elsewhere.</li>
+    <li>This is a curated engineering map, not a complete bibliography.</li>
+  </ul>
+</aside>
+
+<h3>Transformers and Architectures</h3>
+<table>
+  <caption>Attention, positional encodings, efficient attention variants and modern decoder blocks.</caption>
+  <thead><tr><th>Paper</th><th>Year</th><th>Why it matters</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>Vaswani et al. — Attention Is All You Need</td><td>2017</td><td>Attention-only sequence model; parallel training.</td><td>2</td></tr>
+    <tr><td>Radford et al. — GPT / GPT-2</td><td>2018–19</td><td>Decoder-only LMs; unsupervised multitask transfer.</td><td>2, 4</td></tr>
+    <tr><td>Devlin et al. — BERT</td><td>2018</td><td>Bidirectional MLM pretraining; encoder era.</td><td>2, 5</td></tr>
+    <tr><td>Su et al. — RoFormer (RoPE)</td><td>2021</td><td>Rotary positions; default in modern open LMs.</td><td>2, 7</td></tr>
+    <tr><td>Shazeer — Fast Transformer Decoding (MQA)</td><td>2019</td><td>Shared KV heads cut KV-cache bandwidth.</td><td>7, 11</td></tr>
+    <tr><td>Ainslie et al. — GQA</td><td>2023</td><td>Group-query attention: MQA quality / MHA cost trade-off.</td><td>7, 11</td></tr>
+    <tr><td>Dao et al. — FlashAttention / FA2</td><td>2022–23</td><td>IO-aware attention; wall-clock speedups.</td><td>7, 11</td></tr>
+    <tr><td>Child / Beltagy — sparse attention / Longformer</td><td>2019–20</td><td>Sub-quadratic patterns for long context.</td><td>7</td></tr>
+    <tr><td>Gu &amp; Dao — Mamba</td><td>2023</td><td>Selective SSM alternative / hybrid to attention.</td><td>7</td></tr>
+    <tr><td>Jiang et al. — Mixtral (MoE)</td><td>2024</td><td>Sparse MoE open weights; active vs total params.</td><td>7</td></tr>
+    <tr><td>DeepSeek-V2/V3 — MLA</td><td>2024</td><td>Multi-head latent attention for KV compression.</td><td>7, 11</td></tr>
+  </tbody>
+</table>
+
+<h3>Pretraining and Data</h3>
+<table>
+  <caption>Self-supervised objectives, corpora, filtering and contamination.</caption>
+  <thead><tr><th>Paper</th><th>Year</th><th>Why it matters</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>Mikolov et al. — word2vec</td><td>2013</td><td>Dense embeddings from raw text at scale.</td><td>1, 5</td></tr>
+    <tr><td>Peters et al. — ELMo</td><td>2018</td><td>Contextualised representations from LMs.</td><td>5</td></tr>
+    <tr><td>Radford et al. — GPT</td><td>2018</td><td>Generative pretraining then discriminative fine-tune.</td><td>4, 5</td></tr>
+    <tr><td>Raffel et al. — T5 / C4</td><td>2020</td><td>Text-to-text framework; documented web corpus.</td><td>5, 6</td></tr>
+    <tr><td>Gao et al. — The Pile</td><td>2020</td><td>Diverse open pretraining mix.</td><td>5</td></tr>
+    <tr><td>Wenzek et al. — CCNet</td><td>2020</td><td>Filtered Common Crawl pipelines.</td><td>5</td></tr>
+    <tr><td>Lee et al. — Deduplicating Training Data</td><td>2022</td><td>Near-dup removal improves loss and memorisation.</td><td>5</td></tr>
+    <tr><td>FineWeb, Dolma, RedPajama</td><td>2023–24</td><td>Open recipes for web-scale data quality.</td><td>5, 6</td></tr>
+    <tr><td>Carlini et al. — Extracting Training Data</td><td>2021+</td><td>Memorisation, extraction and privacy risk.</td><td>5, 17</td></tr>
+  </tbody>
+</table>
+
+<h3>Scaling Laws and Compute-Optimal Training</h3>
+<table>
+  <caption>How loss, data and parameters trade under a FLOP budget.</caption>
+  <thead><tr><th>Paper</th><th>Year</th><th>Why it matters</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>Kaplan et al. — Scaling Laws for NLMs</td><td>2020</td><td>Power-law loss vs N, D, C; motivates big models.</td><td>1, 6</td></tr>
+    <tr><td>Hoffmann et al. — Chinchilla</td><td>2022</td><td>Compute-optimal: more tokens per parameter.</td><td>6</td></tr>
+    <tr><td>Sardana et al. — Beyond Chinchilla</td><td>2023</td><td>Inference-aware optimal size under serving load.</td><td>6, 11</td></tr>
+    <tr><td>Muennighoff et al. — Scaling Data-Constrained LMs</td><td>2023</td><td>Epoching under data scarcity.</td><td>5, 6</td></tr>
+  </tbody>
+</table>
+
+<h3>Alignment and Post-Training</h3>
+<table>
+  <caption>Instruction following, preferences and preference optimisation.</caption>
+  <thead><tr><th>Paper</th><th>Year</th><th>Why it matters</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>Ouyang et al. — InstructGPT</td><td>2022</td><td>SFT + RLHF recipe for assistants.</td><td>8</td></tr>
+    <tr><td>Bai et al. — Constitutional AI</td><td>2022</td><td>Principle-driven critique / RLAIF.</td><td>8, 17</td></tr>
+    <tr><td>Rafailov et al. — DPO</td><td>2023</td><td>Preference learning without a separate RM+RL loop.</td><td>8</td></tr>
+    <tr><td>Hu et al. — LoRA</td><td>2021</td><td>Low-rank adapters; default PEFT method.</td><td>8</td></tr>
+    <tr><td>Wei et al. — Instruction Tuning / FLAN</td><td>2021–22</td><td>Multitask instruction mixtures.</td><td>8</td></tr>
+    <tr><td>Christiano et al. — Deep RL from Human Preferences</td><td>2017</td><td>Human preference as reward signal.</td><td>8</td></tr>
+    <tr><td>Ethayarajh — KTO; Hong — ORPO</td><td>2024</td><td>Simpler preference / alignment variants.</td><td>8</td></tr>
+  </tbody>
+</table>
+
+<h3>Efficiency: Inference, Serving and Compression</h3>
+<table>
+  <caption>KV cache, batching, quantisation, speculation and kernels.</caption>
+  <thead><tr><th>Paper</th><th>Year</th><th>Why it matters</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>Pope et al. — Efficiently Scaling Transformer Inference</td><td>2022</td><td>Multi-host inference systems analysis.</td><td>11, 12</td></tr>
+    <tr><td>Kwon et al. — vLLM / PagedAttention</td><td>2023</td><td>Paged KV; continuous batching in practice.</td><td>11, 12</td></tr>
+    <tr><td>Yu et al. — Orca</td><td>2022</td><td>Iteration-level (continuous) batching.</td><td>12</td></tr>
+    <tr><td>Frantar / Lin — GPTQ, AWQ</td><td>2022–23</td><td>Weight-only INT4/INT8 post-training quantisation.</td><td>11</td></tr>
+    <tr><td>Leviathan et al. — Speculative Decoding</td><td>2023</td><td>Draft + verify for decode speedups.</td><td>11</td></tr>
+    <tr><td>Dettmers — LLM.int8(), QLoRA</td><td>2022–23</td><td>8-bit inference; 4-bit fine-tuning.</td><td>8, 11</td></tr>
+    <tr><td>Dao — FlashAttention</td><td>2022</td><td>IO-aware exact attention kernels.</td><td>7, 11</td></tr>
+  </tbody>
+</table>
+
+<h3>Retrieval and Context</h3>
+<table>
+  <caption>RAG, dense retrieval, reranking and long-context prompting.</caption>
+  <thead><tr><th>Paper</th><th>Year</th><th>Why it matters</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>Lewis et al. — RAG</td><td>2020</td><td>Retrieve-then-generate with dual memory.</td><td>14</td></tr>
+    <tr><td>Karpukhin et al. — DPR</td><td>2020</td><td>Dense passage retrieval with dual encoders.</td><td>14</td></tr>
+    <tr><td>Izacard &amp; Grave — FiD</td><td>2021</td><td>Fusion-in-Decoder for multi-passage reading.</td><td>14</td></tr>
+    <tr><td>Robertson — BM25 lineage</td><td>1990s–</td><td>Still the strong lexical baseline.</td><td>14</td></tr>
+    <tr><td>Nogueira &amp; Cho — monoBERT rerankers</td><td>2019</td><td>Cross-encoder reranking pattern.</td><td>14</td></tr>
+    <tr><td>Khattab — ColBERT; Ram — In-Context RALM</td><td>2020–23</td><td>Late interaction; ICL + retrieval.</td><td>13, 14</td></tr>
+    <tr><td>Liu et al. — Lost in the Middle</td><td>2023</td><td>Position bias in long contexts.</td><td>13, 14</td></tr>
+  </tbody>
+</table>
+
+<h3>Agents, Tools and Harnesses</h3>
+<table>
+  <caption>Tool use, planning loops, coding agents and runtime control.</caption>
+  <thead><tr><th>Paper / system</th><th>Year</th><th>Why it matters</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>Yao et al. — ReAct</td><td>2022</td><td>Interleaved reasoning and acting.</td><td>15</td></tr>
+    <tr><td>Schick et al. — Toolformer</td><td>2023</td><td>Self-supervised tool-call learning.</td><td>15</td></tr>
+    <tr><td>Shinn et al. — Reflexion</td><td>2023</td><td>Verbal self-reflection memory.</td><td>15</td></tr>
+    <tr><td>Yang et al. — SWE-agent</td><td>2024</td><td>Agent–computer interfaces for SWE.</td><td>15, 16</td></tr>
+    <tr><td>Jimenez et al. — SWE-bench</td><td>2024</td><td>Real GitHub issue resolution benchmark.</td><td>10, 15</td></tr>
+    <tr><td>Park et al. — Generative Agents</td><td>2023</td><td>Simulated societies with memory streams.</td><td>15</td></tr>
+    <tr><td>MCP and related tool protocols</td><td>2024–</td><td>Standardise tool discovery and invocation.</td><td>15, 16</td></tr>
+  </tbody>
+</table>
+
+<h3>Multimodal Understanding and Generation</h3>
+<table>
+  <caption>Vision–language, speech and generative media.</caption>
+  <thead><tr><th>Paper</th><th>Year</th><th>Why it matters</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>Dosovitskiy et al. — ViT</td><td>2020</td><td>Transformers for image patches.</td><td>19</td></tr>
+    <tr><td>Radford et al. — CLIP</td><td>2021</td><td>Contrastive image–text embeddings.</td><td>19</td></tr>
+    <tr><td>Alayrac — Flamingo; Li — BLIP-2</td><td>2022–23</td><td>Frozen LM + visual adapters.</td><td>19</td></tr>
+    <tr><td>Liu et al. — LLaVA</td><td>2023</td><td>Simple visual instruction tuning.</td><td>19</td></tr>
+    <tr><td>Ho / Nichol / Rombach — DDPM, Guided Diff, LDM</td><td>2020–22</td><td>Diffusion and latent diffusion.</td><td>20</td></tr>
+    <tr><td>Lipman et al. — Flow Matching</td><td>2023</td><td>ODE generative path for media models.</td><td>20</td></tr>
+  </tbody>
+</table>
+
+<h3>Reasoning and Test-Time Compute</h3>
+<table>
+  <caption>Chain-of-thought, search, verifiers and reasoning RL.</caption>
+  <thead><tr><th>Paper</th><th>Year</th><th>Why it matters</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>Wei et al. — Chain-of-Thought</td><td>2022</td><td>Intermediate steps unlock multi-step tasks.</td><td>9, 13</td></tr>
+    <tr><td>Wang et al. — Self-Consistency</td><td>2022</td><td>Sample many paths; majority vote.</td><td>9</td></tr>
+    <tr><td>Yao et al. — Tree of Thoughts</td><td>2023</td><td>Deliberate search over thoughts.</td><td>9</td></tr>
+    <tr><td>Lightman et al. — Process Reward Models</td><td>2023</td><td>Step-level feedback for maths.</td><td>9</td></tr>
+    <tr><td>OpenAI o1 / DeepSeek-R1 reports</td><td>2024–25</td><td>RL on verifiable rewards; long thinking.</td><td>9</td></tr>
+    <tr><td>Snell et al. — Scaling Test-Time Compute</td><td>2024</td><td>Optimal spend of inference FLOPs.</td><td>9, 18</td></tr>
+  </tbody>
+</table>
+
+
+<h3>Theme Notes for Practitioners</h3>
+
+<p class="facet">Transformers → architectures</p>
+<ul>
+  <li>If you implement one thing from Volume 2, make it causal MHA with tests against a reference.</li>
+  <li>If you ship one thing from Volume 7, make it GQA-aware KV sizing — it changes hardware buy decisions.</li>
+  <li>FlashAttention is a kernel/systems paper with model-facing consequences: longer practical context in training.</li>
+</ul>
+
+<p class="facet">Pretraining → scaling</p>
+<ul>
+  <li>Data quality compounds: a 10% filter bug can waste more money than a 10% MFU gap.</li>
+  <li>Kaplan → Chinchilla → inference-aware scaling is the planning arc; do not cite 2020 constants blindly in 2026.</li>
+  <li>6ND remains the shared language for “how big was this train?” even when wall-clock disagrees.</li>
+</ul>
+
+<p class="facet">Alignment → efficiency</p>
+<ul>
+  <li>Post-training is where most product behaviour is decided; pretraining sets the ceiling.</li>
+  <li>DPO simplified open alignment; RL with verifiers returned for reasoning (Volume 9).</li>
+  <li>Serving papers (Orca, vLLM) matter as much as model papers once you have users.</li>
+</ul>
+
+<p class="facet">Retrieval → agents → multimodal → reasoning</p>
+<ul>
+  <li>RAG failures are usually retrieval/context, not “the LLM is dumb”.</li>
+  <li>Agents without harnesses are demos; harnesses without evals are incidents waiting to happen.</li>
+  <li>Multimodal inherits every text problem plus grounding and perceptual attacks.</li>
+  <li>Reasoning models move spend from training FLOPs to test-time FLOPs — routers must know.</li>
+</ul>
+
+<table>
+  <caption>Suggested reading order for a new teammate (papers, not volumes).</caption>
+  <thead><tr><th>Week</th><th>Papers</th><th>Engineering payoff</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>Vaswani; Brown; Bommasani</td><td>Shared vocabulary for architecture and FMs</td></tr>
+    <tr><td>2</td><td>Kaplan; Hoffmann; Williams roofline</td><td>Capacity and cost arithmetic</td></tr>
+    <tr><td>3</td><td>Ouyang; Rafailov; Hu LoRA</td><td>How assistants are actually made</td></tr>
+    <tr><td>4</td><td>Lewis RAG; Kwon vLLM; Dao FA</td><td>Grounding + serving reality</td></tr>
+    <tr><td>5</td><td>Wei CoT; Yao ReAct; Lightman PRM</td><td>Reasoning and tools</td></tr>
+    <tr><td>6</td><td>CLIP; LDM; SWE-bench</td><td>Multimodal + coding agents</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout impl"><span class="title">Cross-cutting themes</span>
+  <ul>
+    <li><strong>Evaluation</strong> (Volume 10) sits under every theme: HumanEval, SWE-bench, MMLU, arenas, LLM-as-judge.</li>
+    <li><strong>Security</strong> (Volume 17) cuts across agents, RAG and prompting: injection, exfiltration, jailbreaks.</li>
+    <li><strong>Routing and platforms</strong> (Volumes 18, 21–24) consume these capabilities as product systems.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="roadmap-year">Research Roadmap by Year</h2>
+<p class="chapter-lede">A chronological spine from word2vec to reasoning models. Dependency notes
+show what each milestone unlocked for the next engineering wave.</p>
+
+<aside class="callout core"><span class="title">Reading the timeline</span>
+  <ul>
+    <li>Years mark publication or public release of the idea that changed practice.</li>
+    <li><strong>Depends on</strong> is an engineering dependency, not a citation graph.</li>
+    <li>Product launches (ChatGPT, Claude, Copilot) appear when they changed what engineers ship.</li>
+  </ul>
+</aside>
+
+<h3>2013–2016: Distributed Representations and Neural Seq2seq</h3>
+<table>
+  <caption>Embeddings and the first neural transduction stacks.</caption>
+  <thead><tr><th>Year</th><th>Milestone</th><th>Depends on</th><th>Unlocked</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>2013</td><td>word2vec (Mikolov)</td><td>Distributional hypothesis; SGD at web scale</td><td>Dense features replace sparse NLP pipelines</td><td>1, 5</td></tr>
+    <tr><td>2014</td><td>Seq2seq (Sutskever); Bahdanau attention</td><td>RNNs + embeddings</td><td>End-to-end translation; soft alignment</td><td>2</td></tr>
+    <tr><td>2015</td><td>Sculley — Hidden Technical Debt in ML</td><td>Production ML systems</td><td>MLOps mindset: model is a small box</td><td>1, 22</td></tr>
+    <tr><td>2015–16</td><td>Residual nets; LayerNorm; Adam ubiquity</td><td>Deep CNNs / optimisers</td><td>Trainable deep stacks that Transformers inherit</td><td>2, 4</td></tr>
+  </tbody>
+</table>
+
+<h3>2017–2019: The Transformer and Pretrain–Fine-Tune</h3>
+<table>
+  <caption>Architecture shift and transfer learning as default.</caption>
+  <thead><tr><th>Year</th><th>Milestone</th><th>Depends on</th><th>Unlocked</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>2017</td><td>Transformer (Vaswani)</td><td>Attention + residuals + LayerNorm</td><td>Fully parallel sequence training</td><td>2</td></tr>
+    <tr><td>2017</td><td>Christiano — RL from Human Preferences</td><td>Deep RL</td><td>Preference → reward → policy path</td><td>8</td></tr>
+    <tr><td>2018</td><td>GPT (Radford); BERT (Devlin); ELMo</td><td>Transformer + self-supervision</td><td>Pretrain once, adapt per task</td><td>2, 4, 5</td></tr>
+    <tr><td>2019</td><td>GPT-2; BPE ubiquity; Megatron</td><td>Decoder-only scale; vocab engineering</td><td>Zero-shot transfer; model parallelism</td><td>3, 4, 6</td></tr>
+    <tr><td>2019</td><td>Sutton — The Bitter Lesson</td><td>History of AI methods</td><td>Compute-general methods framing</td><td>1</td></tr>
+    <tr><td>2019</td><td>MQA (Shazeer); Reformer / sparse attn</td><td>KV cost / quadratic attention</td><td>Inference and long-context research lines</td><td>7, 11</td></tr>
+  </tbody>
+</table>
+
+<h3>2020–2021: Scale, Few-Shot and Multimodal Groundwork</h3>
+<table>
+  <caption>GPT-3, scaling laws, RAG and CLIP.</caption>
+  <thead><tr><th>Year</th><th>Milestone</th><th>Depends on</th><th>Unlocked</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>2020</td><td>GPT-3 (Brown); Kaplan scaling laws</td><td>Decoder LMs + FLOP budgets</td><td>In-context learning; scale as a plan</td><td>1, 6</td></tr>
+    <tr><td>2020</td><td>T5 / C4; The Pile</td><td>Web text pipelines</td><td>Documented corpora and text-to-text</td><td>5, 6</td></tr>
+    <tr><td>2020</td><td>RAG (Lewis); DPR (Karpukhin)</td><td>Seq2seq + dense retrieval</td><td>Non-parametric memory for LMs</td><td>14</td></tr>
+    <tr><td>2020</td><td>ViT; DDPM</td><td>Transformers; score-based gen</td><td>Vision Transformers; modern diffusion</td><td>19, 20</td></tr>
+    <tr><td>2021</td><td>CLIP; Codex; LoRA; Bommasani FM report</td><td>Contrastive web pairs; code LMs; PEFT</td><td>Shared embeddings; code gen; adapters; “foundation model”</td><td>8, 19, 1</td></tr>
+    <tr><td>2021</td><td>GitHub Copilot (product)</td><td>Codex-class models</td><td>Inline AI as default IDE expectation</td><td>21, 23</td></tr>
+  </tbody>
+</table>
+
+<h3>2022: Instruct, Chinchilla, Chat and Agents Seed</h3>
+<table>
+  <caption>The year assistants and compute-optimal training went mainstream.</caption>
+  <thead><tr><th>Year</th><th>Milestone</th><th>Depends on</th><th>Unlocked</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>2022</td><td>InstructGPT; ChatGPT launch</td><td>SFT + RLHF + product UX</td><td>Instruction-following consumer assistants</td><td>8, 21</td></tr>
+    <tr><td>2022</td><td>Chinchilla (Hoffmann)</td><td>Kaplan laws + FLOP accounting</td><td>Token-heavy compute-optimal recipes</td><td>6</td></tr>
+    <tr><td>2022</td><td>Flamingo; Stable Diffusion / LDM</td><td>CLIP + LM; latent diffusion</td><td>VLM assistants; open image gen</td><td>19, 20</td></tr>
+    <tr><td>2022</td><td>CoT; Self-Consistency; ReAct</td><td>Prompted LMs</td><td>Reasoning traces; tool-using loops</td><td>9, 15</td></tr>
+    <tr><td>2022</td><td>FlashAttention; Orca; PaLM</td><td>GPU IO; serving batching; scale</td><td>Faster attention; continuous batching; 100B+ LMs</td><td>11, 12, 6</td></tr>
+    <tr><td>2022</td><td>Constitutional AI</td><td>RLHF + principles</td><td>RLAIF / critique pipelines</td><td>8, 17</td></tr>
+  </tbody>
+</table>
+
+<h3>2023: Open Weights, Serving Stacks and Tool Agents</h3>
+<table>
+  <caption>Llama era, vLLM, DPO, multimodal instruction and coding agents.</caption>
+  <thead><tr><th>Year</th><th>Milestone</th><th>Depends on</th><th>Unlocked</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>2023</td><td>LLaMA / Llama 2; Mistral</td><td>Chinchilla-ish recipes; open release</td><td>Capable self-hosted LMs</td><td>6, 7, 12</td></tr>
+    <tr><td>2023</td><td>GPT-4; Claude 2 / Gemini early</td><td>Multimodal + strong post-train</td><td>Frontier product baselines</td><td>19, 21</td></tr>
+    <tr><td>2023</td><td>vLLM / PagedAttention; GQA</td><td>KV fragmentation; MQA lineage</td><td>Production open serving; cheaper KV</td><td>11, 12, 7</td></tr>
+    <tr><td>2023</td><td>DPO; QLoRA; GPTQ / AWQ</td><td>RLHF cost; PEFT; PTQ</td><td>Simpler alignment; laptop fine-tunes; INT4 serve</td><td>8, 11</td></tr>
+    <tr><td>2023</td><td>LLaVA; Whisper maturity; Toolformer</td><td>CLIP + Vicuna; ASR; API tools</td><td>Open VLMs; speech; tool learning</td><td>19, 15</td></tr>
+    <tr><td>2023</td><td>Lost in the Middle; speculative decoding</td><td>Long context; draft models</td><td>Context placement discipline; decode speedups</td><td>13, 11</td></tr>
+    <tr><td>2023</td><td>AutoGPT / LangChain wave (practice)</td><td>ReAct + APIs</td><td>Agent prototypes (and harness lessons)</td><td>15, 16</td></tr>
+  </tbody>
+</table>
+
+<h3>2024–Present: Reasoning, MoE Open, Protocols and Platforms</h3>
+<table>
+  <caption>Test-time compute, open MoE, coding agents and platformisation.</caption>
+  <thead><tr><th>Year</th><th>Milestone</th><th>Depends on</th><th>Unlocked</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>2024</td><td>Mixtral; DeepSeek-V2/V3 (MLA, MoE)</td><td>Sparse MoE; KV compression</td><td>Open sparse models; cheaper long context</td><td>7, 11</td></tr>
+    <tr><td>2024</td><td>o1-class reasoning models</td><td>CoT + RL + verifiers</td><td>Train-to-think; test-time compute products</td><td>9</td></tr>
+    <tr><td>2024</td><td>SWE-bench; SWE-agent; Cursor / Claude Code</td><td>Repo tools + eval harnesses</td><td>Coding agents as a product class</td><td>10, 15, 16, 23</td></tr>
+    <tr><td>2024</td><td>MCP and tool-protocol standardisation</td><td>Fragmented tool APIs</td><td>Portable tool runtimes</td><td>15, 16</td></tr>
+    <tr><td>2024–25</td><td>DeepSeek-R1; open reasoning recipes</td><td>GRPO / verifiable rewards</td><td>Open long-CoT post-training paths</td><td>9</td></tr>
+    <tr><td>2025+</td><td>Agent platforms; multimodal realtime</td><td>Harness + routing + guardrails</td><td>Integrated AI platforms (this book’s end state)</td><td>21–24</td></tr>
+  </tbody>
+</table>
+
+<figure class="diagram">
+<pre class="ascii">2013 embeddings
+  → 2017 Transformer
+    → 2018–19 pretrain/fine-tune
+      → 2020 scale + RAG + diffusion seeds
+        → 2022 instruct + chat + CoT/ReAct
+          → 2023 open weights + serving + DPO
+            → 2024–25 reasoning RL + agents + platforms</pre>
+<figcaption>Dependency spine of the research roadmap (simplified).</figcaption>
+</figure>
+
+
+<h3>Dependency Patterns Worth Internalising</h3>
+<ol>
+  <li><strong>Architecture before scale</strong>: Transformer (2017) precedes GPT-3 (2020). You cannot “scale” an unparallelisable idea cheaply.</li>
+  <li><strong>Scale before alignment</strong>: GPT-3-style bases precede InstructGPT. Alignment needs a capable prior.</li>
+  <li><strong>Alignment before agents</strong>: Tool loops on unaligned bases amplify harm; Instruct/RLHF unlocked safe-ish tool use.</li>
+  <li><strong>Serving before ubiquity</strong>: Continuous batching and paged KV turned demos into affordable products.</li>
+  <li><strong>Verifiers before reasoning RL</strong>: Unit tests and PRMs make RL on long CoT workable.</li>
+</ol>
+
+<table>
+  <caption>Product releases that forced engineering practice changes (selected).</caption>
+  <thead><tr><th>Year</th><th>Product / release</th><th>Practice change</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>2021</td><td>GitHub Copilot</td><td>Inline latency budgets; IDE telemetry; code eval</td><td>11, 21, 23</td></tr>
+    <tr><td>2022</td><td>ChatGPT</td><td>Chat UX; moderation; enormous soft eval via users</td><td>8, 13, 21</td></tr>
+    <tr><td>2023</td><td>Llama / Llama 2 weights</td><td>Self-host economics; open eval culture</td><td>6, 12</td></tr>
+    <tr><td>2023</td><td>GPT-4 / multimodal assistants</td><td>Image inputs in helpdesk and docs products</td><td>19, 21</td></tr>
+    <tr><td>2024</td><td>o1-class / coding agents</td><td>Test-time compute SKUs; repo-level permissions</td><td>9, 15, 16</td></tr>
+    <tr><td>2024–25</td><td>MCP-style tool protocols</td><td>Portable tool runtimes across vendors</td><td>15, 16</td></tr>
+  </tbody>
+</table>
+
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  W2V[word2vec 2013] --> Seq[seq2seq+attn 2014]
+  Seq --> Tr[Transformer 2017]
+  Tr --> GPT[GPT/BERT 2018]
+  GPT --> GPT3[GPT-3 2020]
+  GPT3 --> Instruct[InstructGPT 2022]
+  GPT3 --> RAG[RAG 2020]
+  Instruct --> Chat[Chat products]
+  RAG --> Enterprise[Enterprise assistants]
+  Instruct --> Agents[ReAct/tools 2022+]
+  Agents --> Harness[Harnesses 2024+]
+  GPT3 --> Scale[Chinchilla 2022]
+  Scale --> Open[Llama era 2023]
+  Open --> Serve[vLLM 2023]
+  Instruct --> Reason[CoT → o1/R1]
+  Tr --> CLIP[CLIP 2021]
+  CLIP --> VLM[VLMs]
+  Tr --> Diff[Diffusion 2020-22]</pre>
+<figcaption>High-level dependency sketch (not a full citation graph).</figcaption>
+</figure>
+
+<aside class="callout warning"><span class="title">What the timeline does not show</span>
+  <ul>
+    <li>Infrastructure papers (Dapper, Firecracker, Kubernetes) matter as much as model papers for Volumes 16 and 22.</li>
+    <li>Negative results and saturation papers (e.g. Schaeffer on “emergence”) are essential for evaluation literacy (Volume 10).</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="paper-cards">Paper Cards</h2>
+<p class="chapter-lede">A dense catalogue of high-impact papers across the book, followed by
+full paper cards for a curated spanning set. Prefer the teaching volume for implementation detail;
+use these cards for interview prep and design reviews.</p>
+
+<h3>Dense Catalogue</h3>
+<table>
+  <caption>High-impact papers spanning Volumes 1–24 (selected).</caption>
+  <thead><tr><th>Key</th><th>Title (short)</th><th>Theme</th><th>Vol</th><th>One-line takeaway</th></tr></thead>
+  <tbody>
+    <tr><td>vaswani2017</td><td>Attention Is All You Need</td><td>Transformers</td><td>2</td><td>Self-attention replaces recurrence for seq2seq.</td></tr>
+    <tr><td>brown2020</td><td>GPT-3 / Few-Shot Learners</td><td>Scale</td><td>1, 6</td><td>In-context learning as the task interface.</td></tr>
+    <tr><td>kaplan2020</td><td>Scaling Laws for NLMs</td><td>Scaling</td><td>6</td><td>Loss scales as a power law in N, D, C.</td></tr>
+    <tr><td>hoffmann2022</td><td>Chinchilla</td><td>Scaling</td><td>6</td><td>Compute-optimal needs far more tokens per param.</td></tr>
+    <tr><td>ouyang2022</td><td>InstructGPT</td><td>Alignment</td><td>8</td><td>SFT + RLHF makes models follow instructions.</td></tr>
+    <tr><td>rafailov2023</td><td>DPO</td><td>Alignment</td><td>8</td><td>Preference optimisation without an explicit RL loop.</td></tr>
+    <tr><td>hu2021</td><td>LoRA</td><td>Efficiency</td><td>8</td><td>Low-rank updates adapt large models cheaply.</td></tr>
+    <tr><td>lewis2020</td><td>RAG</td><td>Retrieval</td><td>14</td><td>Parametric + non-parametric memory together.</td></tr>
+    <tr><td>kwon2023</td><td>vLLM / PagedAttention</td><td>Serving</td><td>11, 12</td><td>Page the KV cache like virtual memory.</td></tr>
+    <tr><td>dao2022</td><td>FlashAttention</td><td>Efficiency</td><td>7, 11</td><td>Exact attention with IO-aware tiling.</td></tr>
+    <tr><td>wei2022cot</td><td>Chain-of-Thought</td><td>Reasoning</td><td>9</td><td>Intermediate tokens unlock multi-step tasks.</td></tr>
+    <tr><td>yao2022react</td><td>ReAct</td><td>Agents</td><td>15</td><td>Interleave thought traces with tool actions.</td></tr>
+    <tr><td>radford2021clip</td><td>CLIP</td><td>Multimodal</td><td>19</td><td>Contrastive image–text space at web scale.</td></tr>
+    <tr><td>rombach2022ldm</td><td>Latent Diffusion</td><td>Generation</td><td>20</td><td>Diffuse in latent space for efficient images.</td></tr>
+    <tr><td>bommasani2021</td><td>Foundation Models report</td><td>Landscape</td><td>1</td><td>Names and risks the FM paradigm.</td></tr>
+    <tr><td>sculley2015</td><td>Hidden Technical Debt</td><td>Systems</td><td>1, 22</td><td>ML code is a small box in a large system.</td></tr>
+    <tr><td>shazeer2019mqa</td><td>MQA</td><td>Architecture</td><td>7, 11</td><td>Share KV heads to cut decode bandwidth.</td></tr>
+    <tr><td>ainslie2023gqa</td><td>GQA</td><td>Architecture</td><td>7</td><td>Grouped KV heads between MHA and MQA.</td></tr>
+    <tr><td>leviathan2023</td><td>Speculative Decoding</td><td>Inference</td><td>11</td><td>Draft small, verify large in one forward.</td></tr>
+    <tr><td>liu2023lost</td><td>Lost in the Middle</td><td>Context</td><td>13</td><td>Models under-use mid-context evidence.</td></tr>
+    <tr><td>lightman2023prm</td><td>Let’s Verify Step by Step</td><td>Reasoning</td><td>9</td><td>Process rewards beat outcome-only for maths.</td></tr>
+    <tr><td>jimenez2024swe</td><td>SWE-bench</td><td>Eval / Agents</td><td>10, 15</td><td>Real repo issues as an agent benchmark.</td></tr>
+    <tr><td>dettmers2023qlora</td><td>QLoRA</td><td>Fine-tune</td><td>8</td><td>4-bit bases + LoRA for consumer GPUs.</td></tr>
+    <tr><td>frantar2023gptq</td><td>GPTQ</td><td>Quantisation</td><td>11</td><td>Post-training weight quant for LLMs.</td></tr>
+    <tr><td>yu2022orca</td><td>Orca</td><td>Serving</td><td>12</td><td>Iteration-level continuous batching.</td></tr>
+    <tr><td>karpukhin2020dpr</td><td>DPR</td><td>Retrieval</td><td>14</td><td>Dual-encoder dense passage retrieval.</td></tr>
+    <tr><td>su2021rope</td><td>RoFormer / RoPE</td><td>Architecture</td><td>2, 7</td><td>Rotary relative positions.</td></tr>
+    <tr><td>shinn2023reflexion</td><td>Reflexion</td><td>Agents</td><td>15</td><td>Verbal reinforcement via reflective memory.</td></tr>
+    <tr><td>bai2022constitutional</td><td>Constitutional AI</td><td>Alignment</td><td>8, 17</td><td>Principles drive self-critique and RLAIF.</td></tr>
+    <tr><td>williams2009roofline</td><td>Roofline Model</td><td>Arithmetic</td><td>1, 11</td><td>Bound performance by FLOPs or bandwidth.</td></tr>
+    <tr><td>raffel2020t5</td><td>T5 / C4</td><td>Pretraining</td><td>5, 6</td><td>Text-to-text transfer + documented crawl.</td></tr>
+    <tr><td>touvron2023llama</td><td>LLaMA</td><td>Open LMs</td><td>6, 7</td><td>Capable open weights; Chinchilla-leaning recipe.</td></tr>
+    <tr><td>jiang2024mixtral</td><td>Mixtral</td><td>MoE</td><td>7</td><td>Open sparse MoE with strong quality/cost.</td></tr>
+    <tr><td>schulman2017ppo</td><td>PPO</td><td>RL</td><td>8, 9</td><td>Workhorse policy optimiser for RLHF era.</td></tr>
+    <tr><td>christiano2017prefs</td><td>Deep RL from Human Prefs</td><td>Alignment</td><td>8</td><td>Preference → reward lineage.</td></tr>
+    <tr><td>wei2022emergent</td><td>Emergent Abilities</td><td>Scale</td><td>1, 10</td><td>Claims of sudden abilities at scale.</td></tr>
+    <tr><td>schaeffer2023emergent</td><td>Emergent Mirages</td><td>Eval</td><td>10</td><td>Metric artefacts explain many “jumps”.</td></tr>
+    <tr><td>chen2021humaneval</td><td>Codex / HumanEval</td><td>Code eval</td><td>10</td><td>Functional code correctness benchmark.</td></tr>
+    <tr><td>nogueira2019rank</td><td>Passage Re-ranking BERT</td><td>IR</td><td>14</td><td>Cross-encoder rerank pattern.</td></tr>
+    <tr><td>izacard2021fid</td><td>Fusion-in-Decoder</td><td>RAG</td><td>14</td><td>Encode passages separately; fuse in decoder.</td></tr>
+    <tr><td>schick2023toolformer</td><td>Toolformer</td><td>Tools</td><td>15</td><td>Self-supervised API call learning.</td></tr>
+    <tr><td>yang2024sweagent</td><td>SWE-agent</td><td>Agents</td><td>15, 16</td><td>ACI design for software agents.</td></tr>
+    <tr><td>liu2023llava</td><td>LLaVA</td><td>VLM</td><td>19</td><td>Visual instruction tuning recipe.</td></tr>
+    <tr><td>ho2020ddpm</td><td>DDPM</td><td>Generation</td><td>20</td><td>Denoising diffusion probabilistic models.</td></tr>
+    <tr><td>snell2024ttc</td><td>Scaling Test-Time Compute</td><td>Reasoning</td><td>9, 18</td><td>Allocate inference FLOPs optimally.</td></tr>
+    <tr><td>pope2022infer</td><td>Efficiently Scaling Transformer Inference</td><td>Serving</td><td>11, 12</td><td>Multi-host inference systems study.</td></tr>
+    <tr><td>saltzer1975protection</td><td>Protection of Information</td><td>Security</td><td>16, 17</td><td>Classic principles for harness permissions.</td></tr>
+  </tbody>
+</table>
+
+<p>Full cards below cover a spanning subset (~14). Sister cards live in the teaching volumes’
+research sections; this chapter is the index entry point.</p>
+
+<h3>Full Cards — Foundations and Scale</h3>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Attention Is All You Need</span>
+    <span class="paper-meta">Vaswani et al., 2017 · NeurIPS · arXiv:1706.03762 · Vol 2</span></div>
+  <dl>
+    <dt>Problem</dt><dd>RNN/CNN sequence models train slowly and struggle with long-range dependencies.</dd>
+    <dt>Previous limitation</dt><dd>Recurrence serialises time; convolutions need depth for long receptive fields.</dd>
+    <dt>Approach</dt><dd>Replace recurrence with multi-head self-attention plus positional encodings; encoder–decoder stack.</dd>
+    <dt>Contribution</dt><dd>The Transformer: fully parallel training, strong translation quality, the template for modern LMs.</dd>
+    <dt>Practical impact</dt><dd>Became the default architecture for LLMs, VLMs and many speech models.</dd>
+    <dt>Limitations</dt><dd>Quadratic attention in sequence length; absolute positions age poorly (later fixed by RoPE and relatives).</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Language Models are Few-Shot Learners</span>
+    <span class="paper-meta">Brown et al., 2020 · NeurIPS · arXiv:2005.14165 · Vol 1, 6</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Every NLP task still needed labelled fine-tuning data and a separate training run.</dd>
+    <dt>Previous limitation</dt><dd>Pretrained LMs transferred, but usable behaviour still required task heads or fine-tuning.</dd>
+    <dt>Approach</dt><dd>Scale a decoder-only LM (GPT-3) and specify tasks in prompts with zero/few-shot examples.</dd>
+    <dt>Contribution</dt><dd>In-context learning as an engineering interface: behaviour change without weight updates.</dd>
+    <dt>Practical impact</dt><dd>API-first products, prompt engineering and evaluation sets became the default prototype path.</dd>
+    <dt>Limitations</dt><dd>Prompt sensitivity; contamination; cost; base models are not aligned assistants until post-training.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Scaling Laws for Neural Language Models</span>
+    <span class="paper-meta">Kaplan et al., 2020 · arXiv:2001.08361 · Vol 1, 6</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Labs lacked a quantitative plan for how big to make models versus how much data to train on.</dd>
+    <dt>Previous limitation</dt><dd>Architecture search and “bigger is better” heuristics without FLOP-budget geometry.</dd>
+    <dt>Approach</dt><dd>Fit power-law relationships between cross-entropy loss and parameters, data and compute.</dd>
+    <dt>Contribution</dt><dd>Predictable scaling curves that justify 6ND-style capacity planning.</dd>
+    <dt>Practical impact</dt><dd>Made compute allocation a first-class design decision for pretraining.</dd>
+    <dt>Limitations</dt><dd>Underestimated optimal tokens/parameter (revised by Chinchilla); ignores inference cost.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Training Compute-Optimal Large Language Models (Chinchilla)</span>
+    <span class="paper-meta">Hoffmann et al., 2022 · NeurIPS · arXiv:2203.15556 · Vol 6</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Many large models were under-trained on tokens relative to their parameter count.</dd>
+    <dt>Previous limitation</dt><dd>Kaplan-style guidance favoured parameters over data for a fixed FLOP budget.</dd>
+    <dt>Approach</dt><dd>IsoFLOP experiments; fit compute-optimal N and D; train Chinchilla 70B on 1.4T tokens.</dd>
+    <dt>Contribution</dt><dd>~20 tokens per parameter as a practical compute-optimal rule of thumb of that era.</dd>
+    <dt>Practical impact</dt><dd>Open recipes (Llama, Mistral) shifted toward smaller models with more tokens.</dd>
+    <dt>Limitations</dt><dd>Ignores repeated-data regimes and inference-heavy deployments (later “beyond Chinchilla” work).</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">On the Opportunities and Risks of Foundation Models</span>
+    <span class="paper-meta">Bommasani et al., 2021 · arXiv:2108.07258 · Vol 1</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Homogeneous large models were emerging without shared vocabulary or risk analysis.</dd>
+    <dt>Previous limitation</dt><dd>Task-specific ML surveys missed systemic effects of one model adapted many ways.</dd>
+    <dt>Approach</dt><dd>Define “foundation model”; survey capabilities, adaptation modes and societal risks.</dd>
+    <dt>Contribution</dt><dd>The framing used throughout this book: one pretrained model, many downstream systems.</dd>
+    <dt>Practical impact</dt><dd>Shaped how labs and products discuss general models and shared infrastructure.</dd>
+    <dt>Limitations</dt><dd>Report, not a method paper; some emergence claims needed later empirical checks.</dd>
+  </dl>
+</section>
+
+<h3>Full Cards — Alignment, Retrieval and Serving</h3>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Training Language Models to Follow Instructions with Human Feedback</span>
+    <span class="paper-meta">Ouyang et al., 2022 · NeurIPS · arXiv:2203.02155 · Vol 8</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Base LMs predict web text; they do not reliably follow user instructions or stay helpful/harmless.</dd>
+    <dt>Previous limitation</dt><dd>Fine-tuning on demonstrations alone underperformed human preference rankings.</dd>
+    <dt>Approach</dt><dd>SFT on instructions, train a reward model on rankings, optimise the policy with RL (PPO).</dd>
+    <dt>Contribution</dt><dd>The InstructGPT recipe that became the assistant default.</dd>
+    <dt>Practical impact</dt><dd>Enabled ChatGPT-class products; defined the SFT → RM → RLHF pipeline.</dd>
+    <dt>Limitations</dt><dd>Expensive human data; reward hacking; over-refusal and sycophancy risks.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Direct Preference Optimization</span>
+    <span class="paper-meta">Rafailov et al., 2023 · NeurIPS · arXiv:2305.18290 · Vol 8</span></div>
+  <dl>
+    <dt>Problem</dt><dd>RLHF’s RM + RL loop is unstable, complex and costly to operate.</dd>
+    <dt>Previous limitation</dt><dd>Preference learning required a separate reward model and on-policy RL.</dd>
+    <dt>Approach</dt><dd>Reparameterise the RLHF objective so the policy is trained directly on preference pairs.</dd>
+    <dt>Contribution</dt><dd>A simple classification-style loss that matches or beats PPO-RLHF on many chat tasks.</dd>
+    <dt>Practical impact</dt><dd>Default open-source alignment path; many variants (IPO, KTO, ORPO) followed.</dd>
+    <dt>Limitations</dt><dd>Sensitive to preference data quality; not a full substitute for online RL in all regimes.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">LoRA: Low-Rank Adaptation of Large Language Models</span>
+    <span class="paper-meta">Hu et al., 2021 · ICLR · arXiv:2106.09685 · Vol 8</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Full fine-tuning of large models is memory-heavy and multiplies checkpoint storage per task.</dd>
+    <dt>Previous limitation</dt><dd>Adapters and prefix methods still added latency or underperformed full FT in some settings.</dd>
+    <dt>Approach</dt><dd>Freeze base weights; inject trainable low-rank matrices into attention (and later MLP) projections.</dd>
+    <dt>Contribution</dt><dd>Rank-r updates that match full FT quality with orders-of-magnitude fewer trainable params.</dd>
+    <dt>Practical impact</dt><dd>Industry-default PEFT; composes with quantisation (QLoRA).</dd>
+    <dt>Limitations</dt><dd>Rank and target-module choices matter; multi-adapter serving needs routing or merging strategy.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Retrieval-Augmented Generation for Knowledge-Intensive NLP</span>
+    <span class="paper-meta">Lewis et al., 2020 · NeurIPS · arXiv:2005.11401 · Vol 14</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Parametric LMs hallucinate and go stale on knowledge-intensive tasks.</dd>
+    <dt>Previous limitation</dt><dd>Fine-tuning cannot cheaply refresh facts; pure retrieval lacks fluent generation.</dd>
+    <dt>Approach</dt><dd>Retrieve documents with a neural retriever; condition a seq2seq generator on them (RAG-seq / RAG-tok).</dd>
+    <dt>Contribution</dt><dd>Joint parametric + non-parametric memory as a first-class architecture.</dd>
+    <dt>Practical impact</dt><dd>Template for enterprise assistants, support bots and research copilots.</dd>
+    <dt>Limitations</dt><dd>Retrieval errors dominate; chunking, freshness and citation faithfulness remain hard.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Efficient Memory Management for Large Language Model Serving with PagedAttention</span>
+    <span class="paper-meta">Kwon et al., 2023 · SOSP · arXiv:2309.06180 · Vol 11, 12</span></div>
+  <dl>
+    <dt>Problem</dt><dd>KV-cache memory is fragmented and over-reserved, limiting batch size and throughput.</dd>
+    <dt>Previous limitation</dt><dd>Contiguous per-request KV allocation wastes GPU memory under variable lengths.</dd>
+    <dt>Approach</dt><dd>Store KV in fixed-size blocks (pages); map logical tokens to physical blocks like virtual memory.</dd>
+    <dt>Contribution</dt><dd>PagedAttention + continuous batching in vLLM with large throughput gains.</dd>
+    <dt>Practical impact</dt><dd>De-facto open serving stack pattern; inspired SGLang, TensorRT-LLM features and more.</dd>
+    <dt>Limitations</dt><dd>Block size and scheduling still need tuning; prefix caching and multi-LoRA add complexity.</dd>
+  </dl>
+</section>
+
+<h3>Full Cards — Reasoning, Agents and Multimodal</h3>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Chain-of-Thought Prompting Elicits Reasoning in Large Language Models</span>
+    <span class="paper-meta">Wei et al., 2022 · NeurIPS · arXiv:2201.11903 · Vol 9, 13</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Standard few-shot prompting fails on multi-step arithmetic, logic and symbolic tasks.</dd>
+    <dt>Previous limitation</dt><dd>Models jumped to answers without allocating tokens to intermediate computation.</dd>
+    <dt>Approach</dt><dd>Demonstrate exemplars that include explicit reasoning steps before the final answer.</dd>
+    <dt>Contribution</dt><dd>Showed that intermediate tokens dramatically improve multi-step performance at scale.</dd>
+    <dt>Practical impact</dt><dd>Foundation for self-consistency, ToT, process rewards and reasoning-model training.</dd>
+    <dt>Limitations</dt><dd>Verbose and costly; unfaithful rationales; weaker models gain little.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">ReAct: Synergizing Reasoning and Acting in Language Models</span>
+    <span class="paper-meta">Yao et al., 2022 · ICLR 2023 · arXiv:2210.03629 · Vol 15</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Pure reasoning traces lack grounding; pure action agents lack deliberation.</dd>
+    <dt>Previous limitation</dt><dd>CoT does not query tools; tool-only loops do not plan in language.</dd>
+    <dt>Approach</dt><dd>Interleave “Thought / Action / Observation” steps in one prompt loop.</dd>
+    <dt>Contribution</dt><dd>A simple pattern for tool-using agents that remains the mental model for many products.</dd>
+    <dt>Practical impact</dt><dd>Inspired LangChain-style agents, research assistants and coding agent scaffolds.</dd>
+    <dt>Limitations</dt><dd>Prompt-brittle; no hard permissions/budgets — needs a harness for production (Vol 16).</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Learning Transferable Visual Models From Natural Language Supervision</span>
+    <span class="paper-meta">Radford et al., 2021 · ICML · arXiv:2103.00020 · Vol 19</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Vision models trained on fixed label sets do not transfer zero-shot to new categories.</dd>
+    <dt>Previous limitation</dt><dd>Supervised ImageNet-style training does not use free-form image–text supervision.</dd>
+    <dt>Approach</dt><dd>Contrastive training of image and text encoders on 400M web pairs (CLIP).</dd>
+    <dt>Contribution</dt><dd>A shared embedding space enabling zero-shot classification and retrieval.</dd>
+    <dt>Practical impact</dt><dd>Backbone for VLMs, multimodal RAG, moderation and generative conditioning.</dd>
+    <dt>Limitations</dt><dd>Bag/compositional blind spots; web-data biases; not a generative model by itself.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">High-Resolution Image Synthesis with Latent Diffusion Models</span>
+    <span class="paper-meta">Rombach et al., 2022 · CVPR · arXiv:2112.10752 · Vol 20</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Pixel-space diffusion is too expensive for high-resolution images.</dd>
+    <dt>Previous limitation</dt><dd>DDPMs worked but scaled poorly in compute and memory with resolution.</dd>
+    <dt>Approach</dt><dd>Train a diffusion model in the latent space of a pretrained autoencoder (LDM).</dd>
+    <dt>Contribution</dt><dd>Practical high-res synthesis with accessible compute; basis of Stable Diffusion.</dd>
+    <dt>Practical impact</dt><dd>Democratised text-to-image; template for latent video and audio diffusion.</dd>
+    <dt>Limitations</dt><dd>Autoencoder artefacts; prompt adherence and compositionality still research-active.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Hidden Technical Debt in Machine Learning Systems</span>
+    <span class="paper-meta">Sculley et al., 2015 · NeurIPS · Vol 1, 22</span></div>
+  <dl>
+    <dt>Problem</dt><dd>ML systems are easy to prototype but expensive to maintain in production.</dd>
+    <dt>Previous limitation</dt><dd>Classical software debt concepts ignored data dependencies and feedback loops.</dd>
+    <dt>Approach</dt><dd>Catalogue ML-specific debt: entanglement, hidden feedback, undeclared consumers, glue code.</dd>
+    <dt>Contribution</dt><dd>The diagram of ML code as a tiny box inside a large system.</dd>
+    <dt>Practical impact</dt><dd>Shaped MLOps; for LLMs, prompts, indexes and tools are the new debt sources.</dd>
+    <dt>Limitations</dt><dd>Qualitative; predates foundation models and agent harnesses.</dd>
+  </dl>
+</section>
+
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">FlashAttention: Fast and Memory-Efficient Exact Attention</span>
+    <span class="paper-meta">Dao et al., 2022 · NeurIPS · arXiv:2205.14135 · Vol 7, 11</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Standard attention materialises S×S matrices, exhausting GPU HBM and slowing training/prefill.</dd>
+    <dt>Previous limitation</dt><dd>Approximate attention traded quality; naive exact attention was IO-bound.</dd>
+    <dt>Approach</dt><dd>Tiling + online softmax to keep softmax statistics in SRAM; exact attention with fewer HBM moves.</dd>
+    <dt>Contribution</dt><dd>Wall-clock and memory wins for exact attention; foundation for FA2/FA3.</dd>
+    <dt>Practical impact</dt><dd>Default kernel path in modern training and many serving stacks for long prefill.</dd>
+    <dt>Limitations</dt><dd>Helps decode less when weight/KV bandwidth dominates; hardware-specific kernels.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">GQA: Training Generalized Multi-Query Transformer Models</span>
+    <span class="paper-meta">Ainslie et al., 2023 · arXiv:2305.13245 · Vol 7, 11</span></div>
+  <dl>
+    <dt>Problem</dt><dd>MHA KV caches are too large for high-concurrency serving; MQA can hurt quality.</dd>
+    <dt>Previous limitation</dt><dd>Binary choice between costly MHA and aggressive MQA.</dd>
+    <dt>Approach</dt><dd>Group query heads to share KV heads; uptrain/convert checkpoints to GQA.</dd>
+    <dt>Contribution</dt><dd>Practical Pareto frontier between quality and KV bandwidth/memory.</dd>
+    <dt>Practical impact</dt><dd>Adopted by Llama 2/3-class open models and many production stacks.</dd>
+    <dt>Limitations</dt><dd>Group size is a hyperparameter; conversion needs careful continued training.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Lost in the Middle: How Language Models Use Long Contexts</span>
+    <span class="paper-meta">Liu et al., 2023 · arXiv:2307.03172 · Vol 13, 14</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Models with large context windows still fail to use evidence placed mid-prompt.</dd>
+    <dt>Previous limitation</dt><dd>Marketing “NIk context” as uniformly usable memory.</dd>
+    <dt>Approach</dt><dd>Controlled multi-document QA varying needle position; measure accuracy vs position.</dd>
+    <dt>Contribution</dt><dd>U-shaped position curve: primacy and recency beat the middle.</dd>
+    <dt>Practical impact</dt><dd>Context engineering: put critical evidence at edges; rerank; cite; evaluate placement.</dd>
+    <dt>Limitations</dt><dd>Task-specific; newer long-context training partially mitigates but does not erase the issue.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Let’s Verify Step by Step</span>
+    <span class="paper-meta">Lightman et al., 2023 · arXiv:2305.20050 · Vol 9</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Outcome-only rewards give poor credit assignment on multi-step maths.</dd>
+    <dt>Previous limitation</dt><dd>Final-answer RL struggles to train reliable intermediate reasoning.</dd>
+    <dt>Approach</dt><dd>Collect process supervision on steps; train process reward models; search with PRMs.</dd>
+    <dt>Contribution</dt><dd>Process supervision outperforms outcome supervision on MATH under matched labels.</dd>
+    <dt>Practical impact</dt><dd>Template for verifier-guided decoding and reasoning-model training.</dd>
+    <dt>Limitations</dt><dd>Expensive human process labels; domain-limited; unfaithful steps still possible.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Speculative Decoding</span>
+    <span class="paper-meta">Leviathan et al., 2023 · ICML · arXiv:2211.17192 · Vol 11</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Autoregressive decode of large models is memory-bound and slow at low batch.</dd>
+    <dt>Previous limitation</dt><dd>Faster approximations changed the output distribution.</dd>
+    <dt>Approach</dt><dd>Small draft model proposes γ tokens; large model verifies in one forward; accept/reject keeps exact dist.</dd>
+    <dt>Contribution</dt><dd>Lossless speedups when draft acceptance is high.</dd>
+    <dt>Practical impact</dt><dd>Widely deployed (Medusa, EAGLE, provider speculation features).</dd>
+    <dt>Limitations</dt><dd>Low acceptance wastes work; draft must match domain; implementation complexity.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">QLoRA: Efficient Finetuning of Quantized LLMs</span>
+    <span class="paper-meta">Dettmers et al., 2023 · NeurIPS · arXiv:2305.14314 · Vol 8</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Finetuning 65B-class models needed multi-GPU memory beyond many practitioners.</dd>
+    <dt>Previous limitation</dt><dd>LoRA still kept base weights in high precision in memory.</dd>
+    <dt>Approach</dt><dd>4-bit NormalFloat base + LoRA adapters + paged optimisers.</dd>
+    <dt>Contribution</dt><dd>Finetune very large models on a single 48GB GPU-class machine.</dd>
+    <dt>Practical impact</dt><dd>Democratised instruction/domain adapters; default hobbyist/pro PEFT path.</dd>
+    <dt>Limitations</dt><dd>Quant noise; not always equal to full FT; serving still needs adapter strategy.</dd>
+  </dl>
+</section>
+
+<aside class="callout impl"><span class="title">Finding more cards</span>
+  <ul>
+    <li>Each teaching volume ends with a Research Papers section and additional <code>paper-card</code> blocks.</li>
+    <li>Use Chapter 1’s theme tables to jump to the right volume when this catalogue is not enough.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="glossary">Glossary</h2>
+<p class="chapter-lede">Precise definitions with volume cross-references. The first table is the
+book’s terminology stack (MASTER_PLAN Area 37). The second collects fifty-plus engineering terms
+you will meet repeatedly across Volumes 1–24.</p>
+
+<aside class="callout core"><span class="title">Usage rule</span>
+  <ul>
+    <li>Prefer these definitions in design docs and interviews; cite the teaching volume when you need the derivation.</li>
+    <li>Counter-examples of misuse appear after the core stack.</li>
+  </ul>
+</aside>
+
+<h3>Core Terminology Stack</h3>
+<table>
+  <caption>Canonical terms from Volume 1 Chapter 2, refined where each concept is implemented.</caption>
+  <thead><tr><th>Term</th><th>Definition</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>AI</td><td>Systems that perform tasks associated with human cognition (perception, language, planning, decision-making). In this book: engineered systems centred on learned models.</td><td>1</td></tr>
+    <tr><td>Machine Learning (ML)</td><td>Methods that improve performance on a task from data, without a fully hand-specified program for every case.</td><td>1</td></tr>
+    <tr><td>Deep Learning (DL)</td><td>ML with multi-layer neural networks trained end-to-end, typically by gradient descent.</td><td>1, 2</td></tr>
+    <tr><td>Generative AI</td><td>Models that sample from a distribution over artefacts (text, images, audio, video, code) rather than only classifying or scoring inputs.</td><td>1, 20</td></tr>
+    <tr><td>Foundation Model</td><td>A model trained on broad data at scale that can be adapted to many downstream tasks (prompting, fine-tuning, tools). Homogenises capabilities and risks.</td><td>1</td></tr>
+    <tr><td>LLM</td><td>A large language model: typically a Transformer language model with billions of parameters, pretrained on text (and often code).</td><td>1–4</td></tr>
+    <tr><td>SLM</td><td>A small language model: same paradigm as an LLM but sized for edge, low latency or low cost (roughly ≲3–8B in current practice; boundary is economic, not absolute).</td><td>1, 11, 18</td></tr>
+    <tr><td>Multimodal Model</td><td>A model that takes or produces more than one modality (e.g. text+image, text+audio), often with a shared or coupled representation.</td><td>19, 20</td></tr>
+    <tr><td>AI Application</td><td>A product surface that uses AI models to deliver user-facing value (chat, autocomplete, search, agents). Includes UX, auth, billing and non-model services.</td><td>1, 21</td></tr>
+    <tr><td>AI Workflow</td><td>A <em>deterministic or mostly-deterministic</em> pipeline of steps where control flow is coded (DAGs, state machines). Models may be called as steps; the program decides what runs next.</td><td>1, 15</td></tr>
+    <tr><td>AI Agent</td><td>A system where a model repeatedly chooses actions (tool calls, messages) toward a goal under a loop, with observations feeding the next decision.</td><td>15</td></tr>
+    <tr><td>Agentic System</td><td>An application composed of one or more agents, tools, memory and policies; may include multi-agent collaboration and human approvals.</td><td>15, 16</td></tr>
+    <tr><td>Agent Framework</td><td>A library that helps you <em>author</em> agent graphs, tools and prompts (e.g. graph DSLs). Does not by itself enforce production budgets, sandboxes or audit.</td><td>15, 23</td></tr>
+    <tr><td>Agent Harness</td><td>The <em>runtime</em> that executes agents safely: lifecycle, permissions, budgets, tool sandboxing, retries, tracing and evaluation hooks.</td><td>16</td></tr>
+    <tr><td>Orchestrator</td><td>Component that schedules and coordinates steps or agents (routing, fan-out/fan-in, timeouts). May be code, a workflow engine or a meta-agent.</td><td>15, 16, 18</td></tr>
+    <tr><td>Tool Runtime</td><td>Subsystem that registers, authorises, invokes and streams tool results (including MCP-style discovery).</td><td>16</td></tr>
+    <tr><td>Guardrail</td><td>A control that constrains inputs/outputs/actions (filters, policies, allowlists, classifiers) independent of the model’s good intentions.</td><td>17</td></tr>
+    <tr><td>Evaluation System</td><td>Harness for measuring quality/safety/regression: datasets, metrics, judges, gates and monitoring — not a one-off benchmark score.</td><td>10</td></tr>
+    <tr><td>AI Platform</td><td>Shared product+infra layer: model serving, retrieval, agents, guardrails, eval, routing, observability and cost controls used by many applications.</td><td>22, 24</td></tr>
+  </tbody>
+</table>
+
+<figure class="diagram">
+<pre class="ascii">AI Application
+  └─ AI Platform services (serve, rag, guard, eval, route, obs)
+       ├─ Workflows (code decides next step)
+       └─ Agentic systems
+            ├─ Agent(s) + Orchestrator
+            ├─ Framework (authoring) + Harness (runtime)
+            ├─ Tool Runtime + Guardrails
+            └─ Foundation models / LLMs / SLMs / multimodal</pre>
+<figcaption>Where core terms sit relative to each other.</figcaption>
+</figure>
+
+<p class="facet">Common misuse (counter-examples)</p>
+<ul>
+  <li>Calling a single Chat Completions call an “agent” — that is a model call inside an application or workflow.</li>
+  <li>Calling LangGraph/CrewAI a “harness” — they are frameworks unless you add budgets, sandboxes and audit yourself.</li>
+  <li>Calling a prompt filter the whole “AI platform” — guardrails are one layer.</li>
+  <li>Equating “foundation model” with “any neural net” — FMs are broad, adaptable, scale-trained bases.</li>
+</ul>
+
+<h3>Architecture and Training Terms</h3>
+<table>
+  <caption>Model internals, training objectives and adaptation.</caption>
+  <thead><tr><th>Term</th><th>Definition</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>Token / Tokeniser</td><td>Atomic model input unit / the algorithm mapping text↔token IDs (BPE, Unigram, etc.).</td><td>3</td></tr>
+    <tr><td>Embedding</td><td>Learned vector representation of a token, span or modality.</td><td>2, 3</td></tr>
+    <tr><td>Self-attention</td><td>Every position reads a weighted sum of values from other positions, weights from query–key scores.</td><td>2</td></tr>
+    <tr><td>Causal mask</td><td>Attention mask forbidding positions from attending to future tokens in autoregressive LMs.</td><td>2</td></tr>
+    <tr><td>RoPE</td><td>Rotary positional embedding: rotate Q/K by position-dependent angles for relative position.</td><td>2, 7</td></tr>
+    <tr><td>RMSNorm / SwiGLU</td><td>Common modern block norms and MLP activations in decoder LMs.</td><td>2, 7</td></tr>
+    <tr><td>MHA / MQA / GQA / MLA</td><td>Multi-head, multi-query, grouped-query and multi-head latent attention — trade quality vs KV size.</td><td>7, 11</td></tr>
+    <tr><td>MoE</td><td>Mixture of Experts: route each token to a subset of experts; active params ≪ total params.</td><td>7</td></tr>
+    <tr><td>Pretraining</td><td>Large-scale self-supervised training (usually next-token prediction) that produces a base model.</td><td>5, 6</td></tr>
+    <tr><td>SFT</td><td>Supervised fine-tuning on instruction–response (or demo) pairs.</td><td>8</td></tr>
+    <tr><td>RLHF</td><td>Reinforcement learning from human feedback: RM on preferences + policy optimisation.</td><td>8</td></tr>
+    <tr><td>DPO</td><td>Direct Preference Optimisation: train policy on preference pairs without a separate RL loop.</td><td>8</td></tr>
+    <tr><td>LoRA / QLoRA / PEFT</td><td>Low-rank adapters; QLoRA = 4-bit base + LoRA; PEFT = parameter-efficient fine-tuning family.</td><td>8</td></tr>
+    <tr><td>Cross-entropy / PPL</td><td>NLL training loss; perplexity = exp(loss). Comparable only under the same tokeniser.</td><td>1, 3, 4</td></tr>
+    <tr><td>Bits per byte (BPB)</td><td>Compression metric comparable across tokenisers.</td><td>3, 5</td></tr>
+    <tr><td>Chinchilla-optimal</td><td>Roughly compute-optimal tokens≈const×params for a FLOP budget (era-specific constant).</td><td>6</td></tr>
+    <tr><td>DDP / FSDP / TP / PP</td><td>Data, fully-sharded, tensor and pipeline parallelism strategies.</td><td>6</td></tr>
+    <tr><td>MFU</td><td>Model FLOPs utilisation: achieved useful FLOP/s ÷ hardware peak.</td><td>6, 11</td></tr>
+  </tbody>
+</table>
+
+<h3>Inference, Serving and Cost Terms</h3>
+<table>
+  <caption>Latency, memory and production serving vocabulary.</caption>
+  <thead><tr><th>Term</th><th>Definition</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>Prefill / Decode</td><td>Prefill processes the prompt (compute-friendly); decode emits tokens one-by-one (often memory-bound).</td><td>11</td></tr>
+    <tr><td>KV cache</td><td>Cached keys/values per layer per past token so decode does not recompute attention over the prefix.</td><td>1, 11</td></tr>
+    <tr><td>PagedAttention</td><td>Block/paged KV allocation to reduce fragmentation and raise batch size.</td><td>11, 12</td></tr>
+    <tr><td>Continuous batching</td><td>Scheduler admits/completes sequences at iteration granularity (not whole-batch barriers).</td><td>12</td></tr>
+    <tr><td>TTFT</td><td>Time to first token: latency until the first output token (dominated by prefill + queueing).</td><td>11, 12</td></tr>
+    <tr><td>TPOT / ITL</td><td>Time per output token / inter-token latency during decode.</td><td>11, 12</td></tr>
+    <tr><td>Throughput</td><td>Tokens (or requests) processed per second by the system.</td><td>11, 12</td></tr>
+    <tr><td>Goodput</td><td>Useful successful output rate under SLOs — excludes timeouts, rejects and wasted tokens.</td><td>12, 22</td></tr>
+    <tr><td>Roofline</td><td>Performance model: attainable FLOP/s limited by peak compute or peak bandwidth × intensity.</td><td>1, 11</td></tr>
+    <tr><td>Quantisation (PTQ / QAT)</td><td>Lower-precision weights/activations; post-training vs quantisation-aware training.</td><td>11</td></tr>
+    <tr><td>Speculative decoding</td><td>Small draft model proposes tokens; large model verifies in parallel.</td><td>11</td></tr>
+    <tr><td>Prefix caching</td><td>Reuse KV for repeated prompt prefixes (system prompts, RAG templates).</td><td>12, 13</td></tr>
+    <tr><td>Autoscaling</td><td>Add/remove replicas from queue depth, tokens/s or GPU util — with cold-start awareness.</td><td>12, 22</td></tr>
+  </tbody>
+</table>
+
+<h3>Context, Retrieval and Prompt Terms</h3>
+<table>
+  <caption>Prompting, RAG and context assembly.</caption>
+  <thead><tr><th>Term</th><th>Definition</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>Context window</td><td>Maximum token length the model can attend over in one forward pass.</td><td>7, 13</td></tr>
+    <tr><td>Context engineering</td><td>Deliberate assembly of system prompts, tools, history, retrieved docs under a budget.</td><td>13</td></tr>
+    <tr><td>RAG</td><td>Retrieval-augmented generation: retrieve external evidence, then generate conditioned on it.</td><td>14</td></tr>
+    <tr><td>Chunking</td><td>Splitting documents into retrieval units with overlap/structure policies.</td><td>14</td></tr>
+    <tr><td>Hybrid retrieval</td><td>Combine lexical (e.g. BM25) and dense scores, often with fusion (RRF).</td><td>14</td></tr>
+    <tr><td>Reranker</td><td>Cross-encoder or late-interaction model that reorders a short candidate list.</td><td>14</td></tr>
+    <tr><td>Embedding model</td><td>Encoder producing vectors for similarity search (not necessarily the generative LLM).</td><td>14, 19</td></tr>
+    <tr><td>Structured output</td><td>Constrained decoding or schema validation for JSON/tool calls.</td><td>13</td></tr>
+    <tr><td>Lost-in-the-middle</td><td>Empirical bias: models under-attend evidence in the middle of long contexts.</td><td>13</td></tr>
+  </tbody>
+</table>
+
+<h3>Agents, Safety, Eval and Routing Terms</h3>
+<table>
+  <caption>Control loops, security and measurement.</caption>
+  <thead><tr><th>Term</th><th>Definition</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>Tool call</td><td>Model-emitted structured request to invoke an external function/API.</td><td>15</td></tr>
+    <tr><td>ReAct loop</td><td>Thought → Action → Observation cycle for tool-using agents.</td><td>15</td></tr>
+    <tr><td>Session / turn / step</td><td>Harness lifecycle grains: conversation, user message, agent action.</td><td>16</td></tr>
+    <tr><td>Compaction</td><td>Summarising or truncating history/tool results to fit the context budget.</td><td>16</td></tr>
+    <tr><td>Sandbox</td><td>Isolated execution environment for untrusted tool code (process/container/microVM).</td><td>16, 17</td></tr>
+    <tr><td>Prompt injection</td><td>Attack where untrusted content instructs the model to ignore policy or exfiltrate data.</td><td>17</td></tr>
+    <tr><td>Jailbreak</td><td>User attempts to bypass safety policies via adversarial prompts.</td><td>17</td></tr>
+    <tr><td>Policy engine</td><td>Allow/ask/deny rules over tools, data classes and actions.</td><td>16, 17</td></tr>
+    <tr><td>Golden set</td><td>Versioned evaluation examples with expected behaviours for regression gates.</td><td>10</td></tr>
+    <tr><td>LLM-as-judge</td><td>Using a model to score outputs against a rubric; must be calibrated and audited.</td><td>10</td></tr>
+    <tr><td>pass@k</td><td>Probability that at least one of k samples passes unit tests / checks (code eval).</td><td>10</td></tr>
+    <tr><td>Contamination</td><td>Eval items leaking into training data, inflating scores.</td><td>5, 10</td></tr>
+    <tr><td>Router / cascade</td><td>Choose model/tool path by rules, scores or bandits; cascades try cheap then escalate.</td><td>18</td></tr>
+    <tr><td>Test-time compute</td><td>Spending more inference FLOPs (search, long CoT, best-of-n) to raise quality.</td><td>9, 18</td></tr>
+    <tr><td>Process reward (PRM)</td><td>Reward/score on intermediate reasoning steps, not only final answers.</td><td>9</td></tr>
+    <tr><td>Verifiable reward</td><td>Reward from checkers (unit tests, proofs, compilers) rather than human preference alone.</td><td>9</td></tr>
+  </tbody>
+</table>
+
+<h3>Multimodal and Platform Terms</h3>
+<table>
+  <caption>Perception, generation and platform operations.</caption>
+  <thead><tr><th>Term</th><th>Definition</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>ViT</td><td>Vision Transformer: image patch embeddings + Transformer encoder.</td><td>19</td></tr>
+    <tr><td>VLM</td><td>Vision–language model: jointly handles images and text.</td><td>19</td></tr>
+    <tr><td>Contrastive loss (CLIP-style)</td><td>Pull matched pairs together and push non-matches apart in embedding space.</td><td>19</td></tr>
+    <tr><td>Diffusion / Flow matching</td><td>Generative paradigms: iterative denoising vs learning a velocity field/ODE.</td><td>20</td></tr>
+    <tr><td>Latent diffusion</td><td>Run diffusion in autoencoder latent space for efficiency.</td><td>20</td></tr>
+    <tr><td>ASR / TTS</td><td>Automatic speech recognition / text-to-speech.</td><td>19, 20</td></tr>
+    <tr><td>Documented vs Inferred</td><td>Evidence labels for product architecture claims in case studies.</td><td>21</td></tr>
+    <tr><td>Cost ledger</td><td>Per-request attribution of tokens, tools and GPU-time to teams/products.</td><td>22</td></tr>
+    <tr><td>GenAI observability</td><td>Traces/spans for prompts, completions, tools, retrieval and guard decisions.</td><td>16, 22</td></tr>
+    <tr><td>Eval gate</td><td>CI or release check that blocks shipping on metric regressions.</td><td>10, 23, 24</td></tr>
+  </tbody>
+</table>
+
+
+<h3>Additional Systems and Product Terms</h3>
+<table>
+  <caption>More terms that appear in Volumes 12–24 and operations practice.</caption>
+  <thead><tr><th>Term</th><th>Definition</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>Canary release</td><td>Ship a model/prompt/index to a small traffic slice before full rollout.</td><td>10, 22</td></tr>
+    <tr><td>Shadow traffic</td><td>Replay live requests to a candidate without affecting users; compare outputs offline.</td><td>10, 12</td></tr>
+    <tr><td>Model gateway</td><td>Unified API in front of many models: auth, routing, quotas, tracing.</td><td>12, 18, 24</td></tr>
+    <tr><td>Idempotency key</td><td>Client-supplied key so retried tool/HTTP calls apply side effects once.</td><td>15, 16</td></tr>
+    <tr><td>Human-in-the-loop (HITL)</td><td>Required human approval for sensitive actions or low-confidence decisions.</td><td>16, 21</td></tr>
+    <tr><td>Red teaming</td><td>Adversarial testing for safety, security and policy bypasses.</td><td>10, 17</td></tr>
+    <tr><td>Data flywheel</td><td>Production traces → curated datasets → better models/prompts → better product.</td><td>5, 21</td></tr>
+    <tr><td>Feature store (ML)</td><td>Classical ML serving of shared features; LLMs more often use retrieval/tools instead.</td><td>1, 22</td></tr>
+    <tr><td>Cold start (serving)</td><td>Latency to load weights/kernels onto a new replica before ready.</td><td>12, 22</td></tr>
+    <tr><td>KV prefix cache hit rate</td><td>Fraction of prompt tokens served from cached KV prefixes.</td><td>12, 13</td></tr>
+    <tr><td>Tool affordance / ACI</td><td>Agent–computer interface design: how tools are exposed shapes success (SWE-agent).</td><td>15, 16</td></tr>
+    <tr><td>Bandit router</td><td>Online learning router exploring model choices under reward (quality−λ·cost).</td><td>18</td></tr>
+    <tr><td>Semantic cache</td><td>Cache responses by embedding similarity of queries (risk: stale/wrong hits).</td><td>12, 14</td></tr>
+    <tr><td>Groundedness</td><td>Claims in the answer are supported by retrieved or provided evidence.</td><td>14, 10</td></tr>
+    <tr><td>Citation faithfulness</td><td>Cited spans actually entail the claim (stricter than “has a citation”).</td><td>14</td></tr>
+    <tr><td>Context distillation</td><td>Train a model to internalise behaviours that previously needed long prompts.</td><td>8, 13</td></tr>
+    <tr><td>Distillation (LM)</td><td>Train a smaller student on teacher outputs / logits / traces.</td><td>8, 9</td></tr>
+    <tr><td>Synthetic data</td><td>Model-generated training data; needs filtering against collapse and leakage.</td><td>5, 8</td></tr>
+    <tr><td>Constitution / policy model</td><td>Written principles or a model that critiques/revises against them.</td><td>8, 17</td></tr>
+    <tr><td>SGLang / RadixAttention</td><td>Serving systems optimising structured generation and shared prefixes.</td><td>12, 23</td></tr>
+    <tr><td>OpenTelemetry GenAI</td><td>Conventions for tracing LLM/tool spans in production.</td><td>16, 22</td></tr>
+    <tr><td>FinOps for AI</td><td>Practice of attributing, forecasting and optimising AI spend.</td><td>22</td></tr>
+    <tr><td>Model card / datasheet</td><td>Documentation artefacts for models and datasets (Mitchell; Gebru).</td><td>1, 5</td></tr>
+    <tr><td>Blast radius</td><td>How widely an agent action or bad deploy can cause damage.</td><td>16, 17, 24</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout impl"><span class="title">Count check</span>
+  <ul>
+    <li>Core stack: 19 terms. Additional engineering terms across the tables: 70+.</li>
+    <li>If a term is missing, check the teaching volume’s chapter lede — Volume 25 indexes, it does not invent.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="interview-bank">Interview Question Bank</h2>
+<p class="chapter-lede">Advanced questions grouped by volume. Each item has a short answer outline
+and one follow-up. Aim to speak for 90–120 seconds on the outline, then invite the follow-up.</p>
+
+<aside class="callout core"><span class="title">How to practise</span>
+  <ul>
+    <li>Prefer quantitative answers (bytes, FLOPs, SLOs) over slogans.</li>
+    <li>Name the failure mode and the measurement you would ship.</li>
+    <li>Core volumes (1–4, 6–12, 14–17) are denser — interviewers probe these hardest.</li>
+  </ul>
+</aside>
+
+<h3>Volume 1 — Modern AI Engineering</h3>
+<table>
+  <caption>Interview prompts for Volume 1.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Why is decode often memory-bandwidth-bound? What does batching change on the roofline?</td><td>Decode at B=1 reads all weights for ~2N FLOPs → low arithmetic intensity. Batching reuses weight reads (I≈B) until compute-bound or KV fills memory.</td><td>Estimate ridge point for an H100 and where B=8 decode sits.</td></tr>
+    <tr><td class="num">2</td><td>Estimate GPU memory to serve 8B BF16 to 50 concurrent 8k contexts. What dominates?</td><td>Weights ≈16GB; KV ≈ B·S·(bytes/token). For Llama-like 8B, ~128KiB/token → ~1GB per 8k seq → KV can exceed weights.</td><td>How does GQA change the KV term?</td></tr>
+    <tr><td class="num">3</td><td>Distinguish AI workflow, AI agent and agent harness. When refuse an agent?</td><td>Workflow: code decides next step. Agent: model decides actions in a loop. Harness: runtime with budgets/permissions/sandbox. Refuse agents when the task is a deterministic pipeline or risk &gt; value.</td><td>Give a product example of each.</td></tr>
+    <tr><td class="num">4</td><td>Model problem vs system problem for a wrong RAG answer — triage steps.</td><td>Check retrieval hit, chunk relevance, prompt assembly, citation faithfulness, then model capability. Log traces for each stage.</td><td>What golden-set cases would you add?</td></tr>
+    <tr><td class="num">5</td><td>Why is 6ND a lower bound on training FLOPs vs published GPU-hours?</td><td>6ND is ideal math FLOPs; wall-clock includes MFU≪1, failures, eval, experiments, communication.</td><td>If MFU=40%, convert 6ND to H100-hours for a given N,D.</td></tr>
+    <tr><td class="num">6</td><td>Why temperature 0 on a hosted API is not bit-stable?</td><td>Nondeterminism from batching, kernels, sparse MoE, speculative paths, and load-balancing across replicas.</td><td>How would you test reproducibility in CI?</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 2 — Transformers from First Principles</h3>
+<table>
+  <caption>Interview prompts for Volume 2.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Why scale attention by 1/√d_k? What breaks without it?</td><td>Dot products of unit-variance vectors have variance d_k; large logits saturate softmax and shrink gradients. Scaling keeps variance ~1.</td><td>Show the variance argument in one line of maths.</td></tr>
+    <tr><td class="num">2</td><td>Causal mask vs bidirectional attention — when each?</td><td>Causal for autoregressive LMs; bidirectional for encoders/MLM. Mixing them wrongly leaks future tokens or hurts generation.</td><td>How do encoder–decoder models use both?</td></tr>
+    <tr><td class="num">3</td><td>Implement MHA reshape (B,T,C)→(B,H,T,D). What must hold for parity with H=1?</td><td>C=H·D; projections split heads; concat then output proj. H=1 must match single-head mathematically.</td><td>Where do you put the causal mask in shapes?</td></tr>
+    <tr><td class="num">4</td><td>RoPE vs absolute learned positions — trade-offs.</td><td>RoPE encodes relative offsets via rotations; extrapolates better with scaling tricks. Absolute is simple but weak for long context.</td><td>What fails if you fine-tune with a different RoPE base?</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 3 — Tokenisation and Representations</h3>
+<table>
+  <caption>Interview prompts for Volume 3.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Why can't you compare perplexity across different tokenisers?</td><td>Loss is per token; tokenisers segment differently. Use bits-per-byte or a shared tokenisation.</td><td>Give an example where a 'worse' model has better PPL.</td></tr>
+    <tr><td class="num">2</td><td>BPE vs Unigram — failure modes in production.</td><td>BPE: merge order brittle, weird splits on rare scripts. Unigram: probabilistic, can be unstable with bad vocab. Both: digit/code splits hurt.</td><td>How do special tokens interact with training?</td></tr>
+    <tr><td class="num">3</td><td>What is fertility and why does it matter for cost?</td><td>Tokens per word/char; higher fertility → more tokens → higher latency/cost for same text.</td><td>How would you A/B two tokenisers on a corpus?</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 4 — Building a Small LLM</h3>
+<table>
+  <caption>Interview prompts for Volume 4.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Walk through one training step: forward, loss, backward, optimiser — tensors that dominate memory.</td><td>Activations + grads + Adam states (≈2× params in FP32) + weights. For Adam, ~16 bytes/param training rule of thumb in mixed setups varies.</td><td>Why checkpointing trades compute for activation memory.</td></tr>
+    <tr><td class="num">2</td><td>Top-k vs top-p vs temperature — interactions.</td><td>Temperature reshapes logits; top-k keeps k; top-p keeps mass. Combined policies need clear order.</td><td>When does greedy fail for code?</td></tr>
+    <tr><td class="num">3</td><td>How do you numerically verify your GPT block against a reference?</td><td>Fixed seeds, identical init, allclose on attentions/MLP with tight atol/rtol; test causal mask edges.</td><td>What tolerance is acceptable in BF16?</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 5 — LLM Data Engineering</h3>
+<table>
+  <caption>Interview prompts for Volume 5.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Design a web-data pipeline: crawl → filter → dedup → mix. Where does quality die?</td><td>Language ID, toxicity heuristics, MinHash near-dup, domain mix weights. Quality dies at silent filter bugs and eval contamination.</td><td>How do you measure memorisation risk?</td></tr>
+    <tr><td class="num">2</td><td>Train/eval contamination — detection and mitigation.</td><td>N-gram overlap, canary searches, held-out private sets, contamination-aware reporting.</td><td>Would you remove all overlaps or report contaminated scores?</td></tr>
+    <tr><td class="num">3</td><td>PII in pretraining data — engineering controls.</td><td>Detectors, redaction, access controls, audit sampling; accept residual risk and document it.</td><td>How does this differ for SFT chat logs?</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 6 — Pretraining and Distributed Training</h3>
+<table>
+  <caption>Interview prompts for Volume 6.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>DDP vs FSDP vs tensor parallel — when each?</td><td>DDP: fit model on one GPU. FSDP: shard params/grads/opt. TP: split large matmuls. Combine for huge models.</td><td>What communication pattern dominates each?</td></tr>
+    <tr><td class="num">2</td><td>Chinchilla vs Kaplan — what changes in a training plan?</td><td>More tokens per parameter for compute optimality; smaller N for same FLOPs often wins quality.</td><td>When would you still over-size the model?</td></tr>
+    <tr><td class="num">3</td><td>Define MFU and three ways to raise it.</td><td>Useful FLOP/s / peak. Raise via larger batches, fused kernels, less idle sync, better overlap.</td><td>Why can MFU fall at very large scale?</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 7 — Modern LLM Architectures</h3>
+<table>
+  <caption>Interview prompts for Volume 7.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>How does GQA reduce KV memory and what quality cost?</td><td>Fewer KV heads shared across query groups → proportional KV reduction; small quality drop vs MHA if tuned.</td><td>Compare to MQA and MLA.</td></tr>
+    <tr><td class="num">2</td><td>Active vs total parameters in MoE — serving implications.</td><td>FLOPs ~ active params; memory must hold all experts (or offload). Routing imbalance and expert parallelism matter.</td><td>How do you capacity-plan MoE KV differently?</td></tr>
+    <tr><td class="num">3</td><td>Sliding window / sparse attention — what they don't solve.</td><td>Reduce compute but can lose long-range links unless hierarchical/global tokens exist.</td><td>When prefer SSM/hybrid?</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 8 — Fine-Tuning and Post-Training</h3>
+<table>
+  <caption>Interview prompts for Volume 8.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>SFT vs DPO vs full RLHF — choose for a support bot.</td><td>SFT for format/style; DPO if preference pairs exist; full RLHF when online exploration / complex rewards needed.</td><td>What data failure modes hurt DPO most?</td></tr>
+    <tr><td class="num">2</td><td>LoRA rank selection — practical heuristics.</td><td>Start r=8–16 on attn proj; increase if underfit; merge for serving; watch multi-adapter routing.</td><td>Why might LoRA beat full FT on small data?</td></tr>
+    <tr><td class="num">3</td><td>Reward hacking examples in RLHF.</td><td>Verbose answers, sycophancy, mark-safe refusals, exploiting RM blind spots.</td><td>How do you evaluate for hacking?</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 9 — Reasoning Models and Test-Time Compute</h3>
+<table>
+  <caption>Interview prompts for Volume 9.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Best-of-n vs self-consistency vs long CoT — cost/quality.</td><td>BoN needs a verifier/RM; self-consistency votes; long CoT spends tokens inside one sample. Plot quality vs FLOPs.</td><td>When does more test-time compute not help?</td></tr>
+    <tr><td class="num">2</td><td>Process vs outcome rewards.</td><td>PRM scores steps; outcome only final answer. PRM better credit assignment for maths/code.</td><td>How do you label process data?</td></tr>
+    <tr><td class="num">3</td><td>pass@k vs pass@1 for coding models.</td><td>pass@k measures coverage with sampling; pass@1 is single-try UX. Report both with temperature.</td><td>How does k interact with cost SLOs?</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 10 — Evaluation Engineering</h3>
+<table>
+  <caption>Interview prompts for Volume 10.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Design a release gate for a prompt change.</td><td>Versioned golden set, automated metrics + spot human review, statistical significance, shadow traffic, rollback.</td><td>How big must the set be to detect a 2% drop?</td></tr>
+    <tr><td class="num">2</td><td>LLM-as-judge pitfalls and mitigations.</td><td>Position bias, self-preference, rubric drift. Randomise order, use panels, calibrate vs humans.</td><td>When is a judge unacceptable?</td></tr>
+    <tr><td class="num">3</td><td>Offline vs online eval — what each misses.</td><td>Offline misses distribution shift; online misses rare safety cases. Need both + red teams.</td><td>Define a goodput-based online metric.</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 11 — Inference Optimisation</h3>
+<table>
+  <caption>Interview prompts for Volume 11.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Derive KV cache bytes per token for a decoder.</td><td>2 · L · n_kv · d_h · bytes (K and V). Multiply by B·S for total.</td><td>Plug in Llama-3-8B numbers.</td></tr>
+    <tr><td class="num">2</td><td>INT4 weights — what improves and what breaks?</td><td>Memory/bandwidth improve; outliers and long-tail tasks may degrade; calibrate with GPTQ/AWQ.</td><td>When keep attention in higher precision?</td></tr>
+    <tr><td class="num">3</td><td>Speculative decoding acceptance rate drivers.</td><td>Draft quality, domain match, temperature. Low acceptance → wasted draft FLOPs.</td><td>How to monitor in production?</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 12 — Model Serving and Deployment</h3>
+<table>
+  <caption>Interview prompts for Volume 12.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Continuous vs static batching — queueing effects.</td><td>Continuous raises GPU util and goodput under variable lengths; head-of-line less severe.</td><td>Sketch a scheduler metric for admission.</td></tr>
+    <tr><td class="num">2</td><td>TTFT SLO burn-down — diagnose causes.</td><td>Queue wait, prefill length, KV pressure, cold start, network. Separate prefill/decode metrics.</td><td>How does prefix cache change TTFT?</td></tr>
+    <tr><td class="num">3</td><td>Multi-LoRA serving strategies.</td><td>Merge offline, batch by adapter, or base+delta kernels; watch memory fragmentation.</td><td>When isolate adapters on separate pools?</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 13 — Prompt and Context Engineering</h3>
+<table>
+  <caption>Interview prompts for Volume 13.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Budget a 8k context: system, tools, RAG, history.</td><td>Reserve for output; put critical evidence at edges; compact history; truncate tool results.</td><td>How do you test lost-in-the-middle?</td></tr>
+    <tr><td class="num">2</td><td>Structured outputs — constrained decode vs validate-retry.</td><td>Constrained reduces invalid JSON; validate-retry simpler but higher latency/cost.</td><td>Security risk of repairing with the model?</td></tr>
+    <tr><td class="num">3</td><td>System prompt versioning in production.</td><td>Treat as code: PR, eval gates, canary, provenance in traces.</td><td>How to A/B two system prompts fairly?</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 14 — Retrieval-Augmented Generation</h3>
+<table>
+  <caption>Interview prompts for Volume 14.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Hybrid BM25 + dense + rerank pipeline — failure modes.</td><td>Bad chunks, stale index, query rewrite errors, reranker domain shift, citation hallucination.</td><td>Where put the eval probes?</td></tr>
+    <tr><td class="num">2</td><td>When not to use RAG.</td><td>Stable parametric knowledge, tiny corpora fit in context, or latency budget forbids retrieval.</td><td>Compare fine-tune vs RAG for policy docs.</td></tr>
+    <tr><td class="num">3</td><td>Measure faithfulness vs relevance separately.</td><td>Relevance: retrieval metrics; faithfulness: groundedness/citation checks; answer quality: task metric.</td><td>Design one counterfactual test.</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 15 — AI Agents</h3>
+<table>
+  <caption>Interview prompts for Volume 15.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>ReAct vs planner–executor — trade-offs.</td><td>ReAct simple and flexible; planner clearer control and caching; planners can stale.</td><td>When add multi-agent?</td></tr>
+    <tr><td class="num">2</td><td>Idempotent tools — why mandatory?</td><td>Retries and double-clicks otherwise duplicate side effects (payments, emails).</td><td>Design an idempotency key scheme.</td></tr>
+    <tr><td class="num">3</td><td>Stop conditions for agent loops.</td><td>Step/cost/time budgets, success verifier, user cancel, policy deny.</td><td>What happens on budget exhaustion?</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 16 — Agent Harnesses</h3>
+<table>
+  <caption>Interview prompts for Volume 16.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Framework vs harness responsibilities.</td><td>Framework: authoring graphs/tools. Harness: lifecycle, permissions, sandbox, budgets, traces.</td><td>Where does MCP sit?</td></tr>
+    <tr><td class="num">2</td><td>Compaction strategies and eval risk.</td><td>Summaries drop details → silent failures. Keep hashes of tool results; eval compaction explicitly.</td><td>When refuse compaction?</td></tr>
+    <tr><td class="num">3</td><td>Sandbox levels: process → container → microVM.</td><td>Stronger isolation, higher latency/ops cost. Match to tool risk class.</td><td>What still leaks across sandboxes?</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 17 — Guardrails and AI Security</h3>
+<table>
+  <caption>Interview prompts for Volume 17.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Prompt injection vs jailbreak — controls for each.</td><td>Injection: isolate untrusted content, tool allowlists, output filters. Jailbreak: policy models, refusal evals.</td><td>Defence in depth layers?</td></tr>
+    <tr><td class="num">2</td><td>Why model-only safety is insufficient.</td><td>Models are bypassable; need system controls on tools/data egress.</td><td>Give a documented failure pattern.</td></tr>
+    <tr><td class="num">3</td><td>Data exfiltration via tool calls — detect/prevent.</td><td>Schema allowlists, DLP on args, human approval for sensitive sinks, egress monitoring.</td><td>How to red-team this?</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 18 — Model Routing and Decision Systems</h3>
+<table>
+  <caption>Interview prompts for Volume 18.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Cascade design: cheap model → expensive.</td><td>Confidence/uncertainty triggers escalate; track escalation rate and quality.</td><td>How to avoid ping-pong latency?</td></tr>
+    <tr><td class="num">2</td><td>Feature flags vs learned routers.</td><td>Flags for safety/rollout; learned for cost/quality optimisation with feedback.</td><td>Cold-start problem for bandits?</td></tr>
+    <tr><td class="num">3</td><td>Route on task type vs user tier — conflicts.</td><td>Encode priority rules; never let cost router override safety tier.</td><td>Metrics for router regret.</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 19 — Multimodal Understanding</h3>
+<table>
+  <caption>Interview prompts for Volume 19.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>CLIP zero-shot — what it cannot do well?</td><td>Fine compositionality, counting, negation; domain shift from web photos.</td><td>When fine-tune vs prompt a VLM?</td></tr>
+    <tr><td class="num">2</td><td>VLM adapter patterns (Flamingo/LLaVA).</td><td>Freeze LM, train projector/adapters on image–text instructions.</td><td>Hallucination modes unique to images?</td></tr>
+    <tr><td class="num">3</td><td>Eval multimodal RAG with screenshots.</td><td>Pair visual grounding checks with text faithfulness; use human spot checks.</td><td>OCR errors as a confounder.</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 20 — Multimodal Generation</h3>
+<table>
+  <caption>Interview prompts for Volume 20.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Why latent diffusion beats pixel diffusion for products?</td><td>Lower-dim latents cut compute/memory; autoencoder quality becomes the bottleneck.</td><td>Failure artefacts to watch.</td></tr>
+    <tr><td class="num">2</td><td>Safety for image gen — engineering controls.</td><td>Prompt filters, image classifiers, blocklists, audit logs — not just model alignment.</td><td>CSAM and likeness policy hooks.</td></tr>
+    <tr><td class="num">3</td><td>Flow matching vs DDPM — deploy angle.</td><td>Often fewer steps / simpler training dynamics; still need sampler tuning for quality.</td><td>How does step count hit latency SLOs?</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 21 — AI Product Architecture</h3>
+<table>
+  <caption>Interview prompts for Volume 21.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Documented vs Inferred in a case study — why label?</td><td>Prevents false certainty about private stacks; separates evidence from reasoned guesses.</td><td>Rewrite one claim both ways.</td></tr>
+    <tr><td class="num">2</td><td>HLD for an enterprise assistant — mandatory planes.</td><td>Identity, retrieval, model gateway, guardrails, eval, observability, cost.</td><td>Where does human-in-the-loop sit?</td></tr>
+    <tr><td class="num">3</td><td>Build vs buy vs adapt decision for support automation.</td><td>Buy when commodity; adapt open weights for control; build when IP/latency/compliance demands.</td><td>Kill criteria for a pilot.</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 22 — Infrastructure, Operations and Cost</h3>
+<table>
+  <caption>Interview prompts for Volume 22.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Unit economics: $/1M tokens vs $/resolved task.</td><td>Token cost misleads if retries/tools dominate; optimise goodput per dollar.</td><td>Allocate shared GPU fleet costs.</td></tr>
+    <tr><td class="num">2</td><td>SLOs for an LLM API — choose three.</td><td>TTFT, TPOT, error rate/availability; optionally faithfulness for RAG products.</td><td>Burn-rate alerting design.</td></tr>
+    <tr><td class="num">3</td><td>GPU utilisation high but user latency bad — explain.</td><td>Batching for throughput harms latency; noisy neighbours; prefill blockers.</td><td>What dashboard splits would you add?</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 23 — Tooling and AI-Assisted Development</h3>
+<table>
+  <caption>Interview prompts for Volume 23.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Eval gates for AI-generated code in CI.</td><td>Tests, static analysis, licence/secret scans, size budgets — never merge on vibe.</td><td>How to measure assistant helpfulness internally?</td></tr>
+    <tr><td class="num">2</td><td>Agent instructions drift — governance.</td><td>Version prompts like code; CODEOWNERS; golden tasks for the coding agent.</td><td>Incident: agent deletes files — controls?</td></tr>
+    <tr><td class="num">3</td><td>When forbid autonomous write access?</td><td>Prod credentials, irreversible data ops, unclear rollback — require human approval.</td><td>Least privilege for a repo agent.</td></tr>
+  </tbody>
+</table>
+
+<h3>Volume 24 — Capstone: Complete AI Platform</h3>
+<table>
+  <caption>Interview prompts for Volume 24.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Integrate serve+RAG+agent+guard+eval without spaghetti.</td><td>Clear service boundaries, shared trace IDs, platform SDKs, contract tests between planes.</td><td>Draw the request path for one chat turn.</td></tr>
+    <tr><td class="num">2</td><td>Platform multi-tenancy risks.</td><td>Prompt/cache leakage, noisy neighbour GPUs, per-tenant keys and indexes.</td><td>Isolation levels you would ship first.</td></tr>
+    <tr><td class="num">3</td><td>Definition of done for the Forge platform.</td><td>SLOs green, eval gates, cost ledger, runbooks, security review — not just demos.</td><td>What do you intentionally leave out of v1?</td></tr>
+  </tbody>
+</table>
+
+
+
+
+<h3>Bonus Depth — Volumes 1, 6, 8, 11–12, 14–17</h3>
+<table>
+  <caption>Extra advanced prompts for the densest interview volumes.</caption>
+  <thead><tr><th>#</th><th>Vol</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>1</td><td>Derive 2N forward FLOPs from matmul counting.</td><td>Each param used once in a matvec ≈ 2 FLOPs; sum ≈ 2N ignoring attention extras.</td><td>Add attention term for prefill length S.</td></tr>
+    <tr><td class="num">2</td><td>1</td><td>What is arithmetic intensity of decode B=1?</td><td>~2 FLOPs per 2 bytes weight read → I≈1 FLOP/byte ≪ ridge.</td><td>Ridge for H100?</td></tr>
+    <tr><td class="num">3</td><td>6</td><td>ZeRO-1 vs ZeRO-3 — what is sharded?</td><td>ZeRO-1 optimiser; ZeRO-3 params+grads+opt. Communication rises with sharding depth.</td><td>When prefer TP instead?</td></tr>
+    <tr><td class="num">4</td><td>6</td><td>How do you pick global batch vs microbatch?</td><td>Fit microbatch in memory; accumulate to stable global batch; watch token/day and loss noise.</td><td>Effect on convergence?</td></tr>
+    <tr><td class="num">5</td><td>8</td><td>Write the DPO loss intuition without equations.</td><td>Increase likelihood of preferred vs dispreferred relative to a reference policy, with a β KL-style strength.</td><td>What if reference is the SFT model?</td></tr>
+    <tr><td class="num">6</td><td>8</td><td>Multi-adapter interference at inference.</td><td>Conflicting styles; routing by task; merge carefully; evaluate pairs.</td><td>Hot-swap without reload?</td></tr>
+    <tr><td class="num">7</td><td>11</td><td>Chunked prefill — why?</td><td>Break long prefills to interleave decode and improve TPOT fairness.</td><td>Impact on TTFT?</td></tr>
+    <tr><td class="num">8</td><td>11</td><td>AWQ vs GPTQ in one minute.</td><td>Both PTQ weight-only; different calibration (activation awareness vs second-order). Validate on your eval.</td><td>When re-quantise after LoRA merge?</td></tr>
+    <tr><td class="num">9</td><td>12</td><td>Backpressure strategy when queue explodes.</td><td>Shed low-priority, shorten max tokens, admit deadlines, scale out, return 429 with retry-after.</td><td>Fairness across tenants?</td></tr>
+    <tr><td class="num">10</td><td>12</td><td>Sticky sessions vs stateless replicas for prefix cache.</td><td>Sticky raises hit rate; hurts load balance. Consistent hashing / cache-aware routing.</td><td>Failure when replica dies?</td></tr>
+    <tr><td class="num">11</td><td>14</td><td>Parent-child chunking design.</td><td>Small children for retrieval precision; return parent context for generation.</td><td>How evaluate chunk sizes?</td></tr>
+    <tr><td class="num">12</td><td>14</td><td>Query rewriting risks.</td><td>Drift from user intent; language injection; latency. Log rewrites; constrain templates.</td><td>Multilingual rewrite?</td></tr>
+    <tr><td class="num">13</td><td>15</td><td>Memory architectures for agents.</td><td>Scratchpad, vector store, structured state machine; avoid unbounded transcript.</td><td>Privacy of long-term memory?</td></tr>
+    <tr><td class="num">14</td><td>15</td><td>Evaluator agent vs external verifier.</td><td>LLM judge flexible but biased; unit tests/compilers reliable when available.</td><td>Hybrid pattern?</td></tr>
+    <tr><td class="num">15</td><td>16</td><td>Design budget exhaustion behaviour.</td><td>Graceful summary to user, persist state, no partial side effects, escalate.</td><td>How test it?</td></tr>
+    <tr><td class="num">16</td><td>16</td><td>Trace replay for flaky agent bugs.</td><td>Record spans, tool stubs, determinism modes; bisect step failures.</td><td>What cannot be replayed?</td></tr>
+    <tr><td class="num">17</td><td>17</td><td>Indirect prompt injection via retrieved docs.</td><td>Treat retrieved text as untrusted; delimit; dual-model; tool allowlists; never execute instructions from docs.</td><td>Demo a failing control.</td></tr>
+    <tr><td class="num">18</td><td>17</td><td>Secrets in prompts — controls.</td><td>Do not paste secrets; vault references; DLP; redact traces; short-lived tokens for tools.</td><td>Incident response steps?</td></tr>
+  </tbody>
+</table>
+
+<h3>Cross-Volume Stretch Questions</h3>
+<table>
+  <caption>Harder prompts that span multiple volumes — common in staff/principal interviews.</caption>
+  <thead><tr><th>#</th><th>Question</th><th>Answer outline</th><th>Follow-up</th><th>Vols</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Design capacity for 100 QPS chat with 2k prompt / 200 completion average on an 8B self-hosted model.</td><td>Convert to prefill+decode tokens/s; size replicas from TTFT/TPOT SLOs and KV memory; include headroom and failure domains.</td><td>What changes if 10% of traffic is 32k-context RAG?</td><td>11–12, 14, 22</td></tr>
+    <tr><td class="num">2</td><td>Your eval set rose 4 points but online thumbs-down worsened. Diagnose.</td><td>Contamination, distribution shift, judge bias, latency-induced truncations, product UX confounds.</td><td>What dashboards do you check first?</td><td>10, 12, 21</td></tr>
+    <tr><td class="num">3</td><td>Compare LoRA fine-tune vs RAG vs long-context for a changing policy handbook.</td><td>RAG for freshness/citations; long-context if corpus fits and latency OK; LoRA for style/format not facts.</td><td>Hybrid design you would ship.</td><td>8, 13, 14</td></tr>
+    <tr><td class="num">4</td><td>Agent deleted a production config via shell tool. Postmortem outline.</td><td>Missing allowlist/sandbox, no dry-run, insufficient approval gate, weak audit. Fix harness policies and eval red-teams.</td><td>Write the deny-by-default policy sketch.</td><td>15–17</td></tr>
+    <tr><td class="num">5</td><td>When is an MoE cheaper to serve than a dense model of similar quality?</td><td>When active FLOPs dominate and you can hold experts in memory / parallelise experts without killing latency.</td><td>Networking bottlenecks?</td><td>7, 11, 12</td></tr>
+    <tr><td class="num">6</td><td>Propose an evaluation for prompt-injection resistance that does not game easily.</td><td>Held-out attack suite, tool-abuse tasks, canary secret exfil, human red team rotation; score by successful policy violation rate.</td><td>How avoid training on the eval attacks?</td><td>10, 17</td></tr>
+    <tr><td class="num">7</td><td>Explain goodput vs throughput for an LLM gateway.</td><td>Throughput counts tokens/requests; goodput counts successful in-SLO useful outcomes (minus retries/timeouts/rejects).</td><td>Define goodput for a coding agent.</td><td>12, 22</td></tr>
+    <tr><td class="num">8</td><td>Your KV cache is 90% full and TTFT spikes. Options?</td><td>Admit fewer long jobs, preemption, prefix cache, GQA/quant KV, scale out, reject oversized prompts.</td><td>Fairness policy across tenants?</td><td>11, 12, 22</td></tr>
+    <tr><td class="num">9</td><td>Staff-level: own the model lifecycle artefact list from data to monitor.</td><td>Datasheet, train config, eval report, model card, release checklist, canary, drift monitors, rollback.</td><td>Which artefact is usually missing?</td><td>1, 5, 10, 22</td></tr>
+    <tr><td class="num">10</td><td>Reasoning model doubles latency. Product decision framework.</td><td>Route easy traffic to fast model; spend test-time compute on hard tasks; measure task success/$.</td><td>User-visible “thinking” UX trade-offs.</td><td>9, 18, 21</td></tr>
+    <tr><td class="num">11</td><td>Why might FlashAttention not move your decode TPS?</td><td>Decode is memory-bound on weights/KV; FA helps prefill/training attention IO more than tiny decode mats.</td><td>When does FA still help serving?</td><td>7, 11</td></tr>
+    <tr><td class="num">12</td><td>Multi-agent debate vs single agent with tools — pick and justify.</td><td>Debate for diverse hypotheses; single+tools for grounded actions. Prefer simplest that hits eval.</td><td>Failure mode of debate?</td><td>15, 16</td></tr>
+    <tr><td class="num">13</td><td>Cost model: show $/1M tokens from GPU price, TPS, utilisation.</td><td>$/s GPU ÷ (tokens/s useful) × 1e6; include idle and replica waste.</td><td>Sensitivity to utilisation 30%→60%.</td><td>1, 22</td></tr>
+    <tr><td class="num">14</td><td>How do you version a RAG index with the prompt and model?</td><td>Triple version in traces; canary index; rebuild SLAs; eval on frozen queries.</td><td>Rollback story when index is huge?</td><td>14, 22, 24</td></tr>
+    <tr><td class="num">15</td><td>Principal: draw the Forge AI platform HLD and name the hardest interface.</td><td>Gateway, retrieve, agent harness, guard, eval, route, obs, cost. Hardest often tool identity+authz or eval↔release.</td><td>What would you cut for v1?</td><td>16, 21, 24</td></tr>
+    <tr><td class="num">16</td><td>Quantise embeddings vs generative LLM — different risk profiles.</td><td>Embedding recall degradation vs generative quality/safety; measure retrieval @k separately.</td><td>INT8 vs binary embeddings?</td><td>11, 14</td></tr>
+    <tr><td class="num">17</td><td>Online learning from thumbs-up — why dangerous?</td><td>Feedback loops, sycophancy, poisoning, privacy. Prefer offline preference jobs with review.</td><td>Safe lightweight adaptation?</td><td>8, 10, 17</td></tr>
+    <tr><td class="num">18</td><td>Compare MCP to ad-hoc tool JSON schemas.</td><td>MCP standardises discovery/transport; still need harness authz. Ad-hoc is flexible but fragments.</td><td>Backward compatibility strategy.</td><td>15, 16, 23</td></tr>
+    <tr><td class="num">19</td><td>You must cut inference cost 40% without tanking quality. Levers?</td><td>Routing, caching, smaller models, quant, shorter prompts, speculative decoding, RAG precision↑ to shorten gens.</td><td>Ordered experiment plan.</td><td>11–14, 18</td></tr>
+    <tr><td class="num">20</td><td>What does “temperature 0” mean mathematically, and what remains random?</td><td>Argmax of logits (or near-argmax). Hardware/batching nondeterminism remains.</td><td>Is argmax always best for code?</td><td>1, 4</td></tr>
+    <tr><td class="num">21</td><td>Design a golden set for tool-calling correctness.</td><td>Schema validity, argument accuracy, right tool choice, refusal on disallowed, idempotent retries.</td><td>How score partial credit?</td><td>10, 15</td></tr>
+    <tr><td class="num">22</td><td>Long-context 128k model vs RAG for 500-page PDFs.</td><td>Long context: simple but costly/lossy mid-context; RAG: scalable citations; often hybrid.</td><td>Eval protocol for both.</td><td>7, 13, 14</td></tr>
+    <tr><td class="num">23</td><td>Explain gradient checkpointing vs FSDP for fitting a training run.</td><td>Checkpointing recomputes activations; FSDP shards states. Often combine.</td><td>Impact on step time.</td><td>4, 6</td></tr>
+    <tr><td class="num">24</td><td>Security review checklist before enabling web browse tools.</td><td>SSRF controls, egress allowlists, content sanitisation, injection isolation, DLP, rate limits, audit.</td><td>What is still residual risk?</td><td>16, 17</td></tr>
+    <tr><td class="num">25</td><td>How would you teach a new hire the 6ND and KV formulas in 15 minutes?</td><td>Forward 2N, train 6N; KV 2L n_kv d_h bytes; decode bandwidth bound; one worked 8B example.</td><td>Common mistakes they will make?</td><td>1, 11, 25</td></tr>
+  </tbody>
+</table>
+
+
+<h3>Additional Questions — Volumes 2–5, 7, 9, 13, 18–24</h3>
+<table>
+  <caption>Filling density on volumes with fewer prompts above.</caption>
+  <thead><tr><th>#</th><th>Vol</th><th>Question</th><th>Answer outline</th><th>Follow-up</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>2</td><td>Why residual connections + prenorm/postnorm matter for depth.</td><td>Residuals keep gradient paths; norm placement affects stability and training dynamics of deep stacks.</td><td>What breaks if you remove residuals?</td></tr>
+    <tr><td class="num">2</td><td>2</td><td>Explain multi-head attention as several subspaces.</td><td>Heads can specialise (syntax, position, rare tokens); concat + out-proj mixes them.</td><td>Evidence heads are redundant?</td></tr>
+    <tr><td class="num">3</td><td>2</td><td>Softmax numerical stability trick.</td><td>Subtract row max before exp; shift-invariant; avoids overflow.</td><td>Show a failing float example.</td></tr>
+    <tr><td class="num">4</td><td>3</td><td>Byte-level BPE vs vocab tricks for multilingual.</td><td>Byte-level avoids UNK; fertility differs by script; evaluate BPB per language.</td><td>Code tokenisation pitfalls?</td></tr>
+    <tr><td class="num">5</td><td>3</td><td>How special tokens affect chat templates.</td><td>Must match training template; wrong separators cause instruction bleed.</td><td>Security angle?</td></tr>
+    <tr><td class="num">6</td><td>4</td><td>Learning rate warmup and decay — why.</td><td>Stabilise early large grads; decay for convergence; coupled to batch size.</td><td>What if you skip warmup on a big model?</td></tr>
+    <tr><td class="num">7</td><td>4</td><td>Checkpoint contents for resume vs release.</td><td>Resume needs opt state/RNG; release needs weights (+tokenizer)+card.</td><td>How verify checkpoint integrity?</td></tr>
+    <tr><td class="num">8</td><td>5</td><td>MinHash dedup parameters trade-off.</td><td>Permutations/jaccard threshold: recall vs CPU; near-dups vs exact.</td><td>Impact on rare languages?</td></tr>
+    <tr><td class="num">9</td><td>5</td><td>Domain mixture weighing heuristics.</td><td>Upsample high-quality domains; watch overfit; use held-out BPB.</td><td>Code vs natural language mix?</td></tr>
+    <tr><td class="num">10</td><td>7</td><td>Explain MLA KV compression at a high level.</td><td>Project KV into lower-dim latents; reduce cache traffic; quality via training.</td><td>Serving complexity vs GQA?</td></tr>
+    <tr><td class="num">11</td><td>7</td><td>Hybrid SSM–Transformer motivation.</td><td>Linear-time long range + attention for sharp retrieval; engineering complexity up.</td><td>When pure Transformer wins?</td></tr>
+    <tr><td class="num">12</td><td>9</td><td>Outcome RM vs majority vote vs unit tests.</td><td>Prefer verifiers when available; RM when not; votes for diversity.</td><td>Costed decision tree?</td></tr>
+    <tr><td class="num">13</td><td>9</td><td>Thinking budget as a product feature.</td><td>Expose caps; route; show progress; bill for tokens honestly.</td><td>Abuse via infinite think?</td></tr>
+    <tr><td class="num">14</td><td>13</td><td>Tool descriptions as prompt surface area.</td><td>Verbose tools steal context; ambiguous tools cause miscalls; version them.</td><td>How eval tool-doc changes?</td></tr>
+    <tr><td class="num">15</td><td>13</td><td>Memory: summary vs raw retrieval.</td><td>Summaries cheap but lossy; retrieval precise; hybrid with pinned facts.</td><td>User-editable memory UX?</td></tr>
+    <tr><td class="num">16</td><td>18</td><td>Rules engine before ML router.</td><td>Encode compliance and hard SLOs in rules; learn only soft cost/quality.</td><td>Example rule set?</td></tr>
+    <tr><td class="num">17</td><td>18</td><td>Detecting router distribution shift.</td><td>Monitor escalation rates, confidence calib, task mix; freeze on incidents.</td><td>Rollback story?</td></tr>
+    <tr><td class="num">18</td><td>19</td><td>Tokenising images for VLMs.</td><td>Patches → tokens; resolution vs cost; dynamic high-res strategies.</td><td>PDF page screenshots issues?</td></tr>
+    <tr><td class="num">19</td><td>19</td><td>Audio in the loop latency budget.</td><td>ASR partials + LLM TTFT + TTS; overlap stages; barge-in.</td><td>Where users feel lag?</td></tr>
+    <tr><td class="num">20</td><td>20</td><td>Classifier-free guidance trade-off.</td><td>Higher guidance → sharper prompt match, possible artifacts/oversaturation.</td><td>How tune in prod?</td></tr>
+    <tr><td class="num">21</td><td>20</td><td>Safety filters placement in image pipelines.</td><td>Input prompt + output image; fail closed on CSAM; log decisions.</td><td>Bypass via steganography?</td></tr>
+    <tr><td class="num">22</td><td>21</td><td>Write HLD boxes for a research assistant.</td><td>UI, gateway, RAG, agent, guard, eval, obs, cost; label Documented/Inferred.</td><td>Biggest unknown?</td></tr>
+    <tr><td class="num">23</td><td>21</td><td>UX for uncertain answers.</td><td>Citations, confidence, ask clarifying Q; avoid fake certainty.</td><td>When refuse?</td></tr>
+    <tr><td class="num">24</td><td>22</td><td>Prometheus metrics you would page on.</td><td>TTFT p95, error rate, GPU OOM, queue depth, cost spike, guard block rate.</td><td>Avoid noisy pages how?</td></tr>
+    <tr><td class="num">25</td><td>22</td><td>Spot vs committed GPU capacity.</td><td>Spot for batch/train; committed for latency SLO serving.</td><td>Mixed fleet design?</td></tr>
+    <tr><td class="num">26</td><td>23</td><td>Policy for merging AI-written PRs.</td><td>Tests required; human review on auth/payments; secret scan; size limits.</td><td>Measure assistant ROI?</td></tr>
+    <tr><td class="num">27</td><td>23</td><td>Eval harness for coding agents in CI.</td><td>Golden repos tasks; sandbox; time/cost budgets; flake quarantine.</td><td>Prevent eval overfitting?</td></tr>
+    <tr><td class="num">28</td><td>24</td><td>Tenancy isolation for prompts and caches.</td><td>Per-tenant keys; no cross cache; encrypt; audit access.</td><td>Shared model weights OK?</td></tr>
+    <tr><td class="num">29</td><td>24</td><td>Platform API compatibility strategy.</td><td>Versioned schemas; contract tests; deprecation windows; adapter layer.</td><td>Breaking change example?</td></tr>
+    <tr><td class="num">30</td><td>24</td><td>What “done” means for observability.</td><td>Trace every model/tool call with tenant+version; replayable; PII redacted.</td><td>Sampling strategy?</td></tr>
+  </tbody>
+</table>
+
+<h3>One-Minute Drills (Chapter 6 Linked)</h3>
+<table>
+  <caption>Timed drills pairing formulas with interview pressure.</caption>
+  <thead><tr><th>Drill (60–90s)</th><th>Must mention</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>Convert 70B BF16 weights to GB</td><td>140 GB; multi-GPU</td><td>1, 11</td></tr>
+    <tr><td>KV for 32k context single 8B GQA stream</td><td>~4 GiB at 128KiB/tok</td><td>11</td></tr>
+    <tr><td>6ND for 7B×1T</td><td>~4.2e22 FLOPs</td><td>1, 6</td></tr>
+    <tr><td>Decode tok/s bound from 2TB/s and 14GB weights</td><td>~140 tok/s theoretical</td><td>11</td></tr>
+    <tr><td>$/1M from $4/h GPU at 800 tok/s</td><td>≈$1.39 / 1M</td><td>22</td></tr>
+    <tr><td>E2E from TTFT 0.4s + 80 tok × 25ms</td><td>2.4s</td><td>12</td></tr>
+    <tr><td>pass@5 if independent p=0.3</td><td>≈0.83</td><td>10</td></tr>
+    <tr><td>Ridge FLOP/byte for 989TFLOP/s &amp; 3.35TB/s</td><td>≈295</td><td>1</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Drill advice</span>
+  <ul>
+    <li>Say assumptions aloud (dtype, GQA, MFU).</li>
+    <li>Give a range, then a point estimate.</li>
+    <li>Finish with “what I would measure to confirm”.</li>
+  </ul>
+</aside>
+
+<aside class="callout impl"><span class="title">Bank size</span>
+  <ul>
+    <li>Per-volume tables: 76. Bonus depth: 18. Additional density: 30. Stretch: 25. <strong>Total ≈ 149</strong> primary questions (each with a follow-up), plus timed drills.</li>
+    <li>Teaching volumes also list interview questions in their review sections — use both.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="formulas">Formula and Numbers Reference</h2>
+<p class="chapter-lede">The arithmetic every AI engineer should be able to write on a whiteboard.
+Symbols match Volumes 1 and 11. Treat ideal FLOPs as lower bounds unless you fold in MFU.</p>
+
+<aside class="callout core"><span class="title">Notation</span>
+  <ul>
+    <li><span class="math">N</span> — non-embedding parameter count (approx. total params for large models).</li>
+    <li><span class="math">D</span> — training tokens. <span class="math">S</span> — sequence / context length. <span class="math">B</span> — batch (sequences).</li>
+    <li><span class="math">L</span> — layers. <span class="math">h_{q}, h_{kv}</span> — query / KV heads. <span class="math">d_h</span> — head dimension.</li>
+    <li><span class="math">b_w, b_{kv}</span> — bytes per weight / per KV element (e.g. 2 for BF16, 1 for INT8 KV).</li>
+  </ul>
+</aside>
+
+<h3>FLOPs</h3>
+
+<p class="facet">Matrix multiply</p>
+<ul>
+  <li>An <span class="math">m \times n</span> matmul–vector costs <span class="math">2mn</span> FLOPs (multiply + add).</li>
+</ul>
+
+<p class="facet">Transformer rules of thumb</p>
+<div class="math">\text{Forward FLOPs / token} \approx 2N</div>
+<div class="math">\text{Training FLOPs / token} \approx 6N \quad (\text{forward }2N + \text{backward }\sim 4N)</div>
+<div class="math">\text{Training FLOPs total} \approx 6ND</div>
+
+<table>
+  <caption>When the 2N / 6N rules under/over-count.</caption>
+  <thead><tr><th>Effect</th><th>Direction</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>Attention <span class="math">O(S^2)</span></td><td>Under-counts at long <span class="math">S</span></td><td>Prefill cost grows with context; decode attention is smaller per step but KV traffic dominates.</td></tr>
+    <tr><td>Embeddings / vocab</td><td>Usually small relative</td><td>Include if vocab projection is huge vs N.</td></tr>
+    <tr><td>MoE</td><td>Use active params</td><td>FLOPs track activated experts, not total N stored.</td></tr>
+    <tr><td>Activation recomputation</td><td>Raises training FLOPs</td><td>Checkpointing trades FLOPs for memory.</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>Worked estimate: Llama-3-class 8B on 15T tokens (ideal).</figcaption>
+<pre><code>N = 8e9
+D = 15e12
+flops = 6 * N * D  # ≈ 7.2e23
+# At 40% MFU on H100 ~989 TFLOP/s BF16:
+# seconds ≈ flops / (0.4 * 989e12)
+# GPU-hours ≈ seconds / 3600  → order 0.5M (idealised)
+# Published ~1.3M H100-hours ⇒ treat 6ND as lower bound</code></pre>
+</figure>
+
+<h3>Parameter and Training Memory</h3>
+
+<table>
+  <caption>Rough bytes per parameter during training (classic Adam picture).</caption>
+  <thead><tr><th>State</th><th>Bytes / param (FP32 Adam)</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>Weights</td><td>4 (or 2 in BF16 master variants)</td><td>Depends on mixed-precision recipe.</td></tr>
+    <tr><td>Gradients</td><td>4 or 2</td><td>Same dtype as compute path often.</td></tr>
+    <tr><td>Adam m, v</td><td>8</td><td>Two FP32 moments common.</td></tr>
+    <tr><td>Rule of thumb</td><td>≈12–20</td><td>“~16 bytes/param” is a planning mnemonic, not a law.</td></tr>
+  </tbody>
+</table>
+
+<div class="math">M_{\text{train}} \approx N \cdot b_{\text{train}} + M_{\text{activations}}(+ \text{overhead})</div>
+
+<ul>
+  <li>Activation memory scales with <span class="math">B, S, L, d</span> and shrinks with checkpointing.</li>
+  <li>FSDP/ZeRO shards optimiser states and optionally params/grads across data-parallel ranks.</li>
+</ul>
+
+<h3>Inference Memory and KV Cache</h3>
+
+<div class="math">M_{\text{infer}} \approx \underbrace{N \cdot b_w}_{\text{weights}} + \underbrace{B \cdot S \cdot 2 L\, h_{kv}\, d_h\, b_{kv}}_{\text{KV cache}} + \text{activations / overhead}</div>
+
+<div class="math">\text{KV bytes / token} = 2 \cdot L \cdot h_{kv} \cdot d_h \cdot b_{kv}</div>
+
+<table>
+  <caption>Worked KV sizes (BF16 KV, illustrative Llama-3-8B-like: L=32, h_kv=8, d_h=128).</caption>
+  <thead><tr><th>Quantity</th><th class="num">Value</th><th>Comment</th></tr></thead>
+  <tbody>
+    <tr><td>KV / token</td><td class="num">128 KiB</td><td><span class="math">2·32·8·128·2</span> bytes.</td></tr>
+    <tr><td>One 8k sequence</td><td class="num">≈1.0 GiB</td><td>Linear in S.</td></tr>
+    <tr><td>50 × 8k concurrent</td><td class="num">≈50 GiB</td><td>Plus 16 GiB weights (BF16) → needs large GPU / multi-GPU.</td></tr>
+    <tr><td>With GQA already</td><td class="num">—</td><td>If h_kv were 32 (MHA), KV would be 4× larger.</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout warning"><span class="title">Concurrency limit</span>
+  <ul>
+    <li>On one GPU, free HBM after weights ≈ KV budget. That budget, not peak FLOP/s, often caps concurrent users.</li>
+  </ul>
+</aside>
+
+<h3>Roofline, Throughput and Goodput</h3>
+
+<div class="math">I = \frac{\text{FLOPs}}{\text{bytes moved}} \qquad
+\text{attainable FLOP/s} = \min(\text{peak FLOP/s},\, I \times \text{bandwidth})</div>
+
+<table>
+  <caption>Decode intensity intuition.</caption>
+  <thead><tr><th>Scenario</th><th>Approx. intensity</th><th>Bound</th></tr></thead>
+  <tbody>
+    <tr><td>Decode B=1, BF16 weights</td><td>~1 FLOP/byte</td><td>Memory (HBM) bound</td></tr>
+    <tr><td>Decode batch B</td><td>~B FLOP/byte</td><td>Improves until compute ridge or KV full</td></tr>
+    <tr><td>Large prefill</td><td>Much higher</td><td>Often compute / attention IO bound</td></tr>
+  </tbody>
+</table>
+
+<div class="math">\text{Decode tokens/s upper bound (B=1)} \approx \frac{\text{HBM bandwidth}}{\text{weight bytes}}</div>
+
+<ul>
+  <li>Example: 16 GB weights / 3.35 TB/s ≈ theoretical ~209 tokens/s before kernels/overhead — real systems are lower.</li>
+</ul>
+
+<p class="facet">Throughput vs goodput</p>
+<div class="math">\text{throughput} = \frac{\text{tokens or requests processed}}{\text{time}}</div>
+<div class="math">\text{goodput} = \frac{\text{successful in-SLO useful outcomes}}{\text{time}}</div>
+<ul>
+  <li>Exclude timeouts, 5xx, policy rejects, and abandoned streams from goodput.</li>
+  <li>For agents, prefer tasks successfully completed per hour, not raw tool calls.</li>
+</ul>
+
+<h3>Latency Numbers Engineers Should Know</h3>
+
+<table>
+  <caption>Order-of-magnitude latencies (ballpark; measure your stack).</caption>
+  <thead><tr><th>Quantity</th><th class="num">Typical order</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>L1/L2 cache reference</td><td class="num">~1–10 ns</td><td>CPU mental model only.</td></tr>
+    <tr><td>Main memory reference</td><td class="num">~100 ns</td><td></td></tr>
+    <tr><td>Same-AZ RTT / Redis GET</td><td class="num">~0.2–1 ms</td><td>Wide variance.</td></tr>
+    <tr><td>Cross-AZ RTT</td><td class="num">~1–3 ms</td><td></td></tr>
+    <tr><td>Cross-region RTT</td><td class="num">~30–150 ms</td><td>Avoid in decode hot path.</td></tr>
+    <tr><td>SSD random read</td><td class="num">~50–200 µs</td><td>NVMe better.</td></tr>
+    <tr><td>HDD seek</td><td class="num">~5–10 ms</td><td>Do not store KV here.</td></tr>
+    <tr><td>GPU kernel launch</td><td class="num">~3–20 µs</td><td>Many tiny launches hurt.</td></tr>
+    <tr><td>HBM read of 8B BF16 weights</td><td class="num">~5 ms</td><td>16e9 B / 3.35e12 B/s ≈ 4.8 ms theoretical.</td></tr>
+    <tr><td>Interactive TTFT target (chat)</td><td class="num">~200–800 ms</td><td>Product-dependent.</td></tr>
+    <tr><td>Comfortable TPOT (streaming)</td><td class="num">~20–40 ms</td><td>~25–50 tok/s perceived.</td></tr>
+    <tr><td>ASR partial</td><td class="num">~100–300 ms</td><td>Streaming speech.</td></tr>
+    <tr><td>Diffusion 20–50 steps (image)</td><td class="num">~0.5–5 s</td><td>Hardware and resolution matter.</td></tr>
+    <tr><td>Human “instant”</td><td class="num">≲100 ms</td><td>UI feedback, not full answers.</td></tr>
+    <tr><td>Human conversational gap</td><td class="num">~200–1000 ms</td><td>Why TTFT matters more than final.</td></tr>
+  </tbody>
+</table>
+
+<table>
+  <caption>LLM serving latency budget split (conceptual).</caption>
+  <thead><tr><th>Component</th><th>What it includes</th><th>Knobs</th></tr></thead>
+  <tbody>
+    <tr><td>Queue wait</td><td>Admission delay</td><td>Autoscaling, priorities, load shedding</td></tr>
+    <tr><td>Prefill</td><td>Prompt tokens × compute</td><td>Prompt length, prefix cache, chunked prefill</td></tr>
+    <tr><td>TTFT</td><td>Queue + prefill + first decode</td><td>All of the above</td></tr>
+    <tr><td>TPOT</td><td>Per-token decode</td><td>Batch size, quant, speculation, KV pressure</td></tr>
+    <tr><td>E2E</td><td>TTFT + TPOT × (n−1)</td><td>Shorter outputs, better routing</td></tr>
+  </tbody>
+</table>
+
+<h3>Cost Formulas</h3>
+
+<div class="math">\$/\text{1M tokens} \approx \frac{\text{GPU \$/s}}{\text{useful tokens/s}} \times 10^{6}</div>
+
+<div class="math">\$/\text{request} \approx
+c_{\text{in}}\cdot n_{\text{in}} + c_{\text{out}}\cdot n_{\text{out}}
++ c_{\text{embed}} + c_{\text{rerank}} + c_{\text{tools}} + c_{\text{overhead}}</div>
+
+<table>
+  <caption>Cost levers (self-host vs API).</caption>
+  <thead><tr><th>Lever</th><th>Self-host</th><th>Hosted API</th></tr></thead>
+  <tbody>
+    <tr><td>Utilisation</td><td>Dominant (idle GPUs burn money)</td><td>Priced into token rates</td></tr>
+    <tr><td>Batch / continuous batching</td><td>Raises tokens/s</td><td>Opaque but still helps providers</td></tr>
+    <tr><td>Quantisation</td><td>Fit more concurrency</td><td>Often unavailable / fixed</td></tr>
+    <tr><td>Prompt length</td><td>Prefill + KV</td><td>Direct $ on input tokens</td></tr>
+    <tr><td>Caching</td><td>Prefix KV cache</td><td>Provider prompt caching products</td></tr>
+    <tr><td>Routing</td><td>SLM vs LLM pools</td><td>Multi-model accounts</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>Back-of-envelope self-host cost.</figcaption>
+<pre><code>gpu_per_hour = 3.00          # example on-demand price
+util = 0.55                  # sustained useful time fraction
+tok_per_s = 1200             # cluster aggregate useful tokens/s
+cost_per_s = gpu_per_hour / 3600 / util   # if tok_per_s is per that GPU
+# Better: cost_per_1M = (gpu_per_hour / 3600) / tok_per_s * 1e6
+cost_per_1M = (3.00 / 3600) / 1200 * 1e6
+# ≈ $0.69 / 1M tokens at these numbers (idealised)</code></pre>
+</figure>
+
+<aside class="callout impl"><span class="title">API vs self-host crossover</span>
+  <ul>
+    <li>Compute break-even from token rates vs GPU util; add eng/ops cost, burstiness and quality gaps.</li>
+    <li>Many teams API-first until steady GPU util and eval maturity justify colo/cloud GPUs (Volumes 12, 22).</li>
+  </ul>
+</aside>
+
+<h3>Training Time and Data Rules of Thumb</h3>
+
+<div class="math">T_{\text{train}} \approx \frac{6ND}{\text{MFU}\times \text{peak FLOP/s} \times N_{\text{GPU}}}</div>
+
+<table>
+  <caption>Data and scale mnemonics (era-dependent — re-check papers).</caption>
+  <thead><tr><th>Rule</th><th>Mnemonic</th><th>Vol</th></tr></thead>
+  <tbody>
+    <tr><td>Chinchilla-ish</td><td>~$20$ tokens per parameter for compute-optimal pretrain (2022-era)</td><td>6</td></tr>
+    <tr><td>Overtraining</td><td>Inference-heavy deploys may want more tokens / smaller N</td><td>6, 11</td></tr>
+    <tr><td>Epoching</td><td>Repeating data helps under data constraints, with diminishing returns</td><td>5, 6</td></tr>
+    <tr><td>SFT size</td><td>Thousands→millions high-quality pairs beat raw web for assistants</td><td>8</td></tr>
+    <tr><td>Eval</td><td>Hundreds of golden items catch large regressions; thousands for small lifts</td><td>10</td></tr>
+  </tbody>
+</table>
+
+<h3>Evaluation and Sampling Numerics</h3>
+
+<div class="math">\operatorname{softmax}(z)_i = \frac{e^{z_i/\tau}}{\sum_j e^{z_j/\tau}}</div>
+<div class="math">\mathrm{PPL} = \exp(\mathcal{L}_{\text{NLL}})</div>
+<div class="math">\operatorname{pass@}k = \mathbb{E}\!\left[1 - \frac{\binom{n-c}{k}}{\binom{n}{k}}\right]
+\quad (c \text{ correct among } n \text{ samples})</div>
+
+<ul>
+  <li>Report pass@k with sampling temperature and n fixed.</li>
+  <li>Self-consistency: sample k CoT paths, majority-vote the answer — cost ×k.</li>
+</ul>
+
+<h3>Attention Complexity Cheatsheet</h3>
+
+<table>
+  <caption>Sequence length dependence (per layer, simplified).</caption>
+  <thead><tr><th>Variant</th><th>Compute</th><th>KV memory</th></tr></thead>
+  <tbody>
+    <tr><td>Dense MHA</td><td><span class="math">O(S^2 d)</span></td><td><span class="math">O(S \cdot h_q \cdot d_h)</span></td></tr>
+    <tr><td>GQA/MQA</td><td>Same attention score structure</td><td><span class="math">O(S \cdot h_{kv} \cdot d_h)</span> with <span class="math">h_{kv}\ll h_q</span></td></tr>
+    <tr><td>Sliding window w</td><td><span class="math">O(S w d)</span></td><td>Often <span class="math">O(w)</span> retained</td></tr>
+    <tr><td>MLA (latent)</td><td>Architecture-specific</td><td>Compressed latent KV</td></tr>
+  </tbody>
+</table>
+
+<h3>Quick Hardware Peak Numbers (Documented Ballparks)</h3>
+
+<table>
+  <caption>Useful peaks for whiteboard estimates — always verify the exact SKU datasheet.</caption>
+  <thead><tr><th>Device</th><th>HBM</th><th>Bandwidth</th><th>BF16 peak (order)</th></tr></thead>
+  <tbody>
+    <tr><td>A100 80GB SXM</td><td class="num">80 GB</td><td class="num">~2.0 TB/s</td><td class="num">~312 TFLOP/s</td></tr>
+    <tr><td>H100 SXM</td><td class="num">80 GB</td><td class="num">~3.35 TB/s</td><td class="num">~989 TFLOP/s</td></tr>
+    <tr><td>H200</td><td class="num">141 GB</td><td class="num">~4.8 TB/s</td><td class="num">similar compute class</td></tr>
+    <tr><td>Apple M2 unified (eg.)</td><td class="num">shared</td><td class="num">~100 GB/s order</td><td class="num">laptop tier L</td></tr>
+  </tbody>
+</table>
+
+
+<h3>Worked Numerical Examples</h3>
+
+<p class="facet">Example A — Training FLOPs to GPU-hours</p>
+<ul>
+  <li>N = 70B, D = 1.4T (Chinchilla-like), FLOPs ≈ 6ND = 6 × 7e10 × 1.4e12 = 5.88e23.</li>
+  <li>H100 peak ≈ 9.89e14 FLOP/s; at MFU 0.4 with 1024 GPUs: useful = 0.4 × 9.89e14 × 1024.</li>
+  <li>Seconds ≈ 5.88e23 / useful ≈ 1.45e6 s ≈ 400 GPU-hours × 1024 ≈ 0.4M GPU-hours order — then inflate for real MFU/failures.</li>
+</ul>
+
+<p class="facet">Example B — KV concurrency on 80GB</p>
+<ul>
+  <li>Weights BF16 70B ≈ 140 GB → needs multi-GPU; for 8B weights 16 GB on 80 GB leaves ~60 GB KV.</li>
+  <li>At 128 KiB/token, 60 GB ≈ 4.8e5 tokens of KV ⇒ e.g. ~58 sequences at 8k, or ~14 at 32k.</li>
+  <li>INT8 KV halves bytes/token → roughly 2× concurrency if quality allows.</li>
+</ul>
+
+<p class="facet">Example C — API bill</p>
+<ul>
+  <li>1M requests/day, 800 input + 200 output tokens, $0.50 / $1.50 per 1M in/out.</li>
+  <li>Daily $ ≈ 1e6 × (800×0.5 + 200×1.5) / 1e6 = 1e6 × (0.0004 + 0.0003) = $700/day.</li>
+  <li>Cut input 25% via prompt compression/caching → save $200/day before quality checks.</li>
+</ul>
+
+<p class="facet">Example D — TTFT vs E2E</p>
+<ul>
+  <li>TTFT 0.6s, TPOT 30 ms, 150 output tokens → E2E ≈ 0.6 + 149×0.03 ≈ 5.1s.</li>
+  <li>Halving output length saves ~2.2s; halving TTFT saves 0.3s — pick the bottleneck by product.</li>
+</ul>
+
+<p class="facet">Example E — pass@k intuition</p>
+<ul>
+  <li>If pass@1 = 0.2 independent, pass@k ≈ 1 − (1−0.2)^k → pass@5 ≈ 0.67, pass@10 ≈ 0.89.</li>
+  <li>Real samples are correlated; measure empirically; cost scales with k.</li>
+</ul>
+
+<table>
+  <caption>Unit conversions worth memorising.</caption>
+  <thead><tr><th>From</th><th>To</th><th>Factor</th></tr></thead>
+  <tbody>
+    <tr><td>1 token (English rough)</td><td>~4 characters / ~0.75 words</td><td>Corpus-dependent</td></tr>
+    <tr><td>1B params BF16</td><td>2 GB weights</td><td>×2 bytes</td></tr>
+    <tr><td>1B params INT4</td><td>~0.5 GB weights</td><td>idealised pack</td></tr>
+    <tr><td>1 TFLOP/s × 1 s</td><td>1e12 FLOPs</td><td></td></tr>
+    <tr><td>1 GPU-hour</td><td>3600 GPU-seconds</td><td></td></tr>
+    <tr><td>1 day × 100 tok/s</td><td>8.64M tokens</td><td>sustained</td></tr>
+  </tbody>
+</table>
+
+<h3>Failure-Mode Arithmetic</h3>
+<ul class="failure-modes">
+  <li>Planning with peak FLOP/s and 100% MFU — understates time/cost by 2–5×.</li>
+  <li>Sizing GPUs from weights only — KV and activations decide concurrency.</li>
+  <li>Comparing $/1M tokens across models with different verbosity — normalise by task success.</li>
+  <li>Ignoring prefill for long RAG prompts — TTFT regressions look like “model got slower”.</li>
+  <li>Counting rejected speculative tokens as useful throughput — goodput falls while TPS looks fine.</li>
+</ul>
+
+
+<h3>Symbol Sheet</h3>
+<table>
+  <caption>Symbols used across the book’s arithmetic.</caption>
+  <thead><tr><th>Symbol</th><th>Meaning</th><th>Typical units</th></tr></thead>
+  <tbody>
+    <tr><td><span class="math">N</span></td><td>Parameter count</td><td>1 (count)</td></tr>
+    <tr><td><span class="math">D</span></td><td>Training tokens</td><td>tokens</td></tr>
+    <tr><td><span class="math">C</span></td><td>Compute budget</td><td>FLOPs</td></tr>
+    <tr><td><span class="math">S</span></td><td>Sequence length</td><td>tokens</td></tr>
+    <tr><td><span class="math">B</span></td><td>Batch size (sequences)</td><td>1</td></tr>
+    <tr><td><span class="math">L</span></td><td>Number of layers</td><td>1</td></tr>
+    <tr><td><span class="math">d_{\text{model}}</span></td><td>Model width</td><td>1</td></tr>
+    <tr><td><span class="math">d_h</span></td><td>Head dimension</td><td>1</td></tr>
+    <tr><td><span class="math">h_q, h_{kv}</span></td><td>Query / KV head counts</td><td>1</td></tr>
+    <tr><td><span class="math">V</span></td><td>Vocabulary size</td><td>1</td></tr>
+    <tr><td><span class="math">\tau</span></td><td>Sampling temperature</td><td>1</td></tr>
+    <tr><td><span class="math">b_w, b_{kv}</span></td><td>Bytes per weight / KV value</td><td>bytes</td></tr>
+    <tr><td><span class="math">I</span></td><td>Arithmetic intensity</td><td>FLOP/byte</td></tr>
+    <tr><td>MFU</td><td>Model FLOPs utilisation</td><td>fraction</td></tr>
+    <tr><td>TTFT</td><td>Time to first token</td><td>seconds</td></tr>
+    <tr><td>TPOT</td><td>Time per output token</td><td>seconds</td></tr>
+  </tbody>
+</table>
+
+<h3>Inequalities You Will Use Constantly</h3>
+<ul>
+  <li><span class="math">M_{\text{KV}} \propto B \cdot S \cdot h_{kv}</span> — cut any factor to raise concurrency.</li>
+  <li><span class="math">\text{TTFT} \ge t_{\text{queue}} + t_{\text{prefill}}</span> — you cannot fix queueing with a faster kernel alone.</li>
+  <li><span class="math">\$_{\text{task}} \ge \$_{\text{tokens}} + \$_{\text{tools}} + \$_{\text{humans}}</span> — token bills understate agentic products.</li>
+  <li><span class="math">\text{goodput} \le \text{throughput}</span> — equality only if nothing fails SLOs.</li>
+  <li><span class="math">\text{quality}(\text{test-time compute})</span> saturates — measure the knee before spending.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Whiteboard checklist</span>
+  <ul>
+    <li>Weights bytes = <span class="math">N b_w</span>.</li>
+    <li>KV bytes = <span class="math">B S \cdot (2 L h_{kv} d_h b_{kv})</span>.</li>
+    <li>Train FLOPs ≈ <span class="math">6ND</span>; wall clock ÷ MFU.</li>
+    <li>Decode B=1 ≈ bandwidth / weight bytes tokens/s.</li>
+    <li>Cost = $/s ÷ useful tokens/s; optimise goodput not vanity TPS.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CLOSING -->
+<section class="review">
+<h1>How to Use This Reference</h1>
+
+<p class="chapter-lede" style="margin-top:0">Volume 25 closes the series as an index layer. There is no next teaching volume.
+Use this chapter as a map back into Volumes 1–24.</p>
+
+<h2>What This Volume Indexes</h2>
+<ul>
+  <li>Research roadmaps by theme and by year, with volume cross-references.</li>
+  <li>A dense paper catalogue plus fourteen full paper cards spanning the curriculum.</li>
+  <li>The terminology stack and fifty-plus engineering glossary entries.</li>
+  <li>An interview bank of about one hundred advanced questions with outlines and follow-ups.</li>
+  <li>FLOPs, memory, KV, roofline, cost and latency formulas in one place.</li>
+</ul>
+
+
+<h3>Paper-Reading Template (Index Use)</h3>
+<p>When Chapter 3 has no full card, fill this template in your notes. It matches the book’s paper-card fields.</p>
+<table>
+  <caption>Blank template fields and what “good” looks like.</caption>
+  <thead><tr><th>Field</th><th>Question to answer</th><th>Quality bar</th></tr></thead>
+  <tbody>
+    <tr><td>Problem</td><td>What engineering pain existed?</td><td>Concrete, not “improve NLP”</td></tr>
+    <tr><td>Previous limitation</td><td>Why prior SOTA was insufficient?</td><td>Names a real constraint (compute, data, stability)</td></tr>
+    <tr><td>Approach</td><td>What did they change?</td><td>Algorithm / system / data — be specific</td></tr>
+    <tr><td>Contribution</td><td>What should we remember in five years?</td><td>One sentence</td></tr>
+    <tr><td>Practical impact</td><td>What did builders ship differently?</td><td>Tools, defaults, products</td></tr>
+    <tr><td>Limitations</td><td>When does it fail or not apply?</td><td>At least two failure modes</td></tr>
+    <tr><td>Volume link</td><td>Where does this book teach it?</td><td>Primary + secondary vols</td></tr>
+  </tbody>
+</table>
+
+<figure class="diagram">
+<pre class="ascii">Read abstract → skim figures → methods → limitations
+        ↓
+  Fill template (7 fields)
+        ↓
+  Map to volume → skim teaching chapter
+        ↓
+  Optional: re-implement toy version / add eval case</pre>
+<figcaption>Paper → practice loop using this reference as the index.</figcaption>
+</figure>
+
+<h3>Selected Constants Pocket Card</h3>
+<table>
+  <caption>Memorable constants — always re-validate for your hardware and year.</caption>
+  <thead><tr><th>Constant</th><th class="num">Value</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr><td>Forward FLOPs/token</td><td class="num">≈2N</td><td>Prefill/decode compute</td></tr>
+    <tr><td>Train FLOPs/token</td><td class="num">≈6N</td><td>Pretrain planning</td></tr>
+    <tr><td>BF16 bytes/param</td><td class="num">2</td><td>Weight memory</td></tr>
+    <tr><td>FP32 bytes/param</td><td class="num">4</td><td>Master weights</td></tr>
+    <tr><td>Adam moments (classic)</td><td class="num">8 bytes/param</td><td>Train memory</td></tr>
+    <tr><td>English chars/token</td><td class="num">~4</td><td>Rough prompt sizing</td></tr>
+    <tr><td>H100 BF16 peak</td><td class="num">~989 TFLOP/s</td><td>Roofline</td></tr>
+    <tr><td>H100 HBM BW</td><td class="num">~3.35 TB/s</td><td>Decode bound</td></tr>
+    <tr><td>H100 ridge</td><td class="num">~295 FLOP/byte</td><td>Intensity compare</td></tr>
+    <tr><td>Interactive TTFT</td><td class="num">0.2–0.8 s</td><td>Chat SLO start</td></tr>
+    <tr><td>Streaming TPOT</td><td class="num">20–40 ms</td><td>Feel of fluency</td></tr>
+    <tr><td>Chinchilla-ish tokens/param</td><td class="num">~20</td><td>2022-era planning</td></tr>
+  </tbody>
+</table>
+
+<h3>Glossary Cross-Index by Volume</h3>
+<table>
+  <caption>Where to study terms in depth (pointer index).</caption>
+  <thead><tr><th>Vol</th><th>Representative glossary terms</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>AI, ML, FM, LLM, SLM, workflow, agent, platform, roofline, 6ND</td></tr>
+    <tr><td>2–4</td><td>Attention, RoPE, causal mask, PPL, sampling, checkpoint</td></tr>
+    <tr><td>5–6</td><td>Dedup, contamination, Chinchilla, DDP/FSDP, MFU</td></tr>
+    <tr><td>7</td><td>GQA, MoE, MLA, sliding window, SSM</td></tr>
+    <tr><td>8–9</td><td>SFT, LoRA, DPO, RLHF, PRM, test-time compute, pass@k</td></tr>
+    <tr><td>10</td><td>Golden set, LLM-as-judge, contamination, eval gate</td></tr>
+    <tr><td>11–12</td><td>KV cache, TTFT, TPOT, continuous batching, goodput, speculation</td></tr>
+    <tr><td>13–14</td><td>Context engineering, RAG, hybrid retrieval, rerank, groundedness</td></tr>
+    <tr><td>15–16</td><td>ReAct, harness, tool runtime, compaction, sandbox</td></tr>
+    <tr><td>17–18</td><td>Injection, jailbreak, guardrail, router, cascade</td></tr>
+    <tr><td>19–20</td><td>ViT, VLM, CLIP, diffusion, flow matching</td></tr>
+    <tr><td>21–24</td><td>Documented/Inferred, cost ledger, FinOps, eval gate, platform</td></tr>
+  </tbody>
+</table>
+
+<h3>Interview Session Plans</h3>
+<table>
+  <caption>Suggested 45-minute self-mock formats.</caption>
+  <thead><tr><th>Track</th><th>Minutes</th><th>Chapters / vols to pull</th></tr></thead>
+  <tbody>
+    <tr><td>Inference engineer</td><td>10 formulas + 25 Qs from V11–12 + 10 stretch</td><td>Ch 5–6; Vol 7, 11, 12</td></tr>
+    <tr><td>Applied LLM / RAG</td><td>5 glossary + 30 Qs V13–14 + 10 eval</td><td>Ch 4–5; Vol 10, 13, 14</td></tr>
+    <tr><td>Agents platform</td><td>10 terminology + 25 Qs V15–17 + 10 harness</td><td>Ch 4–5; Vol 15–17, 24</td></tr>
+    <tr><td>Training / post-train</td><td>10 scaling + 25 Qs V5–9</td><td>Ch 1, 5–6; Vol 5–9</td></tr>
+    <tr><td>Staff generalist</td><td>15 stretch + 15 formulas + 15 product</td><td>Ch 5 stretch; Ch 6; Vol 21–22</td></tr>
+  </tbody>
+</table>
+
+<p class="facet">Scoring yourself</p>
+<ul>
+  <li><strong>0</strong>: blank or wrong units.</li>
+  <li><strong>1</strong>: right idea, no numbers or no failure mode.</li>
+  <li><strong>2</strong>: numbers + trade-off + how to measure.</li>
+  <li>Target average ≥1.5 on your track before onsite loops.</li>
+</ul>
+
+<table>
+  <caption>Anti-patterns heard in interviews (and the fix).</caption>
+  <thead><tr><th>Anti-pattern</th><th>Fix using this volume</th></tr></thead>
+  <tbody>
+    <tr><td>“Just fine-tune the LLM”</td><td>Ch 4: workflow vs agent; Ch 5 V8/V14 questions</td></tr>
+    <tr><td>“We’ll use agents” with no budgets</td><td>Glossary harness; V16 questions</td></tr>
+    <tr><td>“GPU with 80GB fits 70B”</td><td>Ch 6: dtype × N; multi-GPU</td></tr>
+    <tr><td>“Temperature 0 ⇒ deterministic”</td><td>V1 question on nondeterminism</td></tr>
+    <tr><td>“RAG solves hallucination”</td><td>V14 faithfulness vs relevance</td></tr>
+    <tr><td>“Eval is MMLU”</td><td>V10 golden sets + online goodput</td></tr>
+  </tbody>
+</table>
+
+
+<h3>Errata Posture and Versioning</h3>
+<p>This reference will age: hardware peaks, optimal tokens/parameter and product names move.
+Treat numbers as <em>order-of-magnitude tools</em>. Prefer measuring your fleet. When teaching
+volumes disagree with a newer paper, the teaching volume’s derivation still trains judgement —
+update the constant, keep the method.</p>
+
+<table>
+  <caption>What ages fast vs what ages slowly.</caption>
+  <thead><tr><th>Ages fast</th><th>Ages slowly</th></tr></thead>
+  <tbody>
+    <tr><td>Frontier benchmark scores</td><td>Attention + residual block structure</td></tr>
+    <tr><td>Specific GPU peak FLOP/s</td><td>Roofline reasoning</td></tr>
+    <tr><td>Chinchilla constant</td><td>6ND lower-bound thinking</td></tr>
+    <tr><td>Vendor product names</td><td>Gateway / harness / guard / eval split</td></tr>
+    <tr><td>Exact MoE routing tricks</td><td>Active vs total parameter distinction</td></tr>
+    <tr><td>Jailbreak strings</td><td>Untrusted content + tool allowlists</td></tr>
+  </tbody>
+</table>
+
+<h3>Minimal Spanning Set of Papers</h3>
+<p>If you can study only twelve papers deeply, use this spanning set (also carded above where noted):</p>
+<ol>
+  <li>Vaswani et al., 2017 — Attention Is All You Need</li>
+  <li>Brown et al., 2020 — GPT-3</li>
+  <li>Kaplan et al., 2020 — Scaling Laws</li>
+  <li>Hoffmann et al., 2022 — Chinchilla</li>
+  <li>Ouyang et al., 2022 — InstructGPT</li>
+  <li>Rafailov et al., 2023 — DPO</li>
+  <li>Hu et al., 2021 — LoRA</li>
+  <li>Lewis et al., 2020 — RAG</li>
+  <li>Kwon et al., 2023 — vLLM / PagedAttention</li>
+  <li>Wei et al., 2022 — Chain-of-Thought</li>
+  <li>Yao et al., 2022 — ReAct</li>
+  <li>Radford et al., 2021 — CLIP (plus Rombach LDM if you ship media)</li>
+</ol>
+
+<aside class="callout impl"><span class="title">Spanning set rule</span>
+  <ul>
+    <li>One architecture, one scale, one alignment, one adapter, one retrieve, one serve, one reason, one act, one multimodal.</li>
+    <li>Everything else in Chapters 1–3 is elaboration on these spines.</li>
+  </ul>
+</aside>
+
+<h3>Forge Package ↔ Volume Cheat Sheet</h3>
+<table>
+  <caption>Where continuous project code grows (from MASTER_PLAN).</caption>
+  <thead><tr><th>Package / area</th><th>Vol</th><th>Reference use</th></tr></thead>
+  <tbody>
+    <tr><td><code>forge.compute</code></td><td>1</td><td>Validate Ch 6 formulas in code</td></tr>
+    <tr><td><code>forge.nn</code></td><td>2, 7</td><td>Attention/GQA interview drills</td></tr>
+    <tr><td><code>forge.tokenizers</code></td><td>3</td><td>Fertility / BPB questions</td></tr>
+    <tr><td><code>forge.model/train/generate</code></td><td>4</td><td>Training-step memory narrative</td></tr>
+    <tr><td><code>forge.data</code></td><td>5</td><td>Dedup / PII controls</td></tr>
+    <tr><td><code>forge.train.distributed</code></td><td>6</td><td>DDP/FSDP comparisons</td></tr>
+    <tr><td><code>forge.posttrain</code></td><td>8</td><td>LoRA/DPO outlines</td></tr>
+    <tr><td><code>forge.reasoning</code></td><td>9</td><td>Test-time compute plans</td></tr>
+    <tr><td><code>forge.eval</code></td><td>10</td><td>Gate design</td></tr>
+    <tr><td><code>forge.inference</code> / <code>serve</code></td><td>11–12</td><td>KV + TTFT arithmetic</td></tr>
+    <tr><td><code>forge.context</code> / <code>rag</code></td><td>13–14</td><td>Context budgets</td></tr>
+    <tr><td><code>forge.agents</code> / <code>harness</code></td><td>15–16</td><td>Terminology precision</td></tr>
+    <tr><td><code>forge.guard</code> / <code>router</code></td><td>17–18</td><td>Safety + cost routing</td></tr>
+    <tr><td><code>forge.multimodal</code></td><td>19–20</td><td>VLM / diffusion cards</td></tr>
+    <tr><td><code>services/</code>, <code>ops</code>, platform</td><td>21–24</td><td>HLD rubrics</td></tr>
+  </tbody>
+</table>
+
+<figure class="diagram">
+<pre class="ascii">Volumes 1–4    foundations     → compute, nn, tok, train
+Volumes 5–9    model factory   → data, scale, arch, align, reason
+Volumes 10–12  measure/serve   → eval, inference, serving
+Volumes 13–18  systems         → context, rag, agents, harness, guard, route
+Volumes 19–20  multimodal      → understand, generate
+Volumes 21–24  productise      → architecture, ops, tooling, platform
+Volume 25      index           → you are here</pre>
+<figcaption>Series arc summarised for navigation.</figcaption>
+</figure>
+
+
+<h3>Final Checklist Before You Close the Book</h3>
+<div class="frame checklist">
+<ul>
+  <li>Can you derive 2N / 6N and KV bytes/token without notes?</li>
+  <li>Can you define agent vs workflow vs harness without hand-waving?</li>
+  <li>Can you triage RAG errors into retrieval vs prompt vs model?</li>
+  <li>Can you sketch continuous batching and why KV paging helps?</li>
+  <li>Can you design an eval gate for a prompt change?</li>
+  <li>Can you name two prompt-injection controls that are not “better model”?</li>
+  <li>Can you compute a rough $/1M tokens from GPU price and TPS?</li>
+  <li>Can you explain DPO vs RLHF in one minute?</li>
+  <li>Can you point to the volume that implements each Forge package?</li>
+  <li>Can you refuse an agent architecture when a workflow suffices?</li>
+</ul>
+</div>
+
+<p>If you miss more than two, jump to the matching interview rows in Chapter 5 and the formulas in Chapter 6, then re-read the teaching volume’s review section.</p>
+
+<table>
+  <caption>Checklist item → volume jump.</caption>
+  <thead><tr><th>Checklist theme</th><th>Jump</th></tr></thead>
+  <tbody>
+    <tr><td>2N / 6N / KV</td><td>Vol 1 Ch 4; Vol 11; this Vol Ch 6</td></tr>
+    <tr><td>Terminology stack</td><td>Vol 1 Ch 2; this Vol Ch 4</td></tr>
+    <tr><td>RAG triage</td><td>Vol 14; this Vol Ch 5 V14</td></tr>
+    <tr><td>Serving / paging</td><td>Vol 11–12; paper card Kwon 2023</td></tr>
+    <tr><td>Eval gates</td><td>Vol 10</td></tr>
+    <tr><td>Injection controls</td><td>Vol 17</td></tr>
+    <tr><td>Cost arithmetic</td><td>Vol 22; this Vol Ch 6</td></tr>
+    <tr><td>DPO vs RLHF</td><td>Vol 8; paper cards Ouyang / Rafailov</td></tr>
+    <tr><td>Forge map</td><td>this Vol review table</td></tr>
+    <tr><td>Refuse agents</td><td>Vol 15–16; glossary counter-examples</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Last word before the paths table</span>
+  <ul>
+    <li>The series ends, but the index stays open.</li>
+    <li>Prefer a measured system over a fashionable architecture.</li>
+    <li>Carry Chapter 6 in your head and Chapter 4 on your tongue.</li>
+  </ul>
+</aside>
+
+<h2>Recommended Paths</h2>
+<table>
+  <caption>Pick a path based on what you need right now.</caption>
+  <thead><tr><th>Goal</th><th>Start here</th><th>Then jump to</th></tr></thead>
+  <tbody>
+    <tr><td>Interview in 48 hours</td><td>Chapter 5 (your target volumes) + Chapter 6 checklist</td><td>Volume review sections for weak spots</td></tr>
+    <tr><td>Read a new paper</td><td>Chapter 1 theme table → Chapter 3 card if present</td><td>Teaching volume implementation chapters</td></tr>
+    <tr><td>Capacity plan / design doc</td><td>Chapter 6 formulas</td><td>Volumes 11–12, 22</td></tr>
+    <tr><td>Settle naming debates</td><td>Chapter 4 core stack</td><td>Volumes 15–16 for agents/harnesses</td></tr>
+    <tr><td>Build the platform</td><td>Volume 24 capstone</td><td>This volume’s stretch interview Qs as design reviews</td></tr>
+  </tbody>
+</table>
+
+
+<h2>Maintaining Your Personal Index</h2>
+<ul>
+  <li>When you read a paper, add one row to a personal table: problem, limitation, approach, impact, volume link.</li>
+  <li>When you scrap a production incident, add one interview question you wish you had rehearsed.</li>
+  <li>When a constant changes (tokens/param, hardware peaks), update Chapter 6’s mental model first — then the spreadsheet.</li>
+</ul>
+
+<table>
+  <caption>Quarterly refresh checklist for an AI platform team.</caption>
+  <thead><tr><th>Area</th><th>Refresh action</th><th>Pointer</th></tr></thead>
+  <tbody>
+    <tr><td>Models</td><td>Re-run golden + online slices on new frontier/open candidates</td><td>Vol 10, 18</td></tr>
+    <tr><td>Serving</td><td>Re-measure TTFT/TPOT/goodput on current traffic shape</td><td>Vol 11, 12</td></tr>
+    <tr><td>RAG</td><td>Rebuild sample index; check freshness SLAs and faithfulness</td><td>Vol 14</td></tr>
+    <tr><td>Agents</td><td>Red-team tools; review permission diffs</td><td>Vol 16, 17</td></tr>
+    <tr><td>Cost</td><td>Recompute $/task; revisit routing thresholds</td><td>Vol 18, 22</td></tr>
+    <tr><td>Security</td><td>Rotate attack sets; review egress policies</td><td>Vol 17</td></tr>
+    <tr><td>Docs</td><td>Update model cards and runbooks</td><td>Vol 1, 22, 24</td></tr>
+  </tbody>
+</table>
+
+<h2>Common Exam / Design-Doc Rubrics</h2>
+<p>Interviewers and design reviewers often score the same five axes. Use them as a self-rubric:</p>
+<ol>
+  <li><strong>Problem framing</strong> — model vs system; workflow vs agent; constraints explicit.</li>
+  <li><strong>Quantitative plan</strong> — memory, FLOPs, latency, dollars with units.</li>
+  <li><strong>Evaluation</strong> — offline gates, online metrics, safety cases.</li>
+  <li><strong>Failure modes</strong> — ranked, with mitigations and blast radius.</li>
+  <li><strong>Operability</strong> — traces, rollbacks, ownership, cost attribution.</li>
+</ol>
+
+<table>
+  <caption>Mapping rubrics to volumes.</caption>
+  <thead><tr><th>Rubric axis</th><th>Primary volumes</th><th>Reference chapter here</th></tr></thead>
+  <tbody>
+    <tr><td>Problem framing</td><td>1, 15, 16, 21</td><td>Glossary</td></tr>
+    <tr><td>Quantitative plan</td><td>1, 6, 11, 12, 22</td><td>Formulas</td></tr>
+    <tr><td>Evaluation</td><td>10, 14, 17</td><td>Interview bank (V10)</td></tr>
+    <tr><td>Failure modes</td><td>12, 16, 17, 22</td><td>Stretch questions</td></tr>
+    <tr><td>Operability</td><td>16, 22, 24</td><td>Volume map</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout warning"><span class="title">What not to do with this volume</span>
+  <ul>
+    <li>Do not cite Chapter 3 cards as a substitute for reading the paper when you implement the method.</li>
+    <li>Do not treat interview outlines as scripts — interviewers push on the follow-ups.</li>
+    <li>Do not copy latency numbers into SLOs without measuring your stack.</li>
+  </ul>
+</aside>
+
+
+<table>
+  <caption>Quick “I forgot which volume” lookup by symptom.</caption>
+  <thead><tr><th>Symptom</th><th>Likely volume</th><th>Reference hook</th></tr></thead>
+  <tbody>
+    <tr><td>Loss won’t compare across models</td><td>3</td><td>Glossary: BPB / PPL</td></tr>
+    <tr><td>GPU OOM only at long context</td><td>11</td><td>KV formula</td></tr>
+    <tr><td>Fluent wrong answers with citations</td><td>14</td><td>Faithfulness</td></tr>
+    <tr><td>Agent loops forever</td><td>16</td><td>Budgets / harness</td></tr>
+    <tr><td>Prompt change silently regresses</td><td>10, 13</td><td>Eval gate</td></tr>
+    <tr><td>Bill exploded, TPS fine</td><td>12, 22</td><td>Goodput / retries</td></tr>
+    <tr><td>Tool called with secret in args</td><td>17</td><td>DLP / allowlists</td></tr>
+    <tr><td>Small model enough for 80% traffic</td><td>18</td><td>Router / cascade</td></tr>
+    <tr><td>Image answer ignores the chart</td><td>19</td><td>VLM grounding</td></tr>
+    <tr><td>Training estimate 2× low</td><td>1, 6</td><td>MFU / 6ND</td></tr>
+    <tr><td>Need adapter per customer</td><td>8, 12</td><td>LoRA serving</td></tr>
+    <tr><td>Reasoning latency unacceptable</td><td>9, 18</td><td>Test-time compute routing</td></tr>
+  </tbody>
+</table>
+
+<p class="facet">Series complete</p>
+<ul>
+  <li>Teaching volumes: 1–24. Index volume: 25.</li>
+  <li>Re-enter via symptom table, glossary, interview bank or formulas — whichever matches the job in front of you.</li>
+</ul>
+
+<h2>End of the Book Series</h2>
+<p>Volumes 1–24 taught you to go from first-principles Transformers to a production AI platform
+in the Forge project. Volume 25 does not add a new <code>forge</code> package; it indexes what you built
+and what the literature contributed.</p>
+<ul>
+  <li>When the field moves — new architectures, new serving tricks, new agent protocols — update your
+  <em>systems</em> using the same disciplines: measurement, evaluation, harnesses, guardrails and cost arithmetic.</li>
+  <li>When vocabulary drifts in a meeting, return to Chapter 4.</li>
+  <li>When a vendor claim sounds wrong, return to Chapter 6 and demand the MFU, the KV budget and the goodput.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Closing note</span>
+  <ul>
+    <li>The bitter lesson still holds: general methods that leverage computation win — but only if engineers keep the surrounding system honest.</li>
+    <li>Your advantage is not memorising every paper; it is knowing which volume’s tools to pick up when a production problem appears.</li>
+    <li>This is the end of the series. Re-enter wherever the next incident, design review or interview demands.</li>
+  </ul>
+</aside>
+
+
+<table>
+  <caption>en-GB spelling reminders used throughout the series.</caption>
+  <thead><tr><th>Prefer</th><th>Avoid (US)</th><th>Why it matters here</th></tr></thead>
+  <tbody>
+    <tr><td>optimise / optimisation</td><td>optimize</td><td>Matches book style guide</td></tr>
+    <tr><td>tokeniser</td><td>tokenizer (except code APIs)</td><td>Prose vs library names</td></tr>
+    <tr><td>behaviour / favour</td><td>behavior / favor</td><td>Consistency in reviews</td></tr>
+    <tr><td>modelling / labelled</td><td>modeling / labeled</td><td>Volume prose</td></tr>
+    <tr><td>artefact</td><td>artifact</td><td>Lifecycle docs</td></tr>
+    <tr><td>defence (security prose)</td><td>defense</td><td>Except US system names</td></tr>
+    <tr><td>centre / litre (if used)</td><td>center / liter</td><td>Rare in this book</td></tr>
+  </tbody>
+</table>
+
+
+<p>You now have thematic and chronological roadmaps, paper cards, a glossary, an interview bank
+and a formula sheet. That is the whole index layer. Open a teaching volume when you need depth;
+return here when you need orientation, vocabulary or arithmetic.</p>
+<p>For citation-ready bibliographies, prefer the teaching volume’s research tables and the shared
+references file used by the book build — Volume 25 summarises for navigation, not for BibTeX
+export completeness.</p>
+
+<p>There is no Next Volume. The six chapters above plus this closing guide are the entire index
+layer — use them to re-enter Volumes 1–24 whenever the next design review, incident or interview
+demands it.</p>
+
+<p>Keep this volume bookmarked beside your capacity spreadsheet and your interview notes. The field
+will keep moving; the index habit — theme, year, card, term, question, formula — stays.</p>
+<h2>Volume Map (1–25)</h2>
+<table>
+  <caption>Complete series map for quick navigation.</caption>
+  <thead><tr><th class="num">#</th><th>Volume</th><th>Forge focus</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>Modern AI Engineering</td><td><code>forge.core</code>, <code>forge.compute</code></td></tr>
+    <tr><td class="num">2</td><td>Transformers from First Principles</td><td><code>forge.nn</code></td></tr>
+    <tr><td class="num">3</td><td>Tokenisation and Representations</td><td><code>forge.tokenizers</code></td></tr>
+    <tr><td class="num">4</td><td>Building a Small LLM</td><td><code>forge.model</code>, <code>train</code>, <code>generate</code></td></tr>
+    <tr><td class="num">5</td><td>LLM Data Engineering</td><td><code>forge.data</code></td></tr>
+    <tr><td class="num">6</td><td>Pretraining and Distributed Training</td><td><code>forge.train.distributed</code></td></tr>
+    <tr><td class="num">7</td><td>Modern LLM Architectures</td><td><code>forge.nn</code> (GQA, MoE, …)</td></tr>
+    <tr><td class="num">8</td><td>Fine-Tuning and Post-Training</td><td><code>forge.posttrain</code></td></tr>
+    <tr><td class="num">9</td><td>Reasoning Models and Test-Time Compute</td><td><code>forge.reasoning</code></td></tr>
+    <tr><td class="num">10</td><td>Evaluation Engineering</td><td><code>forge.eval</code></td></tr>
+    <tr><td class="num">11</td><td>Inference Optimisation</td><td><code>forge.inference</code></td></tr>
+    <tr><td class="num">12</td><td>Model Serving and Deployment</td><td><code>forge.serve</code></td></tr>
+    <tr><td class="num">13</td><td>Prompt and Context Engineering</td><td><code>forge.context</code></td></tr>
+    <tr><td class="num">14</td><td>Retrieval-Augmented Generation</td><td><code>forge.rag</code></td></tr>
+    <tr><td class="num">15</td><td>AI Agents</td><td><code>forge.agents</code></td></tr>
+    <tr><td class="num">16</td><td>Agent Harnesses</td><td><code>forge.harness</code></td></tr>
+    <tr><td class="num">17</td><td>Guardrails and AI Security</td><td><code>forge.guard</code></td></tr>
+    <tr><td class="num">18</td><td>Model Routing and Decision Systems</td><td><code>forge.router</code></td></tr>
+    <tr><td class="num">19</td><td>Multimodal AI I: Understanding</td><td><code>forge.multimodal</code></td></tr>
+    <tr><td class="num">20</td><td>Multimodal AI II: Generation</td><td><code>forge.multimodal.gen</code></td></tr>
+    <tr><td class="num">21</td><td>AI Product Architecture and Case Studies</td><td><code>services/</code></td></tr>
+    <tr><td class="num">22</td><td>AI Infrastructure, Operations and Cost</td><td><code>forge.ops</code>, <code>deploy/</code></td></tr>
+    <tr><td class="num">23</td><td>Tooling and AI-Assisted Development</td><td>repo tooling / gates</td></tr>
+    <tr><td class="num">24</td><td>Capstone: The Complete AI Platform</td><td>platform integration</td></tr>
+    <tr><td class="num">25</td><td>Reference (this volume)</td><td>—</td></tr>
+  </tbody>
+</table>
+
+<p class="facet">End of series</p>
+<ul>
+  <li>Volumes 1–24 teach; Volume 25 indexes.</li>
+</ul>
+</section>
+
+</body>
+</html>

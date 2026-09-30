@@ -1,0 +1,1556 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 4 · Building a Small LLM</title>
+<meta name="volume" content="Volume 4 · Building a Small LLM">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 4</p>
+  <h1 class="no-toc">Building a Small LLM</h1>
+  <p class="tp-subtitle">Tokeniser, Model, Training Loop, Generation and Evaluation</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Assemble a complete, trainable GPT-style model in a few hundred lines of PyTorch, with nothing hidden behind a library call.</li>
+  <li>Train it on a laptop, checkpoint it, resume it bit-for-bit, sample from it and measure it.</li>
+  <li>Learn the debugging workflow that separates "the model is small" from "the code is wrong".</li>
+  <li>Map every piece onto Hugging Face <code>transformers</code> and <code>safetensors</code>, and see what production trainers add.</li>
+  <li>Seed the continuous package pieces: <code>forge.model</code>, <code>forge.train</code>, <code>forge.data.shards</code>, <code>forge.generate</code>, <code>forge.eval</code>.</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>Volume 2 (Transformer internals / <code>forge.nn</code>) and Volume 3 (tokenisation / <code>forge.tokenizers</code>). Attention, LayerNorm and BPE are used here, not re-derived.</li>
+  <li>You are comfortable reading PyTorch modules and optimiser code.</li>
+</ul>
+
+<p class="facet">How to read the code</p>
+<ul>
+  <li>Every listing is one file of a single program: the listings run in order in one Python namespace, so later listings use names defined earlier.</li>
+  <li>Listings are pedagogical; the integrated modules they seed live under <code>src/forge/</code> as named above.</li>
+  <li>All listings were executed on an Apple M2 laptop (Python 3.12, PyTorch 2.10, <code>transformers</code> 5.6). Printed output is real and unedited.</li>
+  <li>There are no downloads. The corpus is built from the docstrings of the Python standard library installed on the machine, so your exact numbers will differ slightly with your Python version.</li>
+  <li>Total runtime is about two minutes; training uses MPS when available and CPU otherwise.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1  System design       components, configs, artefacts, sizing
+Chapter 2  Dataset pipeline    bytes -> uint16 memmap -> random windows
+Chapter 3  The model           GPTConfig, blocks, tying, init, parameter count
+Chapter 4  Loss and optimiser  cross-entropy, AdamW groups, warmup + cosine
+Chapter 5  Training loop       accumulation, clipping, eval cadence, tokens/s
+Chapter 6  Checkpointing       atomic save, exact resumption test
+Chapter 7  Generation          greedy, temperature, top-k/p, min-p, KV cache
+Chapter 8  Evaluation          perplexity, bits per byte, held-out domains
+Chapter 9  Debugging           overfit one batch, loss-curve pathologies
+Chapter 10 Production libs     HF GPT-2 export, safetensors, what trainers add</pre>
+<figcaption>Map of Volume 4.</figcaption>
+</figure>
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="system-design">System Design of a Small LLM Project</h2>
+<p class="chapter-lede">A language model project is a small distributed system even on one laptop:
+a corpus, a tokeniser, a data format, a model definition, a training loop, checkpoints, samplers
+and evaluators, all joined by configuration. Most training bugs are interface bugs between these
+components, so design the interfaces first.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>You want a model you can train end to end, change one thing about, and retrain with confidence
+  that the difference in the result came from your change. That requires every artefact to be
+  reproducible from a config and a seed, every run to be resumable, and every metric to be
+  comparable across runs.</p>
+</div>
+
+<p class="facet">Possible solutions and what each does not solve</p>
+<ul>
+  <li><strong>A notebook</strong>: fast to start; hidden state, no resumption and no reproducibility.</li>
+  <li><strong>A high-level trainer (HF <code>Trainer</code>, Lightning)</strong>: correct defaults; hides the details you need to debug a loss curve, and you cannot tell which default matters.</li>
+  <li><strong>A small, explicit codebase</strong> (this volume, in the spirit of nanoGPT): every line is visible; you own correctness. Production libraries become an optimisation later (Chapter 10).</li>
+</ul>
+
+<h3>Components and Artefacts</h3>
+<pre class="mermaid">flowchart TD
+  C[Corpus: stdlib docstrings] --> T[Tokeniser: bytes + EOT]
+  T --> S[Shards: train.bin / val.bin uint16]
+  S --> D[Batcher: seeded random windows]
+  CFG[GPTConfig + TrainConfig] --> M[GPT model]
+  CFG --> TR[Trainer]
+  D --> TR
+  M --> TR
+  TR --> CK[Checkpoint: model, optimiser, scheduler, RNG, step]
+  CK --> TR
+  CK --> G[Generator: naive and KV-cached]
+  CK --> E[Evaluator: perplexity, samples]
+  CK --> HF[Export: HF GPT-2 + safetensors]</pre>
+
+<table>
+  <caption>Every component, its artefact and the invariant it must keep.</caption>
+  <thead><tr><th>Component</th><th>Artefact</th><th>Invariant</th></tr></thead>
+  <tbody>
+    <tr><td>Tokeniser</td><td>Vocabulary, special-token ids</td><td>Same ids at training, evaluation and serving time</td></tr>
+    <tr><td>Data pipeline</td><td><code>train.bin</code>, <code>val.bin</code></td><td>Deterministic given a seed; no document in both splits</td></tr>
+    <tr><td>Model</td><td><code>GPTConfig</code> + state dict</td><td>Config alone rebuilds the architecture</td></tr>
+    <tr><td>Trainer</td><td>Checkpoint</td><td>Resuming gives bit-identical results</td></tr>
+    <tr><td>Evaluator</td><td>Metrics JSON</td><td>Fixed eval data and fixed eval batches across runs</td></tr>
+    <tr><td>Exporter</td><td><code>config.json</code> + <code>model.safetensors</code></td><td>Logits match the source model</td></tr>
+  </tbody>
+</table>
+
+<h3>Choosing a Target Size</h3>
+<p>Size is decided by the compute budget, using the rule from Volume 1:</p>
+<div class="math">C_{\text{train}} \approx 6 N D</div>
+<ul>
+  <li><span class="math">N</span> is parameters and <span class="math">D</span> training tokens. A laptop that sustains roughly <span class="math">5 \times 10^{11}</span> FLOP/s (close to the rate measured on MPS in Chapter 5) does <span class="math">1.8 \times 10^{15}</span> FLOPs per hour.</li>
+  <li>The Chinchilla heuristic <span class="math">D \approx 20N</span> gives <span class="math">C \approx 120 N^2</span>, so one hour supports <span class="math">N \approx 3.9\text{M}</span> parameters on about 80M tokens.</li>
+  <li>This volume uses a 1.85M-parameter model for two minutes so every listing reruns quickly. The practical project scales the same code to the plan's Tier L target (10–30M parameters) for an overnight run.</li>
+</ul>
+
+<table>
+  <caption>Sizing options with the same code. Times assume ~5e11 FLOP/s sustained.</caption>
+  <thead><tr><th>Config</th><th class="num">Layers × width</th><th class="num">Params</th><th class="num">Tokens (20N)</th><th class="num">Time</th></tr></thead>
+  <tbody>
+    <tr><td>This volume</td><td class="num">4 × 192</td><td class="num">1.85M</td><td class="num">2.5M (not 20N)</td><td class="num">~1 min</td></tr>
+    <tr><td>Small</td><td class="num">6 × 256</td><td class="num">~4.9M</td><td class="num">98M</td><td class="num">~1.6 h</td></tr>
+    <tr><td>Tier L</td><td class="num">8 × 384</td><td class="num">~14M</td><td class="num">280M</td><td class="num">~13 h</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout impl"><span class="title">Practical Default</span>
+  <ul>
+    <li>Two dataclasses, <code>GPTConfig</code> (architecture) and <code>TrainConfig</code> (optimisation), serialised into every checkpoint. Nothing that affects results lives in a global or a command-line default that is not saved.</li>
+    <li>One experiment = one config diff. Change one field, rerun, compare validation loss at equal tokens.</li>
+  </ul>
+</aside>
+
+<h3>The Experiment Loop</h3>
+<ol>
+  <li>Sanity: loss at initialisation equals <span class="math">\ln V</span>; overfit one batch (Chapter 9).</li>
+  <li>Short run: 5–10% of the budget; check the loss curve shape and throughput.</li>
+  <li>Full run with evaluation every few hundred steps and checkpoints you can resume from.</li>
+  <li>Evaluate: validation perplexity, held-out domains, samples (Chapter 8).</li>
+  <li>Record the config, metrics and artefact hashes (Volume 1 manifest), then change one thing.</li>
+</ol>
+
+<div class="frame exercise"><p>Estimate the wall-clock time to train the Tier L model on 280M tokens on your
+own machine, using the tokens/s you will measure in Chapter 5 scaled by the ratio of parameter counts.
+Decide whether it fits in one night.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="data">The Dataset Pipeline</h2>
+<p class="chapter-lede">The training loop asks one question thousands of times per second: "give me
+B windows of T+1 consecutive tokens". The dataset pipeline exists to answer it in microseconds,
+deterministically, without the corpus fitting in RAM.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Tokenising on the fly wastes CPU on every epoch and makes the data order depend on worker
+  scheduling. Loading all token ids into a Python list costs about 28 bytes per token and does not
+  scale beyond a few hundred million tokens. Splitting into train and validation by position leaks
+  near-duplicate text across the split.</p>
+</div>
+
+<p class="facet">Possible solutions</p>
+<ul>
+  <li><strong>Python lists or pickles</strong>: simple; memory explodes and loading is slow.</li>
+  <li><strong>HF <code>datasets</code> (Arrow)</strong>: memory-mapped and general; per-example overhead, and packing is your job anyway.</li>
+  <li><strong>Pre-tokenised flat binary shards</strong> read with <code>np.memmap</code>: 2 bytes per token, zero parse cost, random access in O(1). The standard for pretraining (nanoGPT, many production pretraining stacks).</li>
+</ul>
+
+<h3>Corpus, Tokeniser and Shards</h3>
+<ul>
+  <li><strong>Corpus</strong>: every docstring defined in every importable standard-library module. It is English technical prose with code fragments: small, varied and license-clean.</li>
+  <li><strong>Tokeniser</strong>: raw UTF-8 bytes (ids 0–255) plus one end-of-text id 256. Byte-level avoids an out-of-vocabulary problem and a training step, at the cost of about 4× longer sequences than BPE (Volume 3).</li>
+  <li><strong>Why <code>uint16</code></strong>: 257 ids do not fit in <code>uint8</code>. <code>uint16</code> covers vocabularies up to 65,535 (GPT-2's 50,257 fits); vocabularies of 100k+ need <code>uint32</code>.</li>
+  <li><strong>Packing</strong>: documents are concatenated with EOT between them into one stream. No padding is ever needed, and every position in every batch trains the model.</li>
+  <li><strong>Split by document</strong>: a hash of the module name decides the split, so the split is stable when modules are added or removed, and no document straddles it.</li>
+</ul>
+
+<figure class="listing">
+<figcaption><code>forge.data.shards</code>: build the corpus, tokenise to bytes and write uint16 memmap shards split by document.</figcaption>
+<pre><code># forge/data/shards.py
+import contextlib, hashlib, importlib, inspect, io, sys, warnings
+from pathlib import Path
+import numpy as np
+
+DATA = Path("/tmp/vol4/data"); DATA.mkdir(parents=True, exist_ok=True)
+EOT = 256                       # document separator; byte ids are 0..255
+SKIP = {"this", "antigravity", "idlelib", "tkinter", "turtle", "turtledemo"}
+
+def module_documents():
+    """Yield (module_name, text) with every docstring defined in that module."""
+    for name in sorted(sys.stdlib_module_names):
+        if name.startswith("_") or name in SKIP:
+            continue
+        try:
+            with warnings.catch_warnings(), contextlib.redirect_stdout(io.StringIO()):
+                warnings.simplefilter("ignore")
+                mod = importlib.import_module(name)
+        except Exception:
+            continue
+        docs = [inspect.getdoc(mod) or ""]
+        for obj in vars(mod).values():
+            if getattr(obj, "__module__", None) == name and inspect.getdoc(obj):
+                docs.append(inspect.getdoc(obj))
+        text = "\n\n".join(dict.fromkeys(d for d in docs if d))  # dedupe, keep order
+        if len(text) &gt; 200:
+            yield name, text
+
+def encode(text: str) -&gt; list[int]:        # byte-level tokeniser
+    return list(text.encode("utf-8"))
+
+def decode(ids) -&gt; str:
+    return bytes(i for i in ids if i &lt; 256).decode("utf-8", errors="replace")
+
+def is_val(name: str, frac=0.1) -&gt; bool:    # split by document, stable across runs
+    return int(hashlib.sha256(name.encode()).hexdigest(), 16) % 1000 &lt; frac * 1000
+
+splits = {"train": [], "val": []}
+n_docs = {"train": 0, "val": 0}
+for name, text in module_documents():
+    split = "val" if is_val(name) else "train"
+    splits[split] += encode(text) + [EOT]
+    n_docs[split] += 1
+
+for split, ids in splits.items():
+    arr = np.memmap(DATA / f"{split}.bin", dtype=np.uint16, mode="w+",
+                    shape=(len(ids),))
+    arr[:] = np.asarray(ids, dtype=np.uint16)
+    arr.flush()
+    print(f"{split:5s} docs={n_docs[split]:4d} tokens={len(ids):&gt;9,d} "
+          f"file={(DATA / f'{split}.bin').stat().st_size / 1e6:.2f} MB")</code></pre>
+</figure>
+<pre class="output">train docs= 158 tokens=  592,355 file=1.18 MB
+val   docs=  18 tokens=  103,414 file=0.21 MB</pre>
+
+<ul>
+  <li>About 0.6M training tokens: tiny by pretraining standards, which is why the model in Chapter 5 sees each token about four times and starts to overfit.</li>
+  <li>File size is exactly 2 bytes per token. A 10B-token corpus is 20 GB on disk and still costs nothing to "load".</li>
+</ul>
+
+<h3>Random-Window Batching</h3>
+<p>Each example is a window starting at a uniformly random offset. The target is the same window
+shifted by one token:</p>
+<div class="math">x = (t_i, \dots, t_{i+T-1}), \qquad y = (t_{i+1}, \dots, t_{i+T})</div>
+<p>One window therefore provides <span class="math">T</span> training signals, one per position, each
+conditioned on a different prefix length.</p>
+
+<figure class="listing">
+<figcaption>A deterministic random-window batcher over the memmap.</figcaption>
+<pre><code>import torch
+
+train_data = np.memmap(DATA / "train.bin", dtype=np.uint16, mode="r")
+val_data = np.memmap(DATA / "val.bin", dtype=np.uint16, mode="r")
+
+def get_batch(data, batch_size, block_size, gen, device="cpu"):
+    """Random windows; y is x shifted left by one token."""
+    ix = torch.randint(len(data) - block_size - 1, (batch_size,), generator=gen)
+    x = torch.stack([torch.from_numpy(data[i : i + block_size].astype(np.int64))
+                     for i in ix.tolist()])                        # (B, T)
+    y = torch.stack([torch.from_numpy(data[i + 1 : i + 1 + block_size].astype(np.int64))
+                     for i in ix.tolist()])                        # (B, T)
+    return x.to(device), y.to(device)
+
+gen = torch.Generator().manual_seed(0)
+x, y = get_batch(train_data, 4, 32, gen)
+print("x", tuple(x.shape), x.dtype, "| y", tuple(y.shape))
+print("x[0]:", repr(decode(x[0].tolist())))
+print("y[0]:", repr(decode(y[0].tolist())))
+gen_a = torch.Generator().manual_seed(0); gen_b = torch.Generator().manual_seed(0)
+print("same seed, same batch:",
+      torch.equal(get_batch(train_data, 4, 32, gen_a)[0],
+                  get_batch(train_data, 4, 32, gen_b)[0]))</code></pre>
+</figure>
+<pre class="output">x (4, 32) torch.int64 | y (4, 32)
+x[0]: 'ect all warnings to the logging '
+y[0]: 'ct all warnings to the logging p'
+same seed, same batch: True</pre>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Determinism comes from an explicit <code>torch.Generator</code> owned by the trainer, not from the global RNG. Its state is a few kilobytes and is saved in the checkpoint, which makes the data stream resumable (Chapter 6).</li>
+    <li>Random offsets mean windows cross document boundaries. The EOT token teaches the model that context before it is unrelated. Production stacks sometimes add document masking so attention cannot cross EOT; at small scale it rarely matters.</li>
+  </ul>
+</aside>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">Random windows (used here)</p>
+    <ul>
+      <li>Stateless apart from one RNG; trivially resumable.</li>
+      <li>No epoch bookkeeping; any shard size works.</li>
+    </ul></div>
+  <div class="cons"><p class="facet">Versus epoch-ordered chunks</p>
+    <ul>
+      <li>Some tokens are sampled twice and some not at all within an "epoch".</li>
+      <li>At very large scale, exact once-per-token coverage matters; there you shuffle chunk indices and save the cursor.</li>
+    </ul></div>
+</div>
+
+<ul class="failure-modes">
+  <li><strong>Off-by-one in the shift</strong>: <code>y = x</code> gives near-zero loss almost immediately (demonstrated in Chapter 9).</li>
+  <li><strong><code>int64</code> overflow avoided, <code>uint16</code> wrap-around not</strong>: a vocabulary larger than 65,535 silently wraps ids when written as <code>uint16</code>.</li>
+  <li><strong>Positional split leakage</strong>: splitting the stream at 90% puts the end of one document in validation and its start in training.</li>
+  <li><strong>Tokeniser drift</strong>: shards written with one tokeniser version and evaluated with another. Store the tokeniser hash next to the shards.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="model">The Model</h2>
+<p class="chapter-lede">The model is a GPT-2-shaped decoder: token and position embeddings, a stack
+of pre-norm Transformer blocks, a final LayerNorm and a language-model head tied to the token
+embedding. The parameter names deliberately match Hugging Face's GPT-2 so the export in Chapter 10
+is a rename-free copy.</p>
+
+<h3>Architecture</h3>
+<figure class="diagram">
+<pre class="ascii">idx (B, T) --wte--> (B, T, C)  +  wpe[pos] (T, C)
+              |
+              v   repeat n_layer times
+        +-----------------------------------------+
+        | x = x + Attn(LN1(x))   causal, n_head   |
+        | x = x + MLP(LN2(x))    C -> 4C -> C     |
+        +-----------------------------------------+
+              |
+              v
+          LN_f --> lm_head (C -> V, weight = wte) --> logits (B, T, V)</pre>
+<figcaption>The GPT forward pass. C is <code>n_embd</code>, V is <code>vocab_size</code>.</figcaption>
+</figure>
+
+<p>Each attention head computes, with a causal mask <span class="math">M</span> that is
+<span class="math">-\infty</span> above the diagonal:</p>
+<div class="math">\operatorname{Attn}(Q, K, V) = \operatorname{softmax}\!\Big(\frac{Q K^\top}{\sqrt{d_h}} + M\Big) V</div>
+<ul>
+  <li><code>F.scaled_dot_product_attention(..., is_causal=True)</code> implements this and dispatches to a fused kernel (FlashAttention on CUDA, a fused kernel on MPS), so the <span class="math">T \times T</span> matrix is never materialised in Python.</li>
+  <li>Pre-norm (LayerNorm inside the residual branch) keeps the residual stream an identity path, which is what makes deep stacks trainable without warmup tricks (Volume 2).</li>
+  <li>The optional <code>past</code> argument is the KV cache used in Chapter 7. With a cache, the single new query may attend to every cached key, so <code>is_causal</code> is switched off.</li>
+</ul>
+
+<figure class="listing">
+<figcaption><code>forge.model</code>: GPTConfig and the complete GPT model, with KV-cache support and a parameter count against <code>forge.compute</code>.</figcaption>
+<pre><code># forge/model.py
+import math
+from dataclasses import dataclass, asdict
+import torch.nn as nn
+import torch.nn.functional as F
+
+@dataclass
+class GPTConfig:
+    vocab_size: int = 257      # 256 bytes + EOT
+    block_size: int = 128      # maximum context length
+    n_layer: int = 4
+    n_head: int = 4
+    n_embd: int = 192
+    dropout: float = 0.0
+    bias: bool = True          # GPT-2 layout, so Chapter 10 can export it
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        assert cfg.n_embd % cfg.n_head == 0
+        self.n_head, self.dropout = cfg.n_head, cfg.dropout
+        self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=cfg.bias)
+        self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
+
+    def forward(self, x, past=None):
+        B, T, C = x.shape
+        q, k, v = self.c_attn(x).split(C, dim=2)
+        # (B, T, C) -&gt; (B, H, T, hd)
+        q, k, v = (t.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+                   for t in (q, k, v))
+        if past is not None:                        # KV cache: prepend old keys/values
+            k = torch.cat([past[0], k], dim=2)
+            v = torch.cat([past[1], v], dim=2)
+        y = F.scaled_dot_product_attention(
+            q, k, v, is_causal=past is None,        # one new query sees all the cache
+            dropout_p=self.dropout if self.training else 0.0)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
+        return self.c_proj(y), (k, v)
+
+class MLP(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.c_fc = nn.Linear(cfg.n_embd, 4 * cfg.n_embd, bias=cfg.bias)
+        self.act = nn.GELU(approximate="tanh")
+        self.c_proj = nn.Linear(4 * cfg.n_embd, cfg.n_embd, bias=cfg.bias)
+        self.drop = nn.Dropout(cfg.dropout)
+
+    def forward(self, x):
+        return self.drop(self.c_proj(self.act(self.c_fc(x))))
+
+class Block(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(cfg.n_embd, bias=cfg.bias)
+        self.attn = CausalSelfAttention(cfg)
+        self.ln_2 = nn.LayerNorm(cfg.n_embd, bias=cfg.bias)
+        self.mlp = MLP(cfg)
+
+    def forward(self, x, past=None):                # pre-norm residual block
+        a, present = self.attn(self.ln_1(x), past)
+        x = x + a
+        x = x + self.mlp(self.ln_2(x))
+        return x, present
+
+class GPT(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.transformer = nn.ModuleDict(dict(
+            wte=nn.Embedding(cfg.vocab_size, cfg.n_embd),
+            wpe=nn.Embedding(cfg.block_size, cfg.n_embd),
+            drop=nn.Dropout(cfg.dropout),
+            h=nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer)),
+            ln_f=nn.LayerNorm(cfg.n_embd, bias=cfg.bias)))
+        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight   # weight tying
+        self.apply(self._init_weights)
+        for name, p in self.named_parameters():             # scaled residual init
+            if name.endswith("c_proj.weight"):
+                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
+
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+        if isinstance(m, nn.Linear) and m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+    def forward(self, idx, targets=None, past=None):
+        B, T = idx.shape
+        t0 = 0 if past is None else past[0][0].size(2)      # tokens already cached
+        assert t0 + T &lt;= self.cfg.block_size, "sequence longer than block_size"
+        pos = torch.arange(t0, t0 + T, device=idx.device)
+        x = self.transformer.drop(self.transformer.wte(idx) + self.transformer.wpe(pos))
+        presents = []
+        for i, block in enumerate(self.transformer.h):
+            x, present = block(x, None if past is None else past[i])
+            presents.append(present)
+        logits = self.lm_head(self.transformer.ln_f(x))     # (B, T, V)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                   ignore_index=-100)
+        return logits, loss, presents
+
+cfg = GPTConfig()
+torch.manual_seed(1337)
+model = GPT(cfg)
+n_total = sum(p.numel() for p in model.parameters())   # tied weight counted once
+n_pos = model.transformer.wpe.weight.numel()
+d, L, V = cfg.n_embd, cfg.n_layer, cfg.vocab_size
+formula = L * (12 * d * d + 13 * d) + V * d + cfg.block_size * d + 2 * d
+print(f"parameters: {n_total:,} (formula {formula:,})")
+print(f"non-embedding: {n_total - n_pos - V * d:,}  per block: {12*d*d + 13*d:,}")
+print("tied:",
+      model.lm_head.weight.data_ptr() == model.transformer.wte.weight.data_ptr())</code></pre>
+</figure>
+<pre class="output">parameters: 1,853,760 (formula 1,853,760)
+non-embedding: 1,779,840  per block: 444,864
+tied: True</pre>
+
+<h3>Parameter Count</h3>
+<p>Per block, with width <span class="math">d</span> and biases:</p>
+<div class="math">N_{\text{block}} = \underbrace{3d^2 + 3d}_{\text{c\_attn}} + \underbrace{d^2 + d}_{\text{attn c\_proj}} + \underbrace{4d^2 + 4d}_{\text{c\_fc}} + \underbrace{4d^2 + d}_{\text{mlp c\_proj}} + \underbrace{4d}_{\text{2 LayerNorms}} = 12d^2 + 13d</div>
+<div class="math">N = L(12d^2 + 13d) + Vd + T_{\max} d + 2d</div>
+<ul>
+  <li>The formula matches <code>numel</code> exactly, which is the check that tying worked: without tying, <code>lm_head</code> would add another <span class="math">Vd = 49{,}344</span>.</li>
+  <li>At this size the embeddings are 4% of parameters. At GPT-2 small (<span class="math">V = 50{,}257</span>, <span class="math">d = 768</span>) the tied embedding is 31% of 124M, which is why tying matters more for small models with large vocabularies.</li>
+</ul>
+
+<h3>Initialisation</h3>
+<ul>
+  <li>All weights <span class="math">\mathcal{N}(0, 0.02^2)</span>, biases zero (GPT-2).</li>
+  <li>Residual output projections (<code>c_proj</code>) use <span class="math">\sigma = 0.02 / \sqrt{2L}</span>. Each block adds two branches to the residual stream; scaling keeps its variance roughly constant with depth instead of growing as <span class="math">2L</span>.</li>
+  <li>Small logits at initialisation mean a near-uniform prediction, so the first loss should be close to <span class="math">\ln V</span>. This is the first sanity check of every run.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Check the loss at initialisation against ln V, and show ignore_index masking.</figcaption>
+<pre><code>gen = torch.Generator().manual_seed(0)
+x, y = get_batch(train_data, 32, cfg.block_size, gen)
+logits, loss, _ = model(x, y)
+print("logits", tuple(logits.shape), f"| loss at init {loss.item():.4f}",
+      f"| ln(V) = {math.log(cfg.vocab_size):.4f}")
+y_masked = y.clone(); y_masked[:, :64] = -100            # score only the second half
+print(f"loss with first 64 positions ignored: {model(x, y_masked)[1].item():.4f}")
+p = F.softmax(logits.float(), -1)
+print(f"max prob at init: {p.max().item():.4f}  (uniform = {1/cfg.vocab_size:.4f})")</code></pre>
+</figure>
+<pre class="output">logits (32, 128, 257) | loss at init 5.5193 | ln(V) = 5.5491
+loss with first 64 positions ignored: 5.5113
+max prob at init: 0.0258  (uniform = 0.0039)</pre>
+
+<ul>
+  <li>5.52 versus 5.55: correct. A first loss of 8 or 20 means logits are too large (bad init or a missing LayerNorm); a first loss far below <span class="math">\ln V</span> means information is leaking from the targets.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>Weight tying saves parameters and usually helps small models (Press and Wolf, 2016), but it forces input and output embeddings to share geometry. Many large models (Llama 2 and 3 at 7B and above) untie them.</li>
+    <li>Learned absolute positions (<code>wpe</code>) are simple and exportable to GPT-2 format, but cannot extrapolate beyond <code>block_size</code>. RoPE (Volume 2) is the modern default.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="optim">Loss, Optimiser and Schedule</h2>
+<p class="chapter-lede">The loss, the optimiser's parameter groups and the learning-rate schedule
+decide more about the final quality of a small model than any architectural choice in Chapter 3.
+Each has one or two details that are silently wrong in a surprising number of codebases.</p>
+
+<h3>Cross-Entropy</h3>
+<div class="math">\mathcal{L} = -\frac{1}{|\mathcal{M}|} \sum_{(b,t) \in \mathcal{M}} \log \operatorname{softmax}(z_{b,t})_{y_{b,t}}, \qquad \mathcal{M} = \{(b,t) : y_{b,t} \neq -100\}</div>
+<ul>
+  <li><strong><code>ignore_index=-100</code></strong> removes positions from both numerator and denominator. Use it for padding, prompt tokens in supervised fine-tuning (Volume 8), and the already-scored prefix in sliding-window perplexity (Chapter 8).</li>
+  <li><strong>Mean over tokens, not sequences</strong>: with padding, a per-sequence mean over-weights short sequences. With gradient accumulation and variable token counts, sum the losses and divide by total tokens.</li>
+  <li><strong>Label smoothing</strong> (<code>label_smoothing=0.1</code>) mixes the one-hot target with uniform. It helps classification calibration but is rarely used in LM pretraining because it puts a floor under the loss and distorts perplexity.</li>
+  <li>Compute the loss in fp32 even under mixed precision: log-softmax over a large vocabulary in bf16 loses precision.</li>
+</ul>
+
+<h3>AdamW</h3>
+<p>For gradient <span class="math">g_t</span>, learning rate <span class="math">\eta_t</span> and decay <span class="math">\lambda</span>:</p>
+<div class="math">m_t = \beta_1 m_{t-1} + (1-\beta_1) g_t, \quad v_t = \beta_2 v_{t-1} + (1-\beta_2) g_t^2</div>
+<div class="math">\theta_t = \theta_{t-1} - \eta_t \Big( \frac{\hat m_t}{\sqrt{\hat v_t} + \epsilon} + \lambda\, \theta_{t-1} \Big), \qquad \hat m_t = \frac{m_t}{1-\beta_1^t},\; \hat v_t = \frac{v_t}{1-\beta_2^t}</div>
+<ul>
+  <li>Decay is <em>decoupled</em> (Loshchilov and Hutter, 2017): it is applied to the weights directly, not added to the gradient where Adam's normalisation would rescale it.</li>
+  <li><span class="math">\beta_2 = 0.95</span> rather than 0.999 is the LLM convention: the second moment adapts faster to the loss spikes that large-batch language modelling produces.</li>
+  <li>Memory: two fp32 moments per parameter, so the optimiser state is twice the model. That is why the checkpoint in Chapter 6 is about 3× the weights.</li>
+</ul>
+
+<h3>Weight-Decay Groups</h3>
+<ul>
+  <li>Decay matrices and embeddings (<code>dim &gt;= 2</code>): they carry the capacity that regularisation should constrain.</li>
+  <li>Do not decay biases and LayerNorm gains (<code>dim &lt; 2</code>): shrinking a LayerNorm gain towards zero shrinks the whole activation, which fights the optimiser for no benefit.</li>
+  <li><code>named_parameters()</code> deduplicates the tied weight, so it is decayed once. Building groups from <code>state_dict()</code> would list it twice.</li>
+</ul>
+
+<h3>Learning-Rate Schedules</h3>
+<p>Linear warmup for <span class="math">W</span> steps, then cosine decay from <span class="math">\eta_{\max}</span> to <span class="math">\eta_{\min}</span> at step <span class="math">S</span>:</p>
+<div class="math">\eta_t = \begin{cases} \eta_{\max} \dfrac{t+1}{W} &amp; t &lt; W \\[2mm] \eta_{\min} + \tfrac{1}{2}\big(1 + \cos\big(\pi \tfrac{t - W}{S - W}\big)\big)(\eta_{\max} - \eta_{\min}) &amp; W \le t \le S \end{cases}</div>
+<ul>
+  <li><strong>Warmup</strong> (Goyal et al., 2017) lets Adam's second-moment estimates settle before large steps are taken; without it, early updates are huge because <span class="math">\hat v</span> is noisy.</li>
+  <li><strong>Warmup–stable–decay (WSD)</strong> holds <span class="math">\eta_{\max}</span> and decays only in the last 10–20% of steps. Any stable-phase checkpoint can be branched and cooled, so one run serves several token budgets. Cosine needs the total step count fixed up front.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>AdamW with decay and no-decay groups; cosine and WSD schedules.</figcaption>
+<pre><code>def configure_optimizer(model, lr, weight_decay, betas=(0.9, 0.95)):
+    params = {n: p for n, p in model.named_parameters() if p.requires_grad}
+    decay = [p for p in params.values() if p.dim() &gt;= 2]      # matmuls, embeddings
+    no_decay = [p for p in params.values() if p.dim() &lt; 2]    # biases, LayerNorm
+    groups = [{"params": decay, "weight_decay": weight_decay},
+              {"params": no_decay, "weight_decay": 0.0}]
+    print(f"decay: {len(decay)} tensors, {sum(p.numel() for p in decay):,} params | "
+          f"no-decay: {len(no_decay)} tensors, {sum(p.numel() for p in no_decay):,}")
+    return torch.optim.AdamW(groups, lr=lr, betas=betas, eps=1e-8)
+
+def cosine_lr(step, max_lr, min_lr, warmup, total):
+    if step &lt; warmup:
+        return max_lr * (step + 1) / warmup
+    if step &gt;= total:
+        return min_lr
+    ratio = (step - warmup) / (total - warmup)
+    return min_lr + 0.5 * (1 + math.cos(math.pi * ratio)) * (max_lr - min_lr)
+
+def wsd_lr(step, max_lr, min_lr, warmup, total, decay_frac=0.2):
+    decay_start = int(total * (1 - decay_frac))
+    if step &lt; warmup:
+        return max_lr * (step + 1) / warmup
+    if step &lt; decay_start:
+        return max_lr
+    ratio = min(1.0, (step - decay_start) / (total - decay_start))
+    return max_lr - ratio * (max_lr - min_lr)            # linear cool-down
+
+opt = configure_optimizer(model, 3e-3, 0.1)
+for s in [0, 49, 100, 300, 500, 599]:
+    print(f"step {s:3d}  cosine {cosine_lr(s, 3e-3, 3e-4, 50, 600):.2e}"
+          f"  wsd {wsd_lr(s, 3e-3, 3e-4, 50, 600):.2e}")</code></pre>
+</figure>
+<pre class="output">decay: 18 tensors, 1,843,392 params | no-decay: 34 tensors, 10,368
+step   0  cosine 6.00e-05  wsd 6.00e-05
+step  49  cosine 3.00e-03  wsd 3.00e-03
+step 100  cosine 2.95e-03  wsd 3.00e-03
+step 300  cosine 1.84e-03  wsd 3.00e-03
+step 500  cosine 5.14e-04  wsd 2.55e-03
+step 599  cosine 3.00e-04  wsd 3.22e-04</pre>
+
+<h3>Gradient Clipping and Accumulation</h3>
+<div class="math">g \leftarrow g \cdot \min\Big(1, \frac{c}{\lVert g \rVert_2}\Big)</div>
+<ul>
+  <li>Clipping to global norm <span class="math">c = 1.0</span> bounds the step during rare spikes (a bad batch, a near-singular attention pattern). Log <span class="math">\lVert g\rVert</span> before clipping: if it is <em>always</em> above <span class="math">c</span>, clipping has become a hidden learning-rate reduction.</li>
+  <li>Accumulation runs <span class="math">k</span> micro-batches, dividing each loss by <span class="math">k</span>, before one optimiser step. The effective batch is <span class="math">k \times B</span> sequences at the memory cost of <span class="math">B</span>. Clip after the last micro-batch, never inside the loop.</li>
+</ul>
+
+<ul class="failure-modes">
+  <li>Forgetting to divide by <span class="math">k</span>: the gradient is <span class="math">k</span> times too large, equivalent to multiplying the learning rate by <span class="math">k</span>.</li>
+  <li>Calling <code>scheduler.step()</code> per micro-batch instead of per optimiser step: warmup ends <span class="math">k</span> times too early.</li>
+  <li>Decaying LayerNorm gains: slow, unexplained underperformance rather than a crash.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="training">The Training Loop</h2>
+<p class="chapter-lede">The loop itself is short: sample, forward, backward, clip, step, schedule.
+What makes it production-grade is everything around it: fixed evaluation batches, honest throughput
+numbers, and state that can be saved and restored.</p>
+
+<h3>Simple Version</h3>
+<div class="frame simple">
+<pre class="ascii">for step in range(max_steps):
+    x, y = get_batch()
+    loss = model(x, y); loss.backward()
+    opt.step(); opt.zero_grad()</pre>
+</div>
+
+<h3>Production Version</h3>
+<ul>
+  <li>A <code>Trainer</code> object owns every piece of mutable state (model, optimiser, scheduler, data RNG, step), so Chapter 6 can save and restore it as a unit.</li>
+  <li>Evaluation uses a fixed-seed generator, so train and validation numbers at step 100 and step 600 are measured on identical batches and are directly comparable.</li>
+  <li>Throughput counts training time only, excluding evaluation, and counts tokens as <code>batch × accum × block_size</code>.</li>
+</ul>
+
+<figure class="listing">
+<figcaption><code>forge.train</code>: TrainConfig, fixed-batch evaluation and the Trainer with accumulation and clipping.</figcaption>
+<pre><code># forge/train.py
+import time
+
+@dataclass
+class TrainConfig:
+    batch_size: int = 32
+    grad_accum: int = 1
+    max_steps: int = 600
+    warmup: int = 50
+    max_lr: float = 3e-3
+    min_lr: float = 3e-4
+    weight_decay: float = 0.1
+    grad_clip: float = 1.0
+    eval_every: int = 100
+    eval_iters: int = 20
+    seed: int = 1337
+
+@torch.no_grad()
+def estimate_loss(model, cfg, tc):
+    model.eval()
+    device, out = next(model.parameters()).device, {}
+    for split, data in (("train", train_data), ("val", val_data)):
+        g = torch.Generator().manual_seed(0)              # identical eval batches
+        losses = [model(*get_batch(data, tc.batch_size, cfg.block_size, g, device))[1]
+                  .item() for _ in range(tc.eval_iters)]
+        out[split] = sum(losses) / len(losses)
+    model.train()
+    return out
+
+class Trainer:
+    def __init__(self, model, cfg: GPTConfig, tc: TrainConfig):
+        self.model, self.cfg, self.tc = model, cfg, tc
+        self.opt = configure_optimizer(model, tc.max_lr, tc.weight_decay)
+        self.sched = torch.optim.lr_scheduler.LambdaLR(self.opt, lambda s: cosine_lr(
+            s, tc.max_lr, tc.min_lr, tc.warmup, tc.max_steps) / tc.max_lr)
+        self.gen = torch.Generator().manual_seed(tc.seed)  # data order
+        self.step = 0
+        self.device = next(model.parameters()).device
+
+    def train_step(self):
+        self.model.train()
+        loss_sum = 0.0
+        for _ in range(self.tc.grad_accum):
+            x, y = get_batch(train_data, self.tc.batch_size, self.cfg.block_size,
+                             self.gen, self.device)
+            _, loss, _ = self.model(x, y)
+            (loss / self.tc.grad_accum).backward()   # average over micro-batches
+            loss_sum += loss.item() / self.tc.grad_accum
+        norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                                              self.tc.grad_clip)
+        self.opt.step()
+        self.sched.step()
+        self.opt.zero_grad(set_to_none=True)
+        self.step += 1
+        return loss_sum, norm.item()
+
+    def fit(self, n_steps, log_every=50, verbose=True):
+        tok_per_step = self.tc.batch_size * self.tc.grad_accum * self.cfg.block_size
+        history, t_train = [], 0.0
+        end = min(self.step + n_steps, self.tc.max_steps)
+        while self.step &lt; end:
+            t0 = time.perf_counter()
+            loss, norm = self.train_step()   # .item() syncs the device each step
+            t_train += time.perf_counter() - t0
+            history.append(loss)
+            if verbose and (self.step % log_every == 0 or self.step == 1):
+                lr = self.sched.get_last_lr()[0]
+                msg = (f"step {self.step:4d} loss {loss:.4f} |g| {norm:5.2f} "
+                       f"lr {lr:.2e} "
+                       f"tok/s {tok_per_step * len(history) / t_train:,.0f}")
+                if self.step % self.tc.eval_every == 0:
+                    ev = estimate_loss(self.model, self.cfg, self.tc)
+                    msg += f" | train {ev['train']:.4f} val {ev['val']:.4f}"
+                print(msg)
+        return history, t_train</code></pre>
+</figure>
+<pre class="output"></pre>
+
+<h3>Devices and Throughput</h3>
+<figure class="listing">
+<figcaption>Time a training step on CPU and MPS with correct synchronisation.</figcaption>
+<pre><code>def time_steps(device, n=10, warmup=3, B=32):
+    torch.manual_seed(0)
+    m = GPT(cfg).to(device)
+    o = torch.optim.AdamW(m.parameters(), lr=1e-3)
+    g = torch.Generator().manual_seed(0)
+    sync = torch.mps.synchronize if device == "mps" else (lambda: None)
+    for i in range(warmup + n):
+        if i == warmup:
+            sync(); t0 = time.perf_counter()
+        x, y = get_batch(train_data, B, cfg.block_size, g, device)
+        m(x, y)[1].backward()
+        o.step(); o.zero_grad(set_to_none=True)
+    sync()                       # MPS is asynchronous: time only after it drains
+    return (time.perf_counter() - t0) / n
+
+for device in ["cpu"] + (["mps"] if torch.backends.mps.is_available() else []):
+    s = time_steps(device)
+    print(f"{device}: {s * 1e3:6.1f} ms/step  {32 * cfg.block_size / s:&gt;8,.0f} tok/s")</code></pre>
+</figure>
+<pre class="output">cpu:  155.8 ms/step    26,287 tok/s
+mps:   71.9 ms/step    56,993 tok/s</pre>
+<ul>
+  <li>MPS is about 2× faster than the CPU here. Kernels are asynchronous, so without <code>torch.mps.synchronize()</code> (or <code>torch.cuda.synchronize()</code>) you time the kernel launches, not the work.</li>
+  <li>At this tiny size the GPU is under-used: per-step launch overhead dominates. Throughput per parameter improves as the model grows.</li>
+</ul>
+
+<h3>A Real Run</h3>
+<figure class="listing">
+<figcaption>Train the 1.85M-parameter model for 600 steps (2.46M tokens) on MPS.</figcaption>
+<pre><code>torch.manual_seed(1337)
+device = "mps" if torch.backends.mps.is_available() else "cpu"
+model = GPT(cfg).to(device)
+tc = TrainConfig()
+trainer = Trainer(model, cfg, tc)
+history, t_train = trainer.fit(tc.max_steps)
+n_params = sum(p.numel() for p in model.parameters())
+tokens = tc.max_steps * tc.batch_size * cfg.block_size
+print(f"trained {tokens:,} tokens in {t_train:.0f}s; "
+      f"~{6 * n_params * tokens / t_train / 1e9:.0f} GFLOP/s by the 6ND rule")</code></pre>
+</figure>
+<pre class="output">decay: 18 tensors, 1,843,392 params | no-decay: 34 tensors, 10,368
+step    1 loss 5.5319 |g|  8.94 lr 1.20e-04 tok/s 36,255
+step   50 loss 2.7931 |g|  0.66 lr 3.00e-03 tok/s 50,059
+step  100 loss 2.6650 |g|  0.64 lr 2.95e-03 tok/s 48,804 | train 2.6410 val 2.6925
+step  150 loss 2.5507 |g|  0.82 lr 2.79e-03 tok/s 49,268
+step  200 loss 2.3063 |g|  1.93 lr 2.53e-03 tok/s 49,638 | train 2.3515 val 2.4330
+step  250 loss 2.1242 |g|  1.68 lr 2.21e-03 tok/s 49,752
+step  300 loss 2.0003 |g|  1.26 lr 1.84e-03 tok/s 49,733 | train 1.9666 val 2.0947
+step  350 loss 1.8513 |g|  1.29 lr 1.46e-03 tok/s 49,969
+step  400 loss 1.8518 |g|  1.08 lr 1.09e-03 tok/s 49,971 | train 1.7293 val 1.8978
+step  450 loss 1.6246 |g|  1.13 lr 7.66e-04 tok/s 49,718
+step  500 loss 1.6880 |g|  1.14 lr 5.14e-04 tok/s 49,794 | train 1.5923 val 1.7915
+step  550 loss 1.5386 |g|  1.25 lr 3.55e-04 tok/s 49,495
+step  600 loss 1.5338 |g|  1.25 lr 3.00e-04 tok/s 49,082 | train 1.5209 val 1.7369
+trained 2,457,600 tokens in 50s; ~546 GFLOP/s by the 6ND rule</pre>
+
+<p class="facet">Reading the curve</p>
+<ul>
+  <li><strong>Throughput</strong> is a steady ~49k tokens/s. An earlier run of the same listing, with other work on the machine, throttled from 48k to 28k tokens/s: always report sustained throughput from a long run on an otherwise idle machine.</li>
+  <li><strong>Steps 1–50</strong>: loss falls from <span class="math">\ln V</span> to about 2.8 as the model learns byte frequencies and common bigrams. The gradient norm drops from ~9 to below 1.</li>
+  <li><strong>Plateau around 2.6–2.7</strong> (steps 50–150): the model has the unigram and bigram statistics and has not yet learned to use attention to copy words from context. This "induction head" plateau is typical of small models (Volume 2).</li>
+  <li><strong>Steps 150–600</strong>: steady improvement as the learning rate decays. The final train loss is below validation: with only 0.6M unique training tokens seen four times, the model begins to memorise.</li>
+</ul>
+
+<h3>Model FLOPs Utilisation</h3>
+<div class="math">\text{MFU} = \frac{6 N \cdot \text{tokens/s}}{\text{peak FLOP/s}}</div>
+<ul>
+  <li>The 6N rule ignores attention FLOPs (<span class="math">12 L T d</span> per token), which are 12% here at <span class="math">T = 128</span> and grow with context length.</li>
+  <li>About 0.55 TFLOP/s against an M2 GPU fp32 peak of roughly 3.6 TFLOP/s gives an MFU of about 15% <span class="evidence inferred">Inferred</span>. Good large-scale CUDA training reaches 40–55%.</li>
+</ul>
+
+<h3>Mixed Precision</h3>
+<ul>
+  <li>On CUDA (Ampere and later) wrap the forward pass in <code>torch.autocast("cuda", dtype=torch.bfloat16)</code>. bf16 has fp32's exponent range, so no loss scaling is needed; fp16 needs <code>GradScaler</code>.</li>
+  <li>On MPS, autocast to fp16/bf16 is available in recent PyTorch but speed-ups on small models are inconsistent; measure with Listing 5.2's harness before adopting it.</li>
+  <li>Keep master weights, optimiser moments and the loss in fp32. Only matmul inputs are cast.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Why It Is Complicated</span>
+  <ul>
+    <li>Each <code>loss.item()</code> forces a device synchronisation. At large scale, log every N steps and accumulate the loss on the device instead.</li>
+    <li><code>torch.compile</code> fuses kernels for 1.3–2× speed-ups on CUDA, at the cost of compile time and harder debugging. Add it after the loop is correct.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="checkpointing">Checkpointing and Resumption</h2>
+<p class="chapter-lede">A training job that cannot resume exactly is a job whose results you cannot
+trust after its first crash. The test is strict and cheap: train N steps straight, train N/2, save,
+kill, load, train N/2, and require bit-identical losses.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Saving only <code>model.state_dict()</code> looks like it works: training continues and the loss
+  looks fine. But Adam's moments restart at zero (a hidden warmup spike), the schedule restarts at
+  step 0 (a second warmup), and the data order repeats from the beginning (the model re-sees data).
+  Each error is small; together they make resumed runs incomparable with uninterrupted ones.</p>
+</div>
+
+<table>
+  <caption>What a checkpoint must contain, and the symptom when it is missing.</caption>
+  <thead><tr><th>State</th><th>Symptom if missing</th></tr></thead>
+  <tbody>
+    <tr><td>Model weights</td><td>Training restarts from scratch</td></tr>
+    <tr><td>Optimiser state (<span class="math">m, v</span>, step counts)</td><td>Loss spike after resume; effective re-warmup</td></tr>
+    <tr><td>Scheduler state and global step</td><td>Learning rate jumps; warmup repeats</td></tr>
+    <tr><td>Data RNG / cursor</td><td>Same batches seen again; silent overfitting</td></tr>
+    <tr><td>Torch (and CUDA) RNG</td><td>Different dropout masks; non-identical but plausible curves</td></tr>
+    <tr><td>Configs and code version</td><td>Checkpoint cannot be rebuilt, or is rebuilt with a different architecture</td></tr>
+  </tbody>
+</table>
+
+<h3>Atomic Writes</h3>
+<ul>
+  <li>Write to <code>path.tmp</code>, <code>fsync</code>, then <code>os.replace</code>. The rename is atomic on POSIX, so a crash leaves either the old checkpoint or the new one, never a truncated file.</li>
+  <li>Keep the last K checkpoints plus the best-validation one. A checkpoint written just before a loss divergence is often useless.</li>
+  <li>Load with <code>weights_only=True</code> (the default since PyTorch 2.6). Unpickling arbitrary objects executes code; restricting checkpoints to tensors and primitive containers keeps them safe to load from others.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Save and load full training state atomically, and test exact resumption.</figcaption>
+<pre><code>import os
+CKPT = Path("/tmp/vol4/ckpt"); CKPT.mkdir(exist_ok=True)
+
+def save_checkpoint(tr: Trainer, path: Path):
+    state = {
+        "model": tr.model.state_dict(),
+        "optimizer": tr.opt.state_dict(),
+        "scheduler": tr.sched.state_dict(),
+        "step": tr.step,
+        "data_rng": tr.gen.get_state(),           # position in the data stream
+        "torch_rng": torch.get_rng_state(),       # dropout and sampling
+        "model_config": asdict(tr.cfg),
+        "train_config": asdict(tr.tc),
+    }
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(state, tmp)
+    with open(tmp, "rb") as f:
+        os.fsync(f.fileno())                      # bytes are on disk ...
+    os.replace(tmp, path)                         # ... before the atomic rename
+
+def load_checkpoint(path: Path, device="cpu") -&gt; Trainer:
+    state = torch.load(path, map_location=device, weights_only=True)
+    cfg, tc = GPTConfig(**state["model_config"]), TrainConfig(**state["train_config"])
+    tr = Trainer(GPT(cfg).to(device), cfg, tc)
+    tr.model.load_state_dict(state["model"])
+    tr.opt.load_state_dict(state["optimizer"])
+    tr.sched.load_state_dict(state["scheduler"])
+    tr.step = state["step"]
+    tr.gen.set_state(state["data_rng"])
+    torch.set_rng_state(state["torch_rng"])
+    return tr
+
+# Exact-resumption test: 40 steps straight vs 20 + save + load + 20.
+small = TrainConfig(max_steps=40, warmup=5, batch_size=8)
+torch.manual_seed(0)
+tr_a = Trainer(GPT(cfg), cfg, small)
+losses_a, _ = tr_a.fit(40, verbose=False)
+
+torch.manual_seed(0)
+tr_b = Trainer(GPT(cfg), cfg, small)
+losses_b, _ = tr_b.fit(20, verbose=False)
+save_checkpoint(tr_b, CKPT / "resume.pt")
+del tr_b                                          # simulate the process dying
+tr_c = load_checkpoint(CKPT / "resume.pt")
+losses_c, _ = tr_c.fit(20, verbose=False)
+
+resumed = losses_b + losses_c
+max_diff = max((pa - pc).abs().max().item() for pa, pc in
+               zip(tr_a.model.parameters(), tr_c.model.parameters()))
+print(f"checkpoint size: {(CKPT / 'resume.pt').stat().st_size / 1e6:.1f} MB")
+print("loss at step 21, straight vs resumed:",
+      f"{losses_a[20]:.6f}", f"{resumed[20]:.6f}")
+print("all 40 losses bit-identical:", losses_a == resumed)
+print("max |param difference| after 40 steps:", max_diff)
+save_checkpoint(trainer, CKPT / "main.pt")        # the 600-step model</code></pre>
+</figure>
+<pre class="output">decay: 18 tensors, 1,843,392 params | no-decay: 34 tensors, 10,368
+decay: 18 tensors, 1,843,392 params | no-decay: 34 tensors, 10,368
+decay: 18 tensors, 1,843,392 params | no-decay: 34 tensors, 10,368
+checkpoint size: 22.3 MB
+loss at step 21, straight vs resumed: 3.096003 3.096003
+all 40 losses bit-identical: True
+max |param difference| after 40 steps: 0.0</pre>
+
+<ul>
+  <li>Losses and parameters are bit-identical, the strongest possible result. The test runs on CPU, where kernels are deterministic. On CUDA, add <code>torch.use_deterministic_algorithms(True)</code> for the test and expect tiny differences in production runs with non-deterministic kernels (atomics in backward passes).</li>
+  <li>22 MB for 1.85M parameters: weights (7.4 MB fp32) plus two Adam moments (14.8 MB). Rule of thumb: a full fp32 AdamW checkpoint is about 12 bytes per parameter; a mixed-precision one about 16.</li>
+</ul>
+
+<aside class="callout security"><span class="title">Engineering Rule</span>
+  <ul>
+    <li>Never <code>torch.load(..., weights_only=False)</code> on a checkpoint you did not produce. Distribute weights as <code>safetensors</code> (Chapter 10).</li>
+  </ul>
+</aside>
+
+<ul class="failure-modes">
+  <li>Checkpoint written to a network filesystem without <code>fsync</code>: the rename lands before the data.</li>
+  <li>Data loader workers with their own RNGs (PyTorch <code>DataLoader</code> with <code>num_workers &gt; 0</code>) whose state is not captured: resumption is approximate.</li>
+  <li>Resuming with a changed <code>TrainConfig</code> (for example a larger <code>max_steps</code>): the cosine schedule changes shape mid-run. WSD avoids this.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="generation">Generation</h2>
+<p class="chapter-lede">Generation turns a next-token distribution into text by sampling repeatedly.
+The sampling rule changes output quality as much as a model size step; the implementation strategy
+(recompute versus cache) changes speed by an order of magnitude.</p>
+
+<h3>Sampling Strategies</h3>
+<table>
+  <caption>Decoding controls implemented in <code>sample_logits</code>.</caption>
+  <thead><tr><th>Strategy</th><th>Rule</th><th>Failure it addresses</th><th>Failure it causes</th></tr></thead>
+  <tbody>
+    <tr><td>Greedy</td><td><span class="math">\arg\max_i z_i</span></td><td>Randomness</td><td>Repetition loops</td></tr>
+    <tr><td>Temperature <span class="math">\tau</span></td><td><span class="math">\operatorname{softmax}(z / \tau)</span></td><td>Too flat or too sharp distribution</td><td>High <span class="math">\tau</span> samples the junk tail</td></tr>
+    <tr><td>Top-k</td><td>Keep the <span class="math">k</span> largest logits</td><td>Junk tail</td><td>Fixed <span class="math">k</span> ignores how confident the model is</td></tr>
+    <tr><td>Top-p (nucleus)</td><td>Smallest set with mass <span class="math">\ge p</span></td><td>Adapts the cut to the distribution</td><td>Flat distributions still admit many tokens</td></tr>
+    <tr><td>Min-p</td><td>Keep <span class="math">p_i \ge p_{\min} \cdot \max_j p_j</span></td><td>Scales the cut with the top token's confidence</td><td>One more hyperparameter</td></tr>
+    <tr><td>Repetition penalty</td><td>Divide positive logits of seen tokens by <span class="math">r</span></td><td>Loops</td><td>Penalises legitimately repeated tokens (names, code)</td></tr>
+  </tbody>
+</table>
+
+<p>Top-p keeps token <span class="math">i</span> (in descending order of probability) if the mass
+strictly before it is at most <span class="math">p</span>:</p>
+<div class="math">\text{keep}_i \iff \sum_{j &lt; i} p_{(j)} \le p</div>
+<p>which always keeps the top token, even when its own probability exceeds <span class="math">p</span>.</p>
+
+<figure class="listing">
+<figcaption><code>forge.generate</code>: sample_logits with greedy, temperature, top-k, top-p and min-p, and a naive generator with a stop token. Repetition penalty is left as an exercise (row in the table above).</figcaption>
+<pre><code># forge/generate.py
+model = model.to("cpu").eval()
+
+def sample_logits(logits, temperature=1.0, top_k=None, top_p=None, min_p=None,
+                  gen=None):
+    """logits: (B, V) -&gt; next token ids (B, 1)."""
+    if temperature == 0.0:
+        return logits.argmax(dim=-1, keepdim=True)            # greedy
+    logits = logits / temperature
+    if top_k is not None:
+        kth = torch.topk(logits, min(top_k, logits.size(-1))).values[:, [-1]]
+        logits = logits.masked_fill(logits &lt; kth, float("-inf"))
+    if top_p is not None and top_p &lt; 1.0:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+        probs = F.softmax(sorted_logits, dim=-1)
+        # drop a token if the mass *before* it already exceeds top_p
+        drop = (probs.cumsum(dim=-1) - probs) &gt; top_p
+        sorted_logits = sorted_logits.masked_fill(drop, float("-inf"))
+        logits = torch.full_like(logits, float("-inf")).scatter(1, sorted_idx,
+                                                                 sorted_logits)
+    if min_p is not None:
+        probs = F.softmax(logits, dim=-1)
+        floor = min_p * probs.max(dim=-1, keepdim=True).values
+        logits = logits.masked_fill(probs &lt; floor, float("-inf"))
+    return torch.multinomial(F.softmax(logits, dim=-1), 1, generator=gen)
+
+@torch.no_grad()
+def generate(model, idx, max_new_tokens, stop_id=EOT, **sampling):
+    for _ in range(max_new_tokens):
+        idx_cond = idx[:, -model.cfg.block_size:]            # crop to the context
+        logits, _, _ = model(idx_cond)                         # full recompute
+        nxt = sample_logits(logits[:, -1, :], **sampling)
+        idx = torch.cat([idx, nxt], dim=1)
+        if (nxt == stop_id).all():
+            break
+    return idx
+
+prompt = torch.tensor([encode("Return the number of ")])
+for name, kw in [("greedy", dict(temperature=0.0)),
+                 ("T=0.8", dict(temperature=0.8)),
+                 ("top-k=20", dict(temperature=1.0, top_k=20)),
+                 ("top-p=0.9", dict(temperature=1.0, top_p=0.9)),
+                 ("min-p=0.1", dict(temperature=1.0, min_p=0.1))]:
+    g = torch.Generator().manual_seed(42)
+    out = generate(model, prompt, 80, gen=g, **kw)
+    print(f"{name:9s} | {decode(out[0].tolist())!r}")</code></pre>
+</figure>
+<pre class="output">greedy    | 'Return the number of the compression the compile of the set the set the compile of the set the set th'
+T=0.8     | 'Return the number of parse the normaticmular\nexecTestem beended argument specified for to be usignal '
+top-k=20  | 'Return the number of pars freences\n    module set dumport errors.  A linespecified for to be using a '
+top-p=0.9 | 'Return the number of pars frame to part or error that be integer.\n\nContens is that for to at using a '
+min-p=0.1 | 'Return the number of the method by part or error that be integer.\n\nContens is that for to an using ex'</pre>
+
+<ul>
+  <li>Greedy decoding collapses into "the set the set the compile of the set the set", the classic repetition loop of a weak model under argmax.</li>
+  <li>Sampled outputs are docstring-shaped (sentences, blank lines, "is used", "attribute") with invented words, as expected from 2.5M tokens of training.</li>
+  <li>Stop conditions in production: EOT id, a stop string (checked on decoded text, because a stop string can span tokens), a maximum length, and a timeout.</li>
+</ul>
+
+<h3>The KV-Cached Generator</h3>
+<div class="frame problem">
+  <p>The naive generator recomputes attention keys and values for the entire prefix at every step:
+  generating <span class="math">n</span> tokens costs <span class="math">O(n^2)</span> token-forwards.
+  But in a causal model, the keys and values of past positions never change.</p>
+</div>
+<ul>
+  <li><strong>Prefill</strong>: run the prompt once, keep each layer's <span class="math">K, V</span> of shape <code>(B, H, T, d_h)</code>.</li>
+  <li><strong>Decode</strong>: feed only the new token; append its <span class="math">K, V</span> to the cache; attend with one query over all cached keys. Cost per step is <span class="math">O(1)</span> token-forwards plus <span class="math">O(T)</span> attention.</li>
+  <li>Positions come from the cache length (<code>t0</code> in <code>GPT.forward</code>), which is the easiest thing to get wrong.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>A KV-cached generator, verified against the naive one and timed.</figcaption>
+<pre><code>@torch.no_grad()
+def generate_kv(model, idx, max_new_tokens, stop_id=EOT, **sampling):
+    assert idx.size(1) + max_new_tokens &lt;= model.cfg.block_size  # no sliding window
+    logits, _, past = model(idx)                    # prefill: whole prompt at once
+    for _ in range(max_new_tokens):
+        nxt = sample_logits(logits[:, -1, :], **sampling)
+        idx = torch.cat([idx, nxt], dim=1)
+        if (nxt == stop_id).all():
+            break
+        logits, _, past = model(nxt, past=past)     # decode: one token, (B, 1)
+    return idx
+
+n_new = 100
+a = generate(model, prompt, n_new, stop_id=-1, temperature=0.0)
+b = generate_kv(model, prompt, n_new, stop_id=-1, temperature=0.0)
+print("greedy tokens identical:", torch.equal(a, b))
+ga, gb = torch.Generator().manual_seed(7), torch.Generator().manual_seed(7)
+sa = generate(model, prompt, n_new, stop_id=-1, top_p=0.9, gen=ga)
+sb = generate_kv(model, prompt, n_new, stop_id=-1, top_p=0.9, gen=gb)
+print("top-p samples identical (same seed):", torch.equal(sa, sb))
+full = model(a[:, :-1])[0][:, -1]
+_, _, past = model(a[:, :-2]); inc = model(a[:, -2:-1], past=past)[0][:, -1]
+print(f"max |logit diff| last position: {(full - inc).abs().max().item():.2e}")
+for fn in (generate, generate_kv):
+    t0 = time.perf_counter()
+    for _ in range(5):
+        fn(model, prompt, n_new, stop_id=-1, temperature=0.0)
+    print(f"{fn.__name__:12s} {5 * n_new / (time.perf_counter() - t0):7.0f} tok/s")
+k0 = past[0][0]                                    # (B, H, T, hd) for layer 0
+print("layer-0 K cache:", tuple(k0.shape), "| per token (K+V, all layers, fp32):",
+      2 * cfg.n_layer * cfg.n_embd * k0.element_size(), "bytes")</code></pre>
+</figure>
+<pre class="output">greedy tokens identical: True
+top-p samples identical (same seed): True
+max |logit diff| last position: 9.54e-06
+generate         379 tok/s
+generate_kv     1566 tok/s
+layer-0 K cache: (1, 4, 119, 48) | per token (K+V, all layers, fp32): 6144 bytes</pre>
+
+<ul>
+  <li>Identical greedy tokens and identical seeded samples: the cache is a pure optimisation. Logit differences of <span class="math">10^{-5}</span> come from different summation orders in fp32 and are harmless here; in bf16 they can flip a near-tie argmax.</li>
+  <li>About 4× faster at 100 tokens, and the ratio grows with length. The cache costs <span class="math">2 L d</span> values per token: 6 KB here, about 0.5 MB per token for a 70B model with GQA in bf16 (Volume 1), which is why serving systems page it (Volume 11).</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>With learned absolute positions, the cache cannot slide past <code>block_size</code>: shifting the window changes every cached position embedding. The naive generator crops and recomputes; RoPE with attention sinks, or a larger context, is the production answer.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="evaluation">Evaluation of a Small LLM</h2>
+<p class="chapter-lede">Validation loss is the only metric a small pretrained model is good enough to
+be measured on reliably. Make it precise (every token scored once, with enough context), make it
+comparable (bits per byte), and add held-out domains and samples to see what the number hides.</p>
+
+<h3>Perplexity and Bits per Byte</h3>
+<div class="math">\text{PPL} = \exp\Big(-\frac{1}{N}\sum_{t=1}^{N} \log p_\theta(x_t \mid x_{&lt;t})\Big), \qquad \text{BPB} = \frac{\mathcal{L}_{\text{token}} \cdot N_{\text{tokens}}}{\ln 2 \cdot N_{\text{bytes}}}</div>
+<ul>
+  <li>Perplexity is comparable only between models with the same tokeniser. Bits per byte normalises by bytes of text and compares a byte model with a BPE model. For a byte-level model the two denominators coincide (for ASCII text).</li>
+  <li>Non-overlapping windows give the first token of each window no context and overstate loss. A sliding window with stride <span class="math">s</span> gives every scored token at least <span class="math">T - s</span> tokens of context; <code>ignore_index</code> prevents double-counting.</li>
+</ul>
+
+<figure class="listing">
+<figcaption><code>forge.eval.perplexity</code>: sliding-window perplexity and bits per byte on train, validation, an out-of-domain text and random bytes.</figcaption>
+<pre><code># forge/eval/perplexity.py
+@torch.no_grad()
+def perplexity(model, tokens, stride=64, batch=64):
+    """Sliding-window NLL; each token is scored once, with &gt;= T-stride context."""
+    T = model.cfg.block_size
+    tokens = torch.as_tensor(np.asarray(tokens, dtype=np.int64))
+    xs, ys, prev_end = [], [], 0
+    for begin in range(0, len(tokens) - 1, stride):
+        end = min(begin + T, len(tokens) - 1)
+        x, y = tokens[begin:end].clone(), tokens[begin + 1:end + 1].clone()
+        y[: max(0, prev_end - begin)] = -100        # already scored: ignore
+        pad = T - len(x)
+        xs.append(F.pad(x, (0, pad))); ys.append(F.pad(y, (0, pad), value=-100))
+        prev_end = end
+        if end == len(tokens) - 1:
+            break
+    nll, count = 0.0, 0
+    for i in range(0, len(xs), batch):
+        x, y = torch.stack(xs[i:i + batch]), torch.stack(ys[i:i + batch])
+        logits = model(x)[0]
+        nll += F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1),
+                               ignore_index=-100, reduction="sum").item()
+        count += (y != -100).sum().item()
+    loss = nll / count
+    return {"tokens": count, "loss": loss, "ppl": math.exp(loss),
+            "bits/byte": loss / math.log(2)}
+
+with contextlib.redirect_stdout(io.StringIO()):
+    import this                                    # the Zen of Python, rot13-encoded
+zen = "".join(this.d.get(c, c) for c in this.s)
+rng = np.random.default_rng(0)
+sets = {"train (first 30k)": train_data[:30_000],
+        "val (first 30k)": val_data[:30_000],
+        "Zen of Python": encode(zen),
+        "random bytes": rng.integers(0, 256, 2_000)}
+for name, toks in sets.items():
+    r = perplexity(model, toks)
+    print(f"{name:18s} tokens={r['tokens']:6d} loss={r['loss']:.3f} "
+          f"ppl={r['ppl']:7.2f} bits/byte={r['bits/byte']:.2f}")</code></pre>
+</figure>
+<pre class="output">train (first 30k)  tokens= 29999 loss=1.393 ppl=   4.03 bits/byte=2.01
+val (first 30k)    tokens= 29999 loss=1.586 ppl=   4.88 bits/byte=2.29
+Zen of Python      tokens=   855 loss=1.916 ppl=   6.79 bits/byte=2.76
+random bytes       tokens=  1999 loss=10.952 ppl=57088.33 bits/byte=15.80</pre>
+
+<ul>
+  <li><strong>Train versus validation</strong> (4.0 versus 4.9 perplexity): the generalisation gap from Chapter 5, now on exact full-context numbers.</li>
+  <li><strong>Zen of Python</strong>: English aphorisms rather than API documentation. Higher perplexity measures domain shift; always report an out-of-domain set so improvements on the main set are not just memorisation.</li>
+  <li><strong>Random bytes</strong>: 15.8 bits per byte, worse than the 8 bits of a uniform guess. The model is confidently wrong off-distribution, a first look at miscalibration.</li>
+</ul>
+
+<h3>Beyond Loss</h3>
+<ul>
+  <li><strong>Sample review</strong>: a fixed prompt set sampled at fixed seeds at every checkpoint. Humans spot repetition, format breakage and tokeniser artefacts that loss averages away.</li>
+  <li><strong>Capability probes</strong>: tiny scripted tests scored by log-likelihood, for example "does the model prefer <code>Return the number</code> over <code>Return the nmuber</code>". They turn qualitative progress into a number that works before the model can follow instructions.</li>
+  <li><strong>Downstream benchmarks</strong> (HellaSwag, ARC) are noise at this scale; they become informative around 100M+ parameters (Volume 10).</li>
+</ul>
+
+<ul class="failure-modes">
+  <li>Evaluating on randomly sampled batches that change between runs: noise larger than the effect being measured.</li>
+  <li>Comparing perplexity across tokenisers.</li>
+  <li>Validation text that duplicates training text (common with web data): perplexity improves while generalisation does not (Volume 5 on deduplication).</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 9 -->
+<section class="chapter">
+<h2 id="debugging">Debugging Training</h2>
+<p class="chapter-lede">A training run fails silently far more often than it crashes. The workflow
+here is to prove the code can learn before asking whether the model does, then read loss curves and
+gradient norms as diagnostics.</p>
+
+<h3>Overfit One Batch</h3>
+<ul>
+  <li>Take one fixed batch, turn off weight decay and dropout, and train on it alone. A correct model and loop drives the loss towards zero within a few hundred steps.</li>
+  <li>If it cannot, the bug is in the model, loss or optimiser wiring, not in the data or hyperparameters.</li>
+  <li>The mirror test: if the loss on <em>fresh</em> batches collapses as fast as on one batch, the model can see its targets.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Overfit one batch, reproduce a target-leak bug, and inspect gradient norms by layer.</figcaption>
+<pre><code>def overfit_one_batch(steps=300, lr=1e-3, leak=False):
+    torch.manual_seed(0)
+    m = GPT(cfg)
+    o = torch.optim.AdamW(m.parameters(), lr=lr, weight_decay=0.0)
+    g = torch.Generator().manual_seed(0)
+    x, y = get_batch(train_data, 8, cfg.block_size, g)
+    log = []
+    for step in range(1, steps + 1):
+        if leak:                                   # bug: fresh batch, target == input
+            x, _ = get_batch(train_data, 8, cfg.block_size, g); y = x
+        loss = m(x, y)[1]
+        loss.backward(); o.step(); o.zero_grad(set_to_none=True)
+        if step in (1, 50, 100, 200, 300):
+            log.append(f"{step}:{loss.item():.3f}")
+    return " ".join(log)
+
+print("overfit one batch     ", overfit_one_batch())
+print("leaky targets (y = x) ", overfit_one_batch(leak=True))
+
+# gradient norms per parameter group after one backward pass on the trained model
+x, y = get_batch(train_data, 16, cfg.block_size, torch.Generator().manual_seed(1))
+model.zero_grad(); model(x, y)[1].backward()
+for name, p in model.named_parameters():
+    if name.endswith(("c_attn.weight", "c_fc.weight", "wte.weight", "wpe.weight")) \
+            and (".0." in name or ".3." in name or "wte" in name or "wpe" in name):
+        print(f"{name:32s} |grad| {p.grad.norm():.3f}  |w| {p.norm():6.2f}")
+model.zero_grad(set_to_none=True)</code></pre>
+</figure>
+<pre class="output">overfit one batch      1:5.409 50:2.982 100:2.498 200:0.043 300:0.010
+leaky targets (y = x)  1:4.454 50:0.081 100:0.028 200:0.008 300:0.004
+transformer.wte.weight           |grad| 0.929  |w|  27.52
+transformer.wpe.weight           |grad| 0.633  |w|   6.63
+transformer.h.0.attn.c_attn.weight |grad| 0.617  |w|  12.76
+transformer.h.0.mlp.c_fc.weight  |grad| 0.302  |w|  18.59
+transformer.h.3.attn.c_attn.weight |grad| 0.078  |w|  10.16
+transformer.h.3.mlp.c_fc.weight  |grad| 0.099  |w|  16.20</pre>
+
+<ul>
+  <li>The single batch is memorised (5.41 to 0.01), with a plateau near 2.5 before attention "clicks".</li>
+  <li>Leaky targets reach 0.08 by step 50 on data the model has never seen. No real language model gets there: a validation loss that looks too good is a bug until proven otherwise.</li>
+  <li>Gradient norms are larger in early layers and embeddings than in the last block at this point in training. A layer whose gradient norm is exactly zero is disconnected (a detached tensor, a module not called); one orders of magnitude larger than its neighbours is a candidate for instability.</li>
+</ul>
+
+<h3>Loss-Curve Pathologies</h3>
+<table>
+  <caption>Common curve shapes, their likely causes and the first check.</caption>
+  <thead><tr><th>Symptom</th><th>Likely cause</th><th>First check</th></tr></thead>
+  <tbody>
+    <tr><td>Initial loss far above <span class="math">\ln V</span></td><td>Init too large; missing final LayerNorm</td><td>Print logit std at step 0</td></tr>
+    <tr><td>Initial loss far below <span class="math">\ln V</span>, or near-zero loss quickly</td><td>Target leak: no shift, non-causal mask</td><td>Assert <code>y[:, :-1] == x[:, 1:]</code>; test <code>is_causal</code></td></tr>
+    <tr><td>Flat at <span class="math">\ln V</span></td><td>No gradient reaches weights; learning rate zero</td><td>Parameter-update ratio <span class="math">\lVert\Delta\theta\rVert / \lVert\theta\rVert</span> (~1e-3 is healthy)</td></tr>
+    <tr><td>Flat at unigram entropy (~4–5 nats for bytes)</td><td>Attention broken or positions ignored</td><td>Overfit one batch</td></tr>
+    <tr><td>Sudden spikes that recover</td><td>Bad batches; learning rate too high; <span class="math">\beta_2</span> too high</td><td>Log batch ids at spikes; lower LR or <span class="math">\beta_2 = 0.95</span></td></tr>
+    <tr><td>Divergence to NaN</td><td>LR too high; fp16 overflow; log of zero</td><td><code>torch.autograd.detect_anomaly</code>; check grad norm before the NaN</td></tr>
+    <tr><td>Train falls, validation rises</td><td>Overfitting; too many epochs on small data</td><td>Unique-token count versus tokens trained</td></tr>
+    <tr><td>Validation lower than train</td><td>Dropout active in train only; easier validation domain; leakage</td><td>Evaluate train in <code>eval()</code> mode</td></tr>
+    <tr><td>Periodic saw-tooth</td><td>Data not shuffled across epochs or shards</td><td>Plot loss against data position</td></tr>
+    <tr><td>Step change at resume</td><td>Optimiser or scheduler state not restored</td><td>Chapter 6 exact-resumption test</td></tr>
+    <tr><td>Good loss, garbage samples</td><td>Tokeniser mismatch between training and generation</td><td>Round-trip <code>decode(encode(s)) == s</code>; compare special-token ids</td></tr>
+  </tbody>
+</table>
+
+<h3>Other Checks</h3>
+<ul>
+  <li><strong>Dead units</strong>: GELU rarely dies, but ReLU MLPs can. Track the fraction of MLP activations that are never positive over an evaluation batch.</li>
+  <li><strong>NaN hunting</strong>: register a forward hook that asserts <code>torch.isfinite</code> on each module output; the first module to fail localises the fault.</li>
+  <li><strong>Data bugs</strong>: decode and print a random training batch at the start of every run. It takes one line and catches wrong files, wrong dtypes and double tokenisation.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Debugging Order</span>
+  <ol>
+    <li>Loss at init equals <span class="math">\ln V</span>.</li>
+    <li>Decode a batch; check the shift.</li>
+    <li>Overfit one batch.</li>
+    <li>Short run: curve shape, gradient norm, throughput.</li>
+    <li>Only then tune hyperparameters.</li>
+  </ol>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 10 -->
+<section class="chapter">
+<h2 id="production">From Scratch to Production Libraries</h2>
+<p class="chapter-lede">Because the model uses GPT-2's layout and parameter names, it is already a
+Hugging Face GPT-2 in disguise. Exporting it proves the from-scratch code is exactly the standard
+architecture, and gives it the whole ecosystem: <code>generate</code>, quantisation, serving engines.</p>
+
+<h3>Mapping Onto <code>transformers</code></h3>
+<ul>
+  <li><code>GPTConfig</code> maps to <code>GPT2Config</code>: <code>n_embd</code>, <code>n_layer</code>, <code>n_head</code>, <code>n_positions = block_size</code>, <code>activation_function = "gelu_new"</code> (the tanh approximation).</li>
+  <li>HF GPT-2 stores linear layers as <code>Conv1D</code> with weights of shape <code>(in, out)</code>, the transpose of <code>nn.Linear</code>. Four weight names need <code>.t()</code>; everything else copies unchanged.</li>
+  <li><code>safetensors</code> is a flat, memory-mappable tensor format with no code execution on load. It refuses tensors that share memory, so tied weights need <code>save_model</code> or <code>save_pretrained</code>, which store the tied tensor once.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Export the trained model to HF GPT-2 format with safetensors, reload it and compare logits and greedy output.</figcaption>
+<pre><code>from transformers import GPT2Config, GPT2LMHeadModel
+from safetensors.torch import save_file
+
+hf_cfg = GPT2Config(vocab_size=cfg.vocab_size, n_positions=cfg.block_size,
+                    n_embd=cfg.n_embd, n_layer=cfg.n_layer, n_head=cfg.n_head,
+                    activation_function="gelu_new", layer_norm_epsilon=1e-5,
+                    resid_pdrop=0.0, embd_pdrop=0.0, attn_pdrop=0.0,
+                    bos_token_id=EOT, eos_token_id=EOT, tie_word_embeddings=True)
+hf = GPT2LMHeadModel(hf_cfg).eval()
+
+conv1d = ("c_attn.weight", "c_proj.weight", "c_fc.weight")   # HF Conv1D is (in, out)
+sd = {k: (v.t().contiguous() if k.endswith(conv1d) else v)
+      for k, v in model.state_dict().items()}
+missing, unexpected = hf.load_state_dict(sd, strict=False)
+print("missing:", missing, "| unexpected:", unexpected)
+
+try:
+    save_file(model.state_dict(), "/tmp/vol4/raw.safetensors")
+except RuntimeError as e:
+    print("save_file refused:", " ".join(str(e).split())[:150])
+
+out_dir = "/tmp/vol4/hf-mini-gpt"
+hf.save_pretrained(out_dir)                          # config.json + model.safetensors
+print("exported:", sorted(os.listdir(out_dir)))
+hf2 = GPT2LMHeadModel.from_pretrained(out_dir).eval()
+
+x = torch.tensor([encode("Return the number of items in the container.")])
+with torch.no_grad():
+    ours, theirs = model(x)[0], hf2(x).logits
+print(f"max |logit diff| ours vs HF: {(ours - theirs).abs().max().item():.2e}")
+hf_out = hf2.generate(prompt, max_new_tokens=60, do_sample=False,
+                      pad_token_id=EOT, eos_token_id=None)
+print("greedy continuation identical:",
+      torch.equal(hf_out, generate_kv(model, prompt, 60, stop_id=-1, temperature=0.0)))</code></pre>
+</figure>
+<pre class="output">missing: [] | unexpected: []
+save_file refused: Some tensors share memory, this will lead to duplicate memory on disk and potential differences when loading them again: [{'transformer.wte.weight', '
+exported: ['config.json', 'generation_config.json', 'model.safetensors']
+max |logit diff| ours vs HF: 0.00e+00
+greedy continuation identical: True</pre>
+
+<ul>
+  <li>No missing or unexpected keys, identical logits, identical greedy continuation. The exported directory loads anywhere GPT-2 loads, including vLLM and llama.cpp converters (Volume 11).</li>
+  <li>The tokeniser must be exported too. A byte-level model needs a trivial tokeniser; for BPE, save <code>tokenizer.json</code> alongside and test the round-trip.</li>
+</ul>
+
+<h3>What Production Trainers Add</h3>
+<table>
+  <caption>What this volume's Trainer does not do, and where it lives in production stacks.</caption>
+  <thead><tr><th>Concern</th><th>This volume</th><th>Production (examples)</th></tr></thead>
+  <tbody>
+    <tr><td>Multi-device</td><td>One device</td><td>DDP, FSDP/ZeRO sharding, tensor and pipeline parallelism (<code>accelerate</code>, DeepSpeed, Megatron, torchtitan; Volume 7)</td></tr>
+    <tr><td>Precision</td><td>fp32</td><td>bf16 autocast, fp8 matmuls on H100 and later</td></tr>
+    <tr><td>Kernels</td><td>SDPA</td><td><code>torch.compile</code>, FlashAttention, fused AdamW, Liger kernels</td></tr>
+    <tr><td>Data</td><td>One memmap, random windows</td><td>Sharded streaming datasets with saved cursors, mixture weights, document masking</td></tr>
+    <tr><td>Fault tolerance</td><td>Manual resume</td><td>Automatic restart, async distributed checkpoints, elastic world size</td></tr>
+    <tr><td>Observability</td><td><code>print</code></td><td>Weights and Biases, TensorBoard, MLflow; per-layer statistics; alerting on spikes</td></tr>
+    <tr><td>Checkpoint format</td><td><code>torch.save</code> dict</td><td>Sharded <code>safetensors</code>, distributed checkpoint (DCP) with resharding on load</td></tr>
+  </tbody>
+</table>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">Keep the from-scratch loop when</p>
+    <ul>
+      <li>Researching architecture or optimiser changes that libraries do not expose.</li>
+      <li>Teaching, debugging, or training on one device.</li>
+    </ul></div>
+  <div class="cons"><p class="facet">Move to a library when</p>
+    <ul>
+      <li>More than one GPU is involved: sharding and fault tolerance are hard to get right.</li>
+      <li>The team needs standard logging, configs and checkpoint formats more than control.</li>
+    </ul></div>
+</div>
+
+<div class="frame exercise"><p>Rewrite <code>Trainer.fit</code> with <code>accelerate.Accelerator</code>: wrap the model,
+optimiser and scheduler with <code>prepare</code>, replace <code>loss.backward()</code> with
+<code>accelerator.backward(loss)</code>, and confirm that the single-device loss curve is unchanged.</p></div>
+</section>
+
+<!-- ================================================================ REVIEW -->
+<section class="review">
+<h1>Volume Review</h1>
+
+<h2>What You Learned</h2>
+<ul>
+  <li>A small LLM project is a pipeline of versioned artefacts joined by configs; size it with <span class="math">C \approx 6ND</span>.</li>
+  <li>Pre-tokenised <code>uint16</code> memmaps with random-window batching give fast, deterministic, resumable data; split by document.</li>
+  <li>A GPT is embeddings, pre-norm blocks with causal SDPA attention and an MLP, a final LayerNorm and a tied head; <span class="math">N = L(12d^2 + 13d) + Vd + T_{\max}d + 2d</span>.</li>
+  <li>Loss at init must be <span class="math">\ln V</span>; <code>ignore_index</code> masks positions from numerator and denominator.</li>
+  <li>AdamW with decay only on matrices and embeddings, warmup plus cosine or WSD, global-norm clipping, correctly scaled accumulation.</li>
+  <li>Throughput needs device synchronisation to measure; MFU relates it to hardware peak.</li>
+  <li>Exact resumption requires model, optimiser, scheduler, RNG and step, written atomically.</li>
+  <li>Sampling controls (temperature, top-k, top-p, min-p) and KV caching; the cache is a pure optimisation.</li>
+  <li>Sliding-window perplexity, bits per byte and held-out domains.</li>
+  <li>The debugging order: init loss, decode a batch, overfit one batch, then read curves.</li>
+  <li>Forge grows here: <code>forge.model</code>, <code>forge.train</code>, <code>forge.data.shards</code>, <code>forge.generate</code>, <code>forge.eval</code>.</li>
+</ul>
+
+<h2>What You Built</h2>
+<ul>
+  <li><code>forge.data.shards</code>: byte-level corpus pipeline to <code>uint16</code> shards and a seeded batcher.</li>
+  <li><code>forge.model</code>: a 1.85M-parameter GPT trained to validation loss 1.74 nats per byte in about one minute on an M2.</li>
+  <li><code>forge.train</code>: a <code>Trainer</code> with accumulation, clipping, a cosine schedule and fixed-batch evaluation.</li>
+  <li>An atomic checkpoint manager that passes a bit-exact resumption test.</li>
+  <li><code>forge.generate</code>: naive and KV-cached generators with five sampling strategies.</li>
+  <li><code>forge.eval.perplexity</code>: a sliding-window perplexity evaluator.</li>
+  <li>An exporter to HF GPT-2 format with <code>safetensors</code>, verified to zero logit difference.</li>
+</ul>
+
+<h2>Important Code</h2>
+<table>
+  <caption>Listings to keep; later volumes extend them inside <code>src/forge/</code>.</caption>
+  <thead><tr><th>Listing</th><th>Forge module</th><th>Concept</th><th>Extended in</th></tr></thead>
+  <tbody>
+    <tr><td><code>get_batch</code>, shard writer</td><td><code>forge.data.shards</code></td><td>Data pipeline</td><td>Volume 5</td></tr>
+    <tr><td><code>GPT</code>, <code>GPTConfig</code></td><td><code>forge.model</code></td><td>Model</td><td>Volumes 6, 8</td></tr>
+    <tr><td><code>Trainer</code>, <code>configure_optimizer</code>, <code>cosine_lr</code></td><td><code>forge.train</code></td><td>Training</td><td>Volume 6 (distributed)</td></tr>
+    <tr><td><code>save_checkpoint</code>, <code>load_checkpoint</code></td><td><code>forge.train</code></td><td>Resumption</td><td>Volume 6</td></tr>
+    <tr><td><code>sample_logits</code>, <code>generate_kv</code></td><td><code>forge.generate</code></td><td>Inference</td><td>Volume 11</td></tr>
+    <tr><td><code>perplexity</code></td><td><code>forge.eval</code></td><td>Evaluation</td><td>Volume 10</td></tr>
+  </tbody>
+</table>
+
+<h2>Important Architecture</h2>
+<figure class="diagram">
+<pre class="ascii">corpus -> tokenise -> train.bin / val.bin (uint16 memmap)
+                          |
+                          v
+   GPTConfig ---> GPT <--- get_batch(seeded Generator)
+   TrainConfig -> Trainer (AdamW groups, warmup+cosine, clip, accum)
+                          |
+                 every K steps: estimate_loss (fixed batches)
+                          |
+                          v
+         checkpoint.pt (model, opt, sched, RNG, step)  --atomic-->
+                          |
+         +----------------+-----------------+
+         v                v                 v
+   generate / generate_kv   perplexity    HF GPT-2 export (safetensors)</pre>
+</figure>
+
+<h2>Failure Modes</h2>
+<ul class="failure-modes">
+  <li>Target not shifted, or a non-causal mask: near-zero loss on unseen data.</li>
+  <li>Loss not divided by the accumulation steps; scheduler stepped per micro-batch.</li>
+  <li>LayerNorm gains and biases decayed.</li>
+  <li>Checkpoint without optimiser, scheduler or RNG state; non-atomic writes.</li>
+  <li>KV cache with wrong position offsets; cache used beyond <code>block_size</code>.</li>
+  <li>Perplexity compared across tokenisers, or measured without context.</li>
+  <li>Timing asynchronous devices without synchronisation.</li>
+  <li>Loading untrusted pickled checkpoints.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<ul>
+  <li>Validation loss and perplexity on fixed data, with sliding-window context.</li>
+  <li>Bits per byte for cross-tokeniser comparisons.</li>
+  <li>An out-of-domain set to separate generalisation from memorisation.</li>
+  <li>Fixed-seed samples on a fixed prompt set at every checkpoint.</li>
+  <li>Log-likelihood capability probes.</li>
+</ul>
+
+<h2>Practical Project</h2>
+<div class="frame exercise">
+  <p><strong>Mini LLM v1.</strong> Scale this volume's code to the Tier L target:</p>
+  <ul>
+    <li>Corpus: TinyStories (Eldan and Li, 2023) or a curated domain corpus of 100–300M tokens, tokenised with the BPE tokeniser from Volume 3 into <code>uint16</code> shards.</li>
+    <li>Model: 8 layers, width 384, 6 heads, context 256 (~14M parameters plus embeddings).</li>
+    <li>Train with WSD, checkpoints every 1,000 steps, and a passing exact-resumption test.</li>
+    <li>Reach a target validation loss you set in advance (for TinyStories with a 4k–8k BPE, below 1.5 nats per token is a reasonable goal).</li>
+    <li>Export to HF format with <code>safetensors</code> and the tokeniser; publish a model card with training config, curves, perplexity on validation and one out-of-domain set, and 20 fixed-seed samples.</li>
+  </ul>
+</div>
+
+<h2>Exercises</h2>
+<ol>
+  <li>Replace learned positions with RoPE; verify the KV-cached generator still matches the naive one.</li>
+  <li>Implement a repetition penalty and measure how it changes the greedy loop in Listing 7.1.</li>
+  <li>Add gradient accumulation with <code>grad_accum=4, batch_size=8</code> and show the loss curve matches <code>batch_size=32</code> to within noise.</li>
+  <li>Implement WSD in the <code>Trainer</code> and branch a cool-down from a mid-run checkpoint.</li>
+  <li>Add document masking so attention cannot cross EOT, and compare validation loss.</li>
+  <li>Write a log-likelihood probe set of 50 correct/corrupted docstring pairs and track accuracy across checkpoints.</li>
+  <li>Break the scheduler restore in <code>load_checkpoint</code> and describe the curve you get after resumption.</li>
+</ol>
+
+<h2>Research Papers</h2>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Language Models are Unsupervised Multitask Learners (GPT-2)</span>
+    <span class="paper-meta">Radford et al., 2019 · OpenAI</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Task-specific supervised models did not transfer across tasks.</dd>
+    <dt>Previous limitation</dt><dd>GPT-1 still needed supervised fine-tuning per task.</dd>
+    <dt>Approach</dt><dd>A larger pre-norm decoder trained on WebText with byte-level BPE; zero-shot task transfer via prompting.</dd>
+    <dt>Contribution</dt><dd>The architecture, initialisation and tokenisation reproduced in this volume.</dd>
+    <dt>Practical impact</dt><dd>The reference small-model layout; its HF implementation is the export target of Chapter 10.</dd>
+    <dt>Limitations</dt><dd>Learned absolute positions; limited context; training details sparse.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Decoupled Weight Decay Regularization (AdamW)</span>
+    <span class="paper-meta">Loshchilov and Hutter, 2017 · ICLR 2019</span></div>
+  <dl>
+    <dt>Problem</dt><dd>L2 regularisation and weight decay are not equivalent under adaptive optimisers.</dd>
+    <dt>Previous limitation</dt><dd>Adam with L2 (Kingma and Ba, 2014) rescales the penalty per parameter, weakening it where gradients are large.</dd>
+    <dt>Approach</dt><dd>Apply decay directly to the weights, separately from the adaptive update.</dd>
+    <dt>Contribution</dt><dd>AdamW, plus evidence for cosine schedules with warm restarts.</dd>
+    <dt>Practical impact</dt><dd>The default optimiser for Transformer training.</dd>
+    <dt>Limitations</dt><dd>Decay and learning rate remain coupled through <span class="math">\eta_t \lambda</span>; the right grouping of parameters is left to practice.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Using the Output Embedding to Improve Language Models</span>
+    <span class="paper-meta">Press and Wolf, 2016 · EACL 2017</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Input and output embeddings are large and learned separately.</dd>
+    <dt>Previous limitation</dt><dd>Untied embeddings double vocabulary-sized parameters.</dd>
+    <dt>Approach</dt><dd>Share the input embedding and the output projection.</dd>
+    <dt>Contribution</dt><dd>Lower perplexity with fewer parameters.</dd>
+    <dt>Practical impact</dt><dd>Standard in small and medium LMs (GPT-2, many small open models).</dd>
+    <dt>Limitations</dt><dd>Benefit shrinks at large scale, where many models untie.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">The Curious Case of Neural Text Degeneration</span>
+    <span class="paper-meta">Holtzman et al., 2019 · ICLR 2020</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Likelihood-maximising decoding produces bland, repetitive text.</dd>
+    <dt>Previous limitation</dt><dd>Beam search and top-k use fixed or likelihood-driven rules.</dd>
+    <dt>Approach</dt><dd>Nucleus (top-p) sampling: truncate to the smallest set with cumulative mass <span class="math">p</span>.</dd>
+    <dt>Contribution</dt><dd>An adaptive truncation that matches human text statistics better.</dd>
+    <dt>Practical impact</dt><dd>The default sampler in most APIs.</dd>
+    <dt>Limitations</dt><dd>Flat distributions still admit long tails; min-p and others refine it.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour</span>
+    <span class="paper-meta">Goyal et al., 2017 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Large batches destabilise early training.</dd>
+    <dt>Previous limitation</dt><dd>Linear LR scaling alone diverged at the start.</dd>
+    <dt>Approach</dt><dd>Linear learning-rate scaling with gradual warmup.</dd>
+    <dt>Contribution</dt><dd>Warmup as a standard tool.</dd>
+    <dt>Practical impact</dt><dd>Every LLM schedule starts with warmup.</dd>
+    <dt>Limitations</dt><dd>Warmup length remains a tuned hyperparameter.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">TinyStories: How Small Can Language Models Be and Still Speak Coherent English?</span>
+    <span class="paper-meta">Eldan and Li, 2023 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Small models trained on web text produce incoherent output, hiding what they learn.</dd>
+    <dt>Previous limitation</dt><dd>Coherence seemed to require 100M+ parameters.</dd>
+    <dt>Approach</dt><dd>A synthetic corpus of simple stories with a restricted vocabulary.</dd>
+    <dt>Contribution</dt><dd>Models of 1–30M parameters that write fluent, consistent stories.</dd>
+    <dt>Practical impact</dt><dd>The standard corpus for laptop-scale LLM work, including this volume's project.</dd>
+    <dt>Limitations</dt><dd>Narrow domain; results do not transfer directly to general text.</dd>
+  </dl>
+</section>
+
+<h2>Interview Questions</h2>
+<ol>
+  <li>What should the loss be at step 0 for a 50k-vocabulary model, and what do you conclude if it is 11?</li>
+  <li>Why exclude LayerNorm and bias parameters from weight decay?</li>
+  <li>How do you implement gradient accumulation correctly, and what two bugs are most common?</li>
+  <li>List everything a checkpoint needs for exact resumption, and how you would test it.</li>
+  <li>Why is <span class="math">\beta_2 = 0.95</span> common for LLMs?</li>
+  <li>Explain the KV cache: what is stored, its memory per token, and why it cannot slide with absolute positions.</li>
+  <li>Top-p versus min-p: when does each fail?</li>
+  <li>Why is perplexity not comparable across tokenisers, and what do you use instead?</li>
+  <li>Your validation loss is lower than training loss. Give three explanations.</li>
+  <li>What does <code>safetensors</code> protect against, and why does it reject tied tensors?</li>
+</ol>
+
+<h2>Next Volume</h2>
+<ul>
+  <li>Volume 5 (LLM Data Engineering) replaces the docstring corpus with a real data pipeline: collection, cleaning, deduplication, quality filtering and mixtures at scale.</li>
+  <li>The model and trainer from this volume are the fixed testbed on which data changes are measured.</li>
+</ul>
+</section>
+
+</body>
+</html>

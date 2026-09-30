@@ -1,0 +1,2049 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 23 · AI Engineering Tooling and AI-Assisted Development</title>
+<meta name="volume" content="Volume 23 · AI Engineering Tooling and AI-Assisted Development">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 23</p>
+  <h1 class="no-toc">AI Engineering Tooling and AI-Assisted Development</h1>
+  <p class="tp-subtitle">The Tool Ecosystem and Working Effectively with Coding Agents</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Build a framework for choosing tools that survive version churn, vendor marketing and lock-in.</li>
+  <li>Map the AI engineering stack: training frameworks, experiment trackers, serving engines, RAG and agent libraries, evaluation and observability, deployment.</li>
+  <li>Treat coding agents (Claude Code, Cursor, Copilot and peers) as production tools with failure modes, not as magic autocomplete.</li>
+  <li>Write repository context that agents can follow: <code>AGENTS.md</code>, <code>CLAUDE.md</code>, rules, and the discipline of validating generated code.</li>
+  <li>Ship a practical validation gate: hallucinated packages, lint, types, tests, security scans and licence checks before merge.</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>Volumes 1–12: the model lifecycle, serving engines, evaluation and the difference between a demo and a service.</li>
+  <li>Volumes 14–16: RAG, agents and harnesses. This volume names the products that implement those ideas; it does not re-derive the algorithms.</li>
+  <li>You have shipped software with CI, code review and dependency management. AI coding tools sit on top of those habits; they do not replace them.</li>
+</ul>
+
+<p class="facet">How to read this volume</p>
+<ul>
+  <li>Tool names and versions move. Prefer criteria and comparison tables over memorising CLI flags.</li>
+  <li>Listings are pedagogical. Printed command shapes match common practice; pin versions in your own lockfiles.</li>
+  <li>Paper cards at the end ground claims about AI-generated code security, package hallucinations and productivity measurement.</li>
+  <li>Volume 24 is the project: AI-assisted feature delivery using the workflows and gates here.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1   Evaluating tools      criteria, lock-in, buy vs build vs integrate
+Chapter 2   Model development     PyTorch, Hugging Face, JAX, Lightning
+Chapter 3   Tracking / registry   MLflow, Weights &amp; Biases, model cards
+Chapter 4   Serving tools         vLLM, SGLang, TGI, Ollama, llama.cpp, Triton
+Chapter 5   RAG and data          loaders, chunkers, vector DBs, pipelines
+Chapter 6   Agents / orchestration LangGraph, MCP, framework lock-in
+Chapter 7   Eval and observability judges, traces, LangSmith, Phoenix, OTel
+Chapter 8   Deployment            containers, K8s, CI/CD, feature flags
+Chapter 9   AI coding tools       Claude Code, Cursor, Copilot, comparison
+Chapter 10  Agent instructions    AGENTS.md, CLAUDE.md, rules, context budgets
+Chapter 11  Assisted workflows    TDD, debug, review, PR loops
+Chapter 12  Validating code       hallucinated pkgs, ruff, mypy, pytest, bandit</pre>
+<figcaption>Map of Volume 23. Chapters 1–8 are the production stack. Chapters 9–12 are how you use coding agents without shipping their mistakes.</figcaption>
+</figure>
+
+<aside class="callout core"><span class="title">How this volume relates to the rest of the book</span>
+  <ul>
+    <li>Volumes 11–12 explain <em>why</em> serving engines work; Chapter 4 here names <em>which</em> products to try.</li>
+    <li>Volumes 14–16 explain RAG and harnesses; Chapters 5–6 map libraries and protocols onto those designs.</li>
+    <li>Volume 10 explains evaluation science; Chapter 7 maps the day-to-day tooling.</li>
+    <li>Volume 1 introduced AI-assisted development habits; Chapters 9–12 make them operational with gates and instruction files.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="evaluating-tools">A Framework for Evaluating Tools</h2>
+<p class="chapter-lede">Every quarter a new framework claims to replace your stack. The engineering
+problem is not finding tools; it is deciding which ones you are willing to own for years, which
+ones you rent, and which ones you ignore.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A team adopts a popular agent framework because the demo graph is elegant. Six months later
+  the product needs streaming, human approval, multi-tenant budgets and a non-Python worker. The
+  framework's abstractions fight every requirement. Migration cost exceeds the original build.
+  The demo was never an evaluation.</p>
+</div>
+
+<p class="facet">What a tool evaluation must answer</p>
+<ul>
+  <li><strong>Job to be done</strong>: which concrete failure or bottleneck does this tool remove?</li>
+  <li><strong>Boundary</strong>: what does it own, and what must you still build around it?</li>
+  <li><strong>Exit cost</strong>: how hard is it to leave if the project dies, prices rise or requirements change?</li>
+  <li><strong>Operational fit</strong>: does it match your languages, clouds, compliance and on-call skills?</li>
+  <li><strong>Evidence</strong>: can you measure the claim on <em>your</em> workload in a week, not a slide deck?</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Tools are contracts: APIs, data formats, operational burden and switching cost.</li>
+    <li>Prefer tools that speak open interfaces (OpenAI-compatible HTTP, OpenTelemetry, MCP, ONNX, standard registries) over tools that invent a private dialect for everything.</li>
+    <li>A short spike with a written scorecard beats a long architecture debate.</li>
+  </ul>
+</aside>
+
+<h3>Scorecard Dimensions</h3>
+
+<table>
+  <caption>A practical scorecard. Weight columns for your organisation; do not treat every row as equal.</caption>
+  <thead><tr><th>Dimension</th><th>Questions to ask</th><th>Red flags</th></tr></thead>
+  <tbody>
+    <tr><td>Correctness fit</td><td>Does it solve the hard part of <em>our</em> problem?</td><td>Demo-only success; no path to our eval set</td></tr>
+    <tr><td>Performance</td><td>Latency, throughput, cost at our QPS and context sizes?</td><td>Numbers from different hardware or older model sizes</td></tr>
+    <tr><td>Reliability</td><td>Timeouts, retries, idempotency, crash recovery?</td><td>"Just restart the pod"</td></tr>
+    <tr><td>Observability</td><td>Metrics, traces, structured logs you already collect?</td><td>Vendor-only UI; no export</td></tr>
+    <tr><td>Security</td><td>Authn/z, secrets, supply chain, sandboxing?</td><td>Default allow; secrets in prompts or spans</td></tr>
+    <tr><td>Operability</td><td>Who on-calls this? Upgrade cadence? Breaking changes?</td><td>Unpinned major versions; silent behaviour changes</td></tr>
+    <tr><td>Portability</td><td>Open formats? Self-host option? Multi-cloud?</td><td>Data gravity into one SaaS with no export</td></tr>
+    <tr><td>Team skill</td><td>Can we hire and train for this?</td><td>One expert who alone understands the graph</td></tr>
+    <tr><td>Licence and legal</td><td>OSI licence, model licence, data residency?</td><td>Ambiguous commercial use; copyleft in production paths</td></tr>
+    <tr><td>Community / vendor</td><td>Docs, issues, support SLAs, roadmap honesty?</td><td>Marketing velocity &gt;&gt; engineering velocity</td></tr>
+  </tbody>
+</table>
+
+<h3>Buy, Build, Integrate</h3>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">Prefer buy / adopt when</p>
+    <ul>
+      <li>The hard problem is commodity (serving engines, object storage, vector indexes).</li>
+      <li>An open interface lets you swap the implementation later.</li>
+      <li>Your differentiation is the product, eval set and data — not the framework.</li>
+    </ul></div>
+  <div class="cons"><p class="facet">Prefer build / thin wrap when</p>
+    <ul>
+      <li>The tool's control flow fights your reliability or security model.</li>
+      <li>Lock-in would put a core control plane behind a vendor API.</li>
+      <li>You need a pedagogical or test double (Forge packages in earlier volumes).</li>
+    </ul></div>
+</div>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>"Not invented here" and "framework of the month" are symmetric failure modes. The scorecard is the antidote to both.</li>
+  </ul>
+</aside>
+
+<h3>Spike Protocol</h3>
+
+<ol>
+  <li>Write the success metric and the workload (requests, tokens, documents, failure injection).</li>
+  <li>Time-box to a few days. One engineer owns the spike; another reviews the scorecard.</li>
+  <li>Exercise the failure path: kill the process, revoke a credential, overflow the context, inject a poisoned tool result.</li>
+  <li>Estimate exit cost: what artefacts and skills become useless if you leave?</li>
+  <li>Decide: adopt, adopt behind a thin interface, or reject. Write the decision down.</li>
+</ol>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Put the scorecard in the RFC or ADR, not in a private chat.</li>
+    <li>Pin versions in the spike the way you will in production.</li>
+    <li>If the vendor will not run against your eval harness, treat marketing numbers as untrusted.</li>
+  </ul>
+</aside>
+
+<h3>Total Cost of Ownership</h3>
+
+<p>Licence price is the visible line item. Ownership cost includes people, incident load, migration
+options and the opportunity cost of a worse interface.</p>
+
+<table>
+  <caption>TCO components teams forget when comparing tools.</caption>
+  <thead><tr><th>Cost type</th><th>Examples</th><th>How to estimate in a spike</th></tr></thead>
+  <tbody>
+    <tr><td>Direct</td><td>SaaS seats, GPU hours, support tiers</td><td>Price at projected 12-month volume</td></tr>
+    <tr><td>Integration</td><td>Adapters, auth, data export jobs</td><td>Person-days to production-shaped demo</td></tr>
+    <tr><td>Operations</td><td>On-call, upgrades, capacity planning</td><td>Pages per month in similar systems; upgrade notes quality</td></tr>
+    <tr><td>Risk</td><td>Lock-in, compliance gaps, single-vendor outage</td><td>Exit rehearsal: export all data in one day?</td></tr>
+    <tr><td>Human</td><td>Training, hiring scarce skills</td><td>Can two engineers operate it without the author?</td></tr>
+  </tbody>
+</table>
+
+<figure class="diagram">
+<pre class="ascii">Marketing claim
+      |
+      v
+Scorecard (weighted) --&gt; spike on OUR workload --&gt; failure injection
+      |                         |                        |
+      v                         v                        v
+  ADR decision           measured delta              residual risks
+      |
+      +-- adopt behind interface
+      +-- adopt naked (only if exit cost is low)
+      +-- reject / revisit date</pre>
+<figcaption>Evaluation flow. The ADR is the artefact; the spike is the evidence; the interface is the escape hatch.</figcaption>
+</figure>
+
+<h3>Open Interfaces Worth Preferring</h3>
+
+<ul>
+  <li><strong>OpenAI-compatible HTTP</strong> for chat and embeddings clients (Volumes 1 and 12).</li>
+  <li><strong>OpenTelemetry GenAI conventions</strong> for spans and usage metrics.</li>
+  <li><strong>MCP</strong> for reusable tool servers across agents and IDEs.</li>
+  <li><strong>OCI images + content digests</strong> for deployable artefacts.</li>
+  <li><strong>Standard model cards / registry metadata</strong> rather than proprietary-only lineage.</li>
+</ul>
+
+<aside class="callout advanced"><span class="title">Research Frontier</span>
+  <ul>
+    <li>Tool ecosystems consolidate and fragment in waves. Optimise for replaceability of the control plane you own (policy, eval, data), not for predicting next year's winning brand.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Pick one tool your team adopted in the last year. Fill the scorecard honestly in
+thirty minutes. Would you adopt it again? What interface would have lowered exit cost?</p></div>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Choosing by GitHub stars or conference keynote.</li>
+  <li>Evaluating only the happy path.</li>
+  <li>Adopting three overlapping tools "for flexibility" and owning none well.</li>
+  <li>Skipping licence review until legal blocks the launch.</li>
+  <li>Optimising for demo latency and discovering multi-tenant fairness later.</li>
+  <li>No revisit date: a rejected tool never gets reconsidered when the landscape moves.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="model-development">Model Development Tools</h2>
+<p class="chapter-lede">Training and adapting models still rests on a small set of libraries.
+PyTorch and Hugging Face dominate most LLM engineering. JAX and Lightning matter when you need
+their specific strengths. The goal is to know what each owns so you do not rebuild them.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A team starts from research notebooks with ad hoc training loops, unversioned checkpoints and
+  a different CUDA stack per laptop. Reproducing a run takes a week. Shipping a fine-tune takes a
+  month. The model is not the bottleneck; the lack of a shared development toolkit is.</p>
+</div>
+
+<table>
+  <caption>Core model-development tools and what they own.</caption>
+  <thead><tr><th>Tool</th><th>Primary job</th><th>You still own</th><th>Typical use in this book</th></tr></thead>
+  <tbody>
+    <tr><td><strong>PyTorch</strong></td><td>Tensors, autograd, nn modules, CUDA/Metal backends, <code>torch.compile</code></td><td>Data pipelines, distributed recipes, serving</td><td>Default research and production training stack</td></tr>
+    <tr><td><strong>Hugging Face Transformers</strong></td><td>Model definitions, tokenisers, <code>generate</code>, Hub checkpoints</td><td>Training orchestration quality, eval, licence compliance</td><td>Load open-weight LLMs; fine-tune with Trainer / TRL</td></tr>
+    <tr><td><strong>Hugging Face Datasets / Accelerate / PEFT / TRL</strong></td><td>Data loading, multi-GPU launch, LoRA, RLHF/DPO loops</td><td>Your data contracts and eval gates</td><td>Adaptation without rewriting distributed code</td></tr>
+    <tr><td><strong>JAX</strong></td><td>Functional transforms (<code>jit</code>, <code>grad</code>, <code>pmap</code>/<code>pjit</code>), XLA</td><td>Ecosystem familiarity; debugging habits differ from PyTorch</td><td>Large-scale research stacks (e.g. MaxText-style)</td></tr>
+    <tr><td><strong>PyTorch Lightning / Fabric</strong></td><td>Training loop boilerplate, hooks, multi-device strategies</td><td>Not a substitute for understanding the loop</td><td>Teams that want structure without a full custom trainer</td></tr>
+  </tbody>
+</table>
+
+<h3>PyTorch in Practice</h3>
+
+<ul>
+  <li><strong>Eager by default</strong>: easy debug; compile or export when the kernel graph is stable.</li>
+  <li><strong>Device placement</strong>: be explicit about CPU vs CUDA vs MPS; silent copies destroy throughput.</li>
+  <li><strong>AMP and dtype</strong>: BF16/FP16 training needs loss scaling awareness; inference often uses FP8/INT8 via separate stacks (Volume 11).</li>
+  <li><strong>Distributed</strong>: FSDP/HSDP for large models; know what is sharded versus replicated.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>PyTorch is the substrate (Paszke et al., 2019: eager, define-by-run execution was the design choice that won research and then production). Hugging Face is the model zoo and adaptation toolkit on top of it for most LLM teams (Wolf et al., 2020).</li>
+    <li>If you cannot load a checkpoint, run a forward pass and compute your eval metric outside the framework's Trainer, you do not control the model.</li>
+  </ul>
+</aside>
+
+<h3>Hugging Face Ecosystem</h3>
+
+<figure class="diagram">
+<pre class="ascii">Hub (weights, configs, model cards, datasets)
+    |
+    +-- transformers : AutoModel, tokenizer, generate, pipelines
+    +-- datasets     : streaming, map, fingerprinting
+    +-- accelerate   : device placement, DDP/FSDP launch
+    +-- peft         : LoRA / adapters
+    +-- trl          : SFT, DPO, reward / RL helpers
+    +-- evaluate / lighteval : metrics (pair with Volume 10)</pre>
+<figcaption>Common HF surfaces for LLM engineering. Prefer Hub digests and pinned revisions over floating <code>main</code>.</figcaption>
+</figure>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>Hub models can include custom code. Prefer <code>trust_remote_code=False</code> unless you have audited the repository.</li>
+    <li>Model licences are not all Apache-2.0. Commercial use and redistribution constraints belong in the registry (Chapter 3).</li>
+  </ul>
+</aside>
+
+<h3>JAX Overview</h3>
+
+<ul>
+  <li><strong>Strengths</strong>: pure functions, XLA compilation, strong multi-host scaling stories in research labs.</li>
+  <li><strong>Costs</strong>: smaller industry hiring pool; debugging compiled traces; ecosystem packages differ from PyTorch's.</li>
+  <li><strong>Rule</strong>: adopt JAX when your org already runs it at scale, or when a specific codebase you must use is JAX-native. Do not switch mid-product for fashion.</li>
+</ul>
+
+<table>
+  <caption>PyTorch versus JAX — engineering posture, not tribal loyalty.</caption>
+  <thead><tr><th>Concern</th><th>PyTorch</th><th>JAX</th></tr></thead>
+  <tbody>
+    <tr><td>Mental model</td><td>Eager tensors, modules, imperative debug</td><td>Pure functions + transforms (<code>jit</code>, <code>grad</code>, <code>vmap</code>)</td></tr>
+    <tr><td>Industry LLM fine-tunes</td><td>Default (HF stack)</td><td>Common in large research stacks</td></tr>
+    <tr><td>Serving path</td><td>Export / compile into engines (vLLM etc.)</td><td>Often separate export story; know your path</td></tr>
+    <tr><td>Hiring / vendors</td><td>Broad</td><td>Narrower outside labs</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>If you maintain both, isolate packages and CI images. Mixed CUDA stacks on one laptop are a time sink.</li>
+    <li>Prefer one substrate per product service unless there is a written reason.</li>
+  </ul>
+</aside>
+
+<h3>Lightning</h3>
+
+<p>Lightning (and Fabric) structures the training loop: hooks for train/val steps, checkpointing and
+strategy selection. It helps teams standardise. It does not remove the need to understand gradient
+accumulation, checkpoint formats or eval. Prefer Fabric when you want less magic than full
+Lightning modules.</p>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">Lightning helps when</p>
+    <ul>
+      <li>Many engineers share training jobs and need a common skeleton.</li>
+      <li>You want multi-GPU strategies without rewriting boilerplate each time.</li>
+    </ul></div>
+  <div class="cons"><p class="facet">Lightning hurts when</p>
+    <ul>
+      <li>The abstraction hides a bug you cannot see in the loop.</li>
+      <li>Your job is a thin HF Trainer / TRL script and Lightning adds a second paradigm.</li>
+    </ul></div>
+</div>
+
+<figure class="listing">
+<figcaption>Minimal "can we load and score?" probe — framework-agnostic habit.</figcaption>
+<pre><code>from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+name = "HuggingFaceTB/SmolLM2-135M"
+tok = AutoTokenizer.from_pretrained(name, revision="main")
+model = AutoModelForCausalLM.from_pretrained(name, revision="main")
+model.eval()
+
+prompt = "def add(a, b):\n    return"
+ids = tok(prompt, return_tensors="pt")
+with torch.no_grad():
+    out = model.generate(**ids, max_new_tokens=16, do_sample=False)
+print(tok.decode(out[0], skip_special_tokens=True))</code></pre>
+</figure>
+
+<aside class="callout impl"><span class="title">Practical Default</span>
+  <ul>
+    <li>Default stack for this book's audience: PyTorch + Transformers + PEFT/TRL + Accelerate.</li>
+    <li>Keep a one-file "load, generate, score" script that does not depend on your Trainer. Use it as a smoke test after every upgrade.</li>
+  </ul>
+</aside>
+
+<h3>Adaptation Tooling: PEFT and TRL</h3>
+
+<p>Full fine-tunes are rare for product teams. LoRA/QLoRA via PEFT and supervised / preference
+loops via TRL cover most adaptation work. The engineering risks are data quality, eval leakage and
+checkpoint hygiene — not whether you can call <code>get_peft_model</code>.</p>
+
+<figure class="listing">
+<figcaption>Shape of a LoRA attach — pedagogical; pin PEFT/Transformers versions in real jobs.</figcaption>
+<pre><code>from peft import LoraConfig, get_peft_model
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+cfg = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+    target_modules=["q_proj", "v_proj"],  # model-specific; verify names
+)
+model = get_peft_model(model, cfg)
+model.print_trainable_parameters()
+# Train with TRL SFTTrainer or a plain PyTorch loop; save adapter weights separately
+# from the base so the registry can record (base_digest, adapter_digest).</code></pre>
+</figure>
+
+<table>
+  <caption>Adaptation path versus when to use it.</caption>
+  <thead><tr><th>Path</th><th>When</th><th>Cost / risk</th></tr></thead>
+  <tbody>
+    <tr><td>Prompt / system only</td><td>Task solvable; need fastest iteration</td><td>Prompt regressions; context cost</td></tr>
+    <tr><td>RAG (Volume 14)</td><td>Knowledge changes; citations required</td><td>Retrieval failures dominate</td></tr>
+    <tr><td>LoRA / adapters</td><td>Style, format, narrow skill; shared base</td><td>Many adapters to govern at serve time</td></tr>
+    <tr><td>Full fine-tune</td><td>Large domain shift; you own the train stack</td><td>Compute, drift, harder rollback</td></tr>
+    <tr><td>Preference (DPO/RLHF)</td><td>Behaviour / preference alignment</td><td>Reward/data quality; eval subtlety</td></tr>
+  </tbody>
+</table>
+
+<h3>Environment and Reproducibility</h3>
+
+<ul>
+  <li>Lock CUDA, drivers, PyTorch and Transformers together in an image digest.</li>
+  <li>Record seeds, dataloader order flags and eval decoding parameters.</li>
+  <li>Prefer content-addressed checkpoints over "final.pt" on a shared drive.</li>
+  <li>Separate <em>training</em> code from <em>scoring</em> code so metric changes are reviewable.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>Hugging Face Trainer speeds experiments and can hide batching or padding bugs. Keep a non-Trainer smoke path.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Break your smoke script on purpose (wrong revision, missing pad token). Confirm it
+fails loudly. Then add the same check to CI for model upgrades.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="tracking-registries">Experiment Tracking and Registries</h2>
+<p class="chapter-lede">If you cannot answer which checkpoint, which data digest and which
+hyperparameters produced a metric, you do not have ML ops — you have folklore. Trackers and
+registries turn folklore into artefacts.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Two fine-tunes both claim "better than baseline". One used a different eval split. The other
+  silently changed the system prompt in the scoring script. Leadership asks which model to ship.
+  Nobody can reconstruct either run from logs alone.</p>
+</div>
+
+<table>
+  <caption>MLflow versus Weights &amp; Biases — roles, not a beauty contest.</caption>
+  <thead><tr><th>Concern</th><th>MLflow</th><th>Weights &amp; Biases</th></tr></thead>
+  <tbody>
+    <tr><td>Core model</td><td>Open-source platform; self-host friendly</td><td>SaaS-first; strong UI and collaboration</td></tr>
+    <tr><td>Tracking</td><td>Experiments, params, metrics, artefacts</td><td>Runs, metrics, media, reports</td></tr>
+    <tr><td>Model registry</td><td>First-class stages (Staging/Production)</td><td>Artefact/model registry patterns; often paired with other stores</td></tr>
+    <tr><td>Lineage</td><td>Run → model version links</td><td>Run graphs, tables, sweeps</td></tr>
+    <tr><td>Lock-in risk</td><td>Lower if you own the store; UI is secondary</td><td>Higher if all history lives only in their cloud</td></tr>
+    <tr><td>Best fit</td><td>Teams that want OSS + registry in one place</td><td>Teams that want fast iteration UX and hosted convenience</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Log enough to reproduce: code SHA, data digest, config, seed, metric definitions, model binary digest.</li>
+    <li>The registry is the release surface. Tracking is the laboratory notebook. Do not conflate them.</li>
+  </ul>
+</aside>
+
+<h3>What to Log Every Run</h3>
+
+<ul>
+  <li><strong>Identity</strong>: run id, git commit, container digest, hardware.</li>
+  <li><strong>Data</strong>: dataset name, version or content hash, train/eval split ids.</li>
+  <li><strong>Config</strong>: hyperparameters, prompt templates, decoding params if they affect scores.</li>
+  <li><strong>Metrics</strong>: primary online/offline metrics with confidence intervals when possible.</li>
+  <li><strong>Artefacts</strong>: checkpoints, tokenizer, eval predictions sample, confusion cases.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Shape of an MLflow-style run log (API names illustrative; pin your MLflow version).</figcaption>
+<pre><code>import mlflow
+
+with mlflow.start_run(run_name="sft-smollm-v3"):
+    mlflow.log_params({
+        "base_model": "HuggingFaceTB/SmolLM2-135M",
+        "lr": 2e-5,
+        "epochs": 1,
+        "git_sha": "abc1234",
+        "data_digest": "sha256:…",
+    })
+    mlflow.log_metrics({"eval_exact_match": 0.41, "eval_n": 200})
+    mlflow.log_artifact("checkpoints/epoch0/")
+    # Later: register a model version pointing at this run's artefact URI</code></pre>
+</figure>
+
+<h3>Registry Discipline</h3>
+
+<ol>
+  <li>Immutable versions: never overwrite "Production"; promote a new version.</li>
+  <li>Required metadata: eval report link, data licence, model licence, known failure modes.</li>
+  <li>Stage transitions gated by CI: offline eval + smoke serve + canary (Volume 12).</li>
+  <li>Rollback means pointing traffic at a previous digest, not rebuilding from memory.</li>
+</ol>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>Heavy logging costs storage and can leak prompts or PII into the tracker. Redact; sample; set retention.</li>
+  </ul>
+</aside>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Metrics without metric definitions (different tokenisers, different judges).</li>
+  <li>Registry that stores names but not digests.</li>
+  <li>W&amp;B-only history with no export plan for audits.</li>
+  <li>"Latest" tags used in production instead of immutable versions.</li>
+</ul>
+
+<h3>Model Cards and Release Notes</h3>
+
+<p>A registry entry without a model card is a binary with a nickname. Cards need not be long; they
+must be honest.</p>
+
+<ul>
+  <li><strong>Intended use</strong> and explicitly out-of-scope uses.</li>
+  <li><strong>Training data summary</strong> (sources, licences, known gaps).</li>
+  <li><strong>Eval results</strong> with dataset ids and decoding settings.</li>
+  <li><strong>Known failure modes</strong> (languages, domains, safety).</li>
+  <li><strong>Compute and carbon</strong> notes when your org tracks them.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Weights &amp; Biases-style run init (API illustrative).</figcaption>
+<pre><code>import wandb
+
+run = wandb.init(
+    project="forge-sft",
+    config={
+        "base_model": "HuggingFaceTB/SmolLM2-135M",
+        "lr": 2e-5,
+        "git_sha": "abc1234",
+        "data_digest": "sha256:…",
+        "eval_suite": "forge_eval_v3",
+    },
+)
+# ... train ...
+wandb.log({"eval_exact_match": 0.41, "eval_n": 200})
+wandb.save("checkpoints/adapter/")
+run.finish()
+# Export policy: periodically dump run configs + metrics to your warehouse
+# so history survives a SaaS exit.</code></pre>
+</figure>
+
+<aside class="callout impl"><span class="title">Practical Default</span>
+  <ul>
+    <li>Self-host MLflow if compliance demands data residency and you want registry+tracking together.</li>
+    <li>Use W&amp;B when collaboration UX pays for itself — and schedule exports.</li>
+    <li>Either way: promotion to Production is a CI job, not a UI click without evidence.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Take one historical "best model" story in your team. Reconstruct the data digest
+and git SHA. If you cannot, that is the backlog item — before the next fine-tune.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="serving-tools">Serving Tools</h2>
+<p class="chapter-lede">Volume 12 built serving as a systems problem. This chapter is the product
+map: which engines to try for which workload, and how they relate. Prefer OpenAI-compatible HTTP as
+the client contract so engines stay swappable.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>You have an open-weight model and a latency SLO. One engineer installs a desktop runner.
+  Another deploys a research server. A third wraps Transformers in FastAPI. All three "work" in a
+  demo and disagree on throughput by 10× under load. You need a serving tool chosen for traffic
+  shape, not familiarity.</p>
+</div>
+
+<table>
+  <caption>Serving engines — comparison for engineering choice (details evolve; re-benchmark).</caption>
+  <thead><tr><th>Engine</th><th>Strength</th><th>Weakness</th><th>Default when</th></tr></thead>
+  <tbody>
+    <tr><td><strong>vLLM</strong></td><td>PagedAttention, continuous batching, broad model/hardware coverage, OpenAI server</td><td>Fast-moving flags; tune per version</td><td>Self-hosted open-weight LLMs at scale</td></tr>
+    <tr><td><strong>SGLang</strong></td><td>RadixAttention prefix cache; strong structured / agentic multi-call programmes</td><td>Smaller ecosystem than vLLM</td><td>Shared-prefix and tool-heavy workloads</td></tr>
+    <tr><td><strong>TGI</strong> (Text Generation Inference)</td><td>HF-native serving path; production-oriented</td><td>Less universal than vLLM in many benchmarks today</td><td>HF-centric stacks that already standardise on TGI</td></tr>
+    <tr><td><strong>Ollama</strong></td><td>Local DX: pull model, run API, great for laptops and demos</td><td>Not the multi-tenant GPU scheduler for large fleets</td><td>Dev machines, edge prototypes, small teams</td></tr>
+    <tr><td><strong>llama.cpp</strong></td><td>CPU/Metal-friendly quantised inference; portable C++</td><td>Different performance envelope than GPU batching engines</td><td>CPU/edge, embedded, local quantised models</td></tr>
+    <tr><td><strong>Triton</strong> (NVIDIA)</td><td>Multi-model ensembles, mature ops, backends including TensorRT-LLM / vLLM</td><td>Heavier ops; not an LLM kernel by itself</td><td>Mixed classical + LLM platforms</td></tr>
+  </tbody>
+</table>
+
+<figure class="diagram">
+<pre class="ascii">Client (OpenAI-compatible HTTP / gRPC)
+        |
+        v
+   API / gateway  (auth, quotas, routing — Volume 12, 18)
+        |
+        +---- vLLM / SGLang / TGI   (GPU continuous batching)
+        +---- Triton (+ TensorRT-LLM or vLLM backend)
+        +---- Ollama / llama.cpp    (local / edge / CPU-Metal)</pre>
+<figcaption>Keep the client contract stable. Swap engines behind it after a bake-off on your traffic.</figcaption>
+</figure>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Engines package Volume 11 ideas (paging, batching, kernels). You still own API, auth, probes, rollout and cost.</li>
+    <li>Benchmark goodput and $/MTok on <em>your</em> prompt length mix. Public leaderboard numbers are starting points.</li>
+  </ul>
+</aside>
+
+<h3>Selection Heuristic</h3>
+
+<ol>
+  <li>Need laptop/CPU first? Start with Ollama or llama.cpp; measure quality under your quantisation.</li>
+  <li>Need multi-tenant GPU throughput? Bake off vLLM vs SGLang (and TGI if HF-standardised) on your traces.</li>
+  <li>Need many model types in one platform? Triton as the outer server; LLM backend still chosen explicitly.</li>
+  <li>Always keep a thin client interface so changing engines is a config change plus a canary.</li>
+</ol>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Pin engine versions in images. Serving regressions often arrive as "helpfully" changed defaults.</li>
+    <li>Expose <code>/health</code> and metrics your autoscaler understands (queue depth, KV utilisation).</li>
+    <li>Prefix caching changes economics for RAG and agents; include shared-prefix tests in the bake-off.</li>
+  </ul>
+</aside>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>Ollama for production GPU fleets is a category error. vLLM for every laptop prototype is also a category error. Match the tool to the environment.</li>
+  </ul>
+</aside>
+
+<h3>Engine Bake-Off Protocol</h3>
+
+<ol>
+  <li>Capture a replay set: prompt length histogram, system prompt sharing, tool-call traces.</li>
+  <li>Fix model weights and quantisation; pin engine versions in images.</li>
+  <li>Measure TTFT, TPOT, goodput, error rate and $/MTok at the SLO concurrency.</li>
+  <li>Include a prefix-heavy mix if you serve RAG or agents.</li>
+  <li>Chaos: kill a replica mid-stream; verify client retries and idempotency keys.</li>
+</ol>
+
+<figure class="listing">
+<figcaption>Illustrative vLLM OpenAI server launch (not executed here; needs a GPU host).</figcaption>
+<pre><code># Pin versions in the image. Flags change across releases — read YOUR version's docs.
+python -m vllm.entrypoints.openai.api_server \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --revision &lt;git_sha_or_digest&gt; \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.90 \
+  --enable-prefix-caching \
+  --served-model-name llama3-8b
+
+# Client stays OpenAI-compatible:
+#   base_url=http://localhost:8000/v1
+# Swap to SGLang/TGI/Ollama by changing base_url + model name in config.</code></pre>
+</figure>
+
+<figure class="listing">
+<figcaption>Local iteration with Ollama (developer machine).</figcaption>
+<pre><code># Pull once; run API compatible enough for many clients
+ollama pull smollm2:135m
+ollama serve
+# curl http://localhost:11434/api/generate -d '{"model":"smollm2:135m","prompt":"hi"}'
+# Promote to vLLM/SGLang only when load tests demand it.</code></pre>
+</figure>
+
+<table>
+  <caption>Workload hints — starting points, not laws.</caption>
+  <thead><tr><th>Workload</th><th>Try first</th><th>Also benchmark</th></tr></thead>
+  <tbody>
+    <tr><td>Chatty multi-turn with shared system prompt</td><td>SGLang or vLLM + prefix cache</td><td>Both; measure cache hit rate</td></tr>
+    <tr><td>High QPS short prompts</td><td>vLLM</td><td>TGI if HF-standardised</td></tr>
+    <tr><td>Structured decoding / constrained JSON</td><td>SGLang; vLLM structured outputs</td><td>Your schema failure rate</td></tr>
+    <tr><td>Laptop / demos / CPU</td><td>Ollama or llama.cpp</td><td>Quality under quantisation</td></tr>
+    <tr><td>Embeddings + LLM + vision in one platform</td><td>Triton front door</td><td>Per-backend SLOs separately</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout impl"><span class="title">Practical Default</span>
+  <ul>
+    <li>Dev: Ollama or llama.cpp. Staging/prod open-weight: vLLM bake-off with SGLang. Platform org: Triton as outer shell when needed.</li>
+    <li>Never let the engine's Python client become your application API — wrap the HTTP contract.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Point the Volume 12 load generator mindset at two engines with the same model.
+Report p50/p95 TTFT and tokens/sec. Winner is evidence, not preference.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="rag-data-tools">RAG and Data Tools</h2>
+<p class="chapter-lede">Retrieval quality is mostly data engineering. Tools help you load, chunk,
+embed, index and refresh corpora. They do not invent a good chunking policy or a trustworthy corpus
+(Volume 14).</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A product wires a vector database to a chat UI in an afternoon. Citations look great on the
+  launch corpus. Three months later documents are stale, chunk boundaries split tables, and nobody
+  can rebuild the index from source. The vector DB was never the hard part.</p>
+</div>
+
+<table>
+  <caption>RAG / data tooling layers.</caption>
+  <thead><tr><th>Layer</th><th>Examples</th><th>Job</th><th>Common failure</th></tr></thead>
+  <tbody>
+    <tr><td>Connectors / loaders</td><td>Unstructured, custom ETL, crawl pipelines</td><td>Ingest from Drive, HTML, PDFs, tickets</td><td>Silent parse loss; no checksums</td></tr>
+    <tr><td>Chunking / parsing</td><td>Custom splitters; docling-style parsers; LlamaIndex node parsers</td><td>Structure-aware segments</td><td>Naive fixed windows across tables/code</td></tr>
+    <tr><td>Embeddings</td><td>HF models, vendor APIs, multimodal encoders</td><td>Vectors for similarity</td><td>Model swap without reindexing</td></tr>
+    <tr><td>Vector / hybrid stores</td><td>pgvector, OpenSearch, Pinecone, Weaviate, Qdrant, Chroma</td><td>ANN + filters + hybrid BM25</td><td>No metadata filters; no hybrid</td></tr>
+    <tr><td>Orchestration libs</td><td>LangChain/LlamaIndex retrievers; custom graphs</td><td>Glue retrieval to prompts</td><td>Business logic trapped in framework glue</td></tr>
+    <tr><td>Eval for RAG</td><td>Ragas-style metrics; custom labelled sets</td><td>Faithfulness, context precision</td><td>Only vibe-checking answers</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Own the document identity, version and chunk ids. Treat the index as a build artefact.</li>
+    <li>Prefer Postgres+pgvector or OpenSearch when you already operate them and need joins/filters; use specialised vector DBs when ANN scale or features justify another system.</li>
+  </ul>
+</aside>
+
+<h3>Build Versus Framework</h3>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">Thin custom pipeline</p>
+    <ul>
+      <li>Clear data contracts and tests.</li>
+      <li>Easy to swap embedder and store.</li>
+      <li>Matches Volume 14 teaching architecture.</li>
+    </ul></div>
+  <div class="cons"><p class="facet">Heavy framework glue</p>
+    <ul>
+      <li>Fast first demo.</li>
+      <li>Harder to see retrieval failures.</li>
+      <li>Upgrades reshape abstractions under you.</li>
+    </ul></div>
+</div>
+
+<figure class="diagram">
+<pre class="ascii">Source systems --&gt; parse/validate --&gt; chunk+metadata --&gt; embed --&gt; index build
+                                           |                         |
+                                           v                         v
+                                    doc/chunk store            vector/hybrid store
+                                           \                         /
+                                            --&gt; retriever --&gt; prompt --&gt; model
+                                                     ^
+                                                     |
+                                              eval set + traces</pre>
+<figcaption>Tooling should make each arrow observable and rebuildable. If any arrow is "magic in the framework", you will not debug it.</figcaption>
+</figure>
+
+<aside class="callout impl"><span class="title">Practical Default</span>
+  <ul>
+    <li>Start with a store you can query with SQL or familiar search APIs.</li>
+    <li>Version the embedding model id into the index name.</li>
+    <li>Keep a golden question set in CI; fail index deploys on retrieval regressions.</li>
+  </ul>
+</aside>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Re-embedding into the same collection with a new model and mixed vector spaces.</li>
+  <li>No delete/tombstone story when source documents are removed (privacy incident waiting).</li>
+  <li>Chunking code that only exists inside a notebook.</li>
+</ul>
+
+<h3>Vector Store Comparison (Engineering View)</h3>
+
+<table>
+  <caption>Store choices — operational criteria over feature checklists.</caption>
+  <thead><tr><th>Store</th><th>Fits when</th><th>Mind the gap</th></tr></thead>
+  <tbody>
+    <tr><td>pgvector</td><td>You already run Postgres; need joins, transactions, RLS</td><td>ANN at very large scale needs tuning / partitioning</td></tr>
+    <tr><td>OpenSearch / Elasticsearch</td><td>Hybrid BM25+vector; existing search ops</td><td>Cluster ops complexity</td></tr>
+    <tr><td>Qdrant / Weaviate / Pinecone</td><td>Dedicated vector features; managed options</td><td>Another system to secure and backup</td></tr>
+    <tr><td>Chroma (dev)</td><td>Local prototypes</td><td>Do not confuse laptop DX with multi-tenant prod</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>Index build as a batch job contract — tool-agnostic.</figcaption>
+<pre><code>"""Conceptual index build steps your pipeline (Airflow, Prefect, cron) should expose."""
+
+def build_index(corpus_version: str, embed_model_id: str) -> str:
+    docs = load_and_validate(corpus_version)          # checksums, licence tags
+    chunks = structure_aware_chunk(docs)              # tables/code keep integrity
+    vectors = embed(chunks, model_id=embed_model_id)  # pin revision
+    index_name = f"docs_{corpus_version}_{embed_model_id}"
+    write_atomic(index_name, chunks, vectors)         # swap pointer when complete
+    smoke_retrieval(index_name, golden_questions_path="eval/rag_golden.json")
+    return index_name
+# Deploy only if smoke_retrieval meets thresholds; keep previous pointer for rollback.</code></pre>
+</figure>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>Access control belongs on document metadata and query filters, not only on the chat API. A vector hit can leak a doc the user must not see.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Name your embedding model id into the collection name. Attempt a query against a
+collection built with a different model. Confirm cosine scores are nonsense — then add a startup
+assertion that model ids match.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="agent-orchestration">Agent and Orchestration Tools</h2>
+<p class="chapter-lede">Agent frameworks accelerate expressing control flow. They are not
+harnesses (Volume 16). MCP standardises tool servers. Lock-in appears when your product logic is
+unreadable outside the framework's graph dialect.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A prototype in LangGraph ships to production. Permissions live in node functions. Budgets are
+  "max steps" in a config file. Traces are framework-specific. A security review asks for complete
+  mediation of tool calls. The answer is a rewrite — because the framework was treated as the
+  security boundary.</p>
+</div>
+
+<table>
+  <caption>Agent / orchestration surfaces.</caption>
+  <thead><tr><th>Tool / protocol</th><th>What it gives you</th><th>What it does not give you</th></tr></thead>
+  <tbody>
+    <tr><td><strong>LangGraph</strong></td><td>Stateful graphs, checkpoints, durable execution patterns</td><td>A default-deny security policy; org-wide budgets; sandboxing</td></tr>
+    <tr><td><strong>LangChain / LlamaIndex agents</strong></td><td>Batteries-included tools and retrievers</td><td>Stable long-term abstractions (expect churn)</td></tr>
+    <tr><td><strong>MCP</strong> (Model Context Protocol)</td><td>JSON-RPC tool/resource protocol; reusable servers</td><td>Trust: servers and results are still untrusted data (Volume 16)</td></tr>
+    <tr><td><strong>Custom loop + harness</strong></td><td>Full control; testability; clear policy point</td><td>More code to write up front</td></tr>
+    <tr><td><strong>Workflow engines</strong> (Temporal et al.)</td><td>Durable business workflows around model calls</td><td>LLM-specific decoding / tool semantics</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Use a framework to express the graph. Enforce effects in a harness: policy, budget, approval, sandbox, trace.</li>
+    <li>MCP is a transport and schema boundary. It is not an allow-list.</li>
+  </ul>
+</aside>
+
+<h3>Lock-in Patterns</h3>
+
+<ul>
+  <li><strong>Graph lock-in</strong>: business rules only exist as framework nodes with proprietary state serializers.</li>
+  <li><strong>Vendor lock-in</strong>: traces, evals and prompts only readable in one SaaS.</li>
+  <li><strong>Protocol lock-in</strong> (benign): speaking MCP or OpenAI tools is usually good — many clients can call them.</li>
+  <li><strong>Model lock-in</strong>: prompts and tools tuned to one provider's quirks without an adapter layer.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>Avoiding all frameworks can waste time. Accepting all framework opinions can waste the company. Put product logic and policy in modules you can unit test without starting the graph runtime.</li>
+  </ul>
+</aside>
+
+<figure class="diagram">
+<pre class="ascii">User goal
+   |
+   v
+Orchestrator / graph (LangGraph or custom)  -- expresses control flow
+   |
+   v
+Harness (policy, budget, approval, sandbox) -- mediates effects
+   |
+   v
+Tool runtime ---- local functions
+               \- MCP clients --&gt; MCP servers (filesystem, SaaS, DB)</pre>
+<figcaption>Framework above, harness in the middle, tools below. Invert this stack and incidents follow.</figcaption>
+</figure>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>MCP server descriptions and results can inject instructions. Policy must run on the next tool call regardless of what the server said.</li>
+    <li>Framework "memory" stores that write unbounded user data into prompts need retention and access control.</li>
+  </ul>
+</aside>
+
+<aside class="callout impl"><span class="title">Practical Default</span>
+  <ul>
+    <li>Prototype graphs quickly; extract pure functions early; put the harness interface under test with a scripted model.</li>
+    <li>Prefer MCP for reusable tool servers when multiple agents/products need the same integrations.</li>
+  </ul>
+</aside>
+
+<h3>MCP in the Tooling Landscape</h3>
+
+<ul>
+  <li><strong>Servers</strong> expose tools/resources over JSON-RPC — filesystem, browser, SaaS, internal APIs.</li>
+  <li><strong>Clients</strong> (IDE agents, Claude Code, custom harnesses) discover and call those tools.</li>
+  <li><strong>Benefit</strong>: write an integration once; reuse across coding agents and product agents.</li>
+  <li><strong>Non-benefit</strong>: protocol compliance ≠ safety. Volume 16's policy still decides allow/ask/deny.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Keep product logic outside the graph SDK so tests stay fast.</figcaption>
+<pre><code># good: pure decision the graph calls
+def should_escalate(ticket: dict, policy: dict) -&gt; bool:
+    return ticket["severity"] &gt;= policy["escalate_at"]
+
+# bad: severity rule only exists inside a LangGraph node closure
+# with hidden client globals — untestable without starting the runtime
+
+def test_should_escalate():
+    assert should_escalate({"severity": 3}, {"escalate_at": 3}) is True
+    assert should_escalate({"severity": 1}, {"escalate_at": 3}) is False</code></pre>
+</figure>
+
+<table>
+  <caption>Lock-in severity for agent stacks.</caption>
+  <thead><tr><th>Choice</th><th>Lock-in</th><th>Mitigation</th></tr></thead>
+  <tbody>
+    <tr><td>OpenAI tool JSON schemas</td><td>Low</td><td>Many runtimes speak them</td></tr>
+    <tr><td>MCP servers you own</td><td>Low–medium</td><td>Keep server code; swap clients</td></tr>
+    <tr><td>Framework-specific checkpoint blobs</td><td>High</td><td>Version them; abstract session store</td></tr>
+    <tr><td>Prompts only in vendor UI</td><td>High</td><td>Store prompts in git; CI eval</td></tr>
+    <tr><td>Policy only in natural language</td><td>Critical</td><td>Code policy in the harness</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>Durable graph execution (checkpoints, resume) is valuable and can couple you to a serializer. Budget an export/migration test yearly.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>List every tool your agent can call. Mark which are mediated by a harness policy
+versus only by a prompt. Anything unmarked is a finding.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="eval-observability">Evaluation and Observability Tools</h2>
+<p class="chapter-lede">Volume 10 treated evaluation as engineering. Volume 16 treated traces as
+evidence. This chapter names the tool categories that implement those disciplines in day-to-day
+work.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Production quality drops after a prompt change. Logs show the final answer but not the
+  retrieved chunks, tool calls or token costs. Offline eval was a spreadsheet last updated before
+  launch. Nobody can tell whether the regression is retrieval, routing or the model.</p>
+</div>
+
+<table>
+  <caption>Eval and observability tool categories.</caption>
+  <thead><tr><th>Category</th><th>Examples</th><th>Use for</th></tr></thead>
+  <tbody>
+    <tr><td>Offline eval harnesses</td><td>Custom pytest; Inspect; LightEval; promptfoo</td><td>CI gates on golden sets</td></tr>
+    <tr><td>LLM-as-judge platforms</td><td>In-house judges; vendor eval products</td><td>Rubric scoring with known bias limits</td></tr>
+    <tr><td>Tracing UIs</td><td>LangSmith, Arize Phoenix, Helicone, Braintrust</td><td>Debugging spans, datasets from prod</td></tr>
+    <tr><td>OpenTelemetry GenAI</td><td>OTel collectors + your APM</td><td>Vendor-neutral spans and metrics</td></tr>
+    <tr><td>Online monitors</td><td>Custom metrics; guardrail hit rates; cost dashboards</td><td>Drift, abuse, spend</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Own the eval set and metric definitions even if a SaaS runs the UI.</li>
+    <li>Prefer exporting OpenTelemetry-compatible spans so traces outlive any one vendor.</li>
+  </ul>
+</aside>
+
+<h3>What a Good Trace Contains</h3>
+
+<ul>
+  <li>Request id, user/tenant id (careful with PII), model id and version.</li>
+  <li>Token usage and estimated cost.</li>
+  <li>Retrieval: query, hit ids, scores — not necessarily full document text in hot storage.</li>
+  <li>Tool calls: names, args (redacted), latency, policy decision.</li>
+  <li>Final output hash or stored output under retention policy.</li>
+</ul>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>Full prompt logging recreates a second copy of customer secrets. Default to redaction and sampling.</li>
+  </ul>
+</aside>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">SaaS tracing</p>
+    <ul>
+      <li>Fast setup, good UX for prompt iteration.</li>
+      <li>Dataset curation from production traces.</li>
+    </ul></div>
+  <div class="cons"><p class="facet">Self-hosted OTel</p>
+    <ul>
+      <li>Data stays in your boundary.</li>
+      <li>You integrate with existing SRE tooling.</li>
+      <li>More assembly required.</li>
+    </ul></div>
+</div>
+
+<aside class="callout impl"><span class="title">Practical Default</span>
+  <ul>
+    <li>CI: deterministic offline suite on every prompt/model change.</li>
+    <li>Staging: trace-rich runs with synthetic tenants.</li>
+    <li>Prod: sampled traces + metrics; promote hard failures to pages.</li>
+  </ul>
+</aside>
+
+<h3>Offline Versus Online</h3>
+
+<table>
+  <caption>Eval modes and the tools that support them.</caption>
+  <thead><tr><th>Mode</th><th>Question</th><th>Tooling habit</th></tr></thead>
+  <tbody>
+    <tr><td>Unit / contract</td><td>Did parsers, routers, tools obey schemas?</td><td>pytest; golden JSON</td></tr>
+    <tr><td>Offline quality</td><td>Did this prompt/model beat the baseline on the suite?</td><td>Inspect / custom harness / promptfoo</td></tr>
+    <tr><td>Shadow / canary</td><td>Does live traffic prefer the candidate?</td><td>Traces + pairwise or judge sampling</td></tr>
+    <tr><td>Monitoring</td><td>Is quality/cost/safety drifting this week?</td><td>Metrics + periodic re-score jobs</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>Minimal CI hook: fail if offline score drops more than a tolerance.</figcaption>
+<pre><code># ci/eval_gate.py — conceptual
+BASELINE = 0.82
+TOLERANCE = 0.02
+
+def main(score: float) -&gt; None:
+    if score + 1e-9 &lt; BASELINE - TOLERANCE:
+        raise SystemExit(
+            f"eval regression: {score:.3f} &lt; {BASELINE - TOLERANCE:.3f}"
+        )
+    print(f"ok score={score:.3f}")
+
+# Wire: python ci/eval_gate.py $(python -m forge.eval.run --suite core)</code></pre>
+</figure>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>LLM-as-judge is cheap and biased. Calibrate against human labels on a slice; never let an unbounded judge be the only gate for safety-critical claims.</li>
+  </ul>
+</aside>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Traces without policy decisions — you see the tool call, not why it was allowed.</li>
+  <li>Eval suites that share prompts with training or few-shot pools (contamination).</li>
+  <li>Dashboards nobody owns; alerts that always page false.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="deployment-tools">Deployment Tools</h2>
+<p class="chapter-lede">Models and agents still ship as artefacts into environments with rollouts,
+flags and CI. The AI-specific pieces (GPU images, long cold starts, token cost) plug into ordinary
+deployment engineering.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Weights sit on a developer's disk. The API is started by hand on a GPU box. There is no image
+  digest, no canary, no feature flag to disable a new tool. When the model misbehaves on Friday
+  night, rollback means SSH and prayer.</p>
+</div>
+
+<table>
+  <caption>Deployment tooling map for AI services.</caption>
+  <thead><tr><th>Layer</th><th>Tools / patterns</th><th>AI-specific note</th></tr></thead>
+  <tbody>
+    <tr><td>CI</td><td>GitHub Actions, GitLab CI, Buildkite</td><td>Include eval gates and licence scans, not only unit tests</td></tr>
+    <tr><td>Images</td><td>Docker, NVIDIA base images</td><td>Separate code image from weight volume; pin CUDA</td></tr>
+    <tr><td>Orchestration</td><td>Kubernetes, KServe, cloud GPU services</td><td>Queue-depth autoscaling; slow scale-up</td></tr>
+    <tr><td>Release</td><td>Argo Rollouts, Flagger, custom canary</td><td>Shadow traffic; compare quality not only error rate</td></tr>
+    <tr><td>Config / flags</td><td>Open Feature, LaunchDarkly, custom</td><td>Kill switches for tools, prompts, models</td></tr>
+    <tr><td>IaC</td><td>Terraform, Pulumi, Helm</td><td>GPU node pools and quotas as code</td></tr>
+    <tr><td>Secrets</td><td>Vault, cloud secret managers</td><td>Never bake API keys into images or prompts</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Immutable artefacts + progressive delivery apply to models exactly as to services.</li>
+    <li>A feature flag that disables a tool is part of the incident response plan for agents.</li>
+  </ul>
+</aside>
+
+<figure class="diagram">
+<pre class="ascii">git push -&gt; CI (tests, ruff, mypy, eval smoke, licence)
+        -&gt; build image (code) + reference weights digest
+        -&gt; deploy staging -&gt; canary -&gt; full
+        -&gt; flags: model_id, prompt_rev, tools_enabled
+        -&gt; observe: latency, cost, quality samples, guardrail hits</pre>
+<figcaption>Deployment is a pipeline. AI adds digests, eval gates and quality canaries to the classic path.</figcaption>
+</figure>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>Baking multi-GB weights into every image makes pulls slow and registries fat. Mount or pull weights by digest instead.</li>
+  </ul>
+</aside>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Record <code>model_digest</code>, <code>image_digest</code> and <code>config_hash</code> on every response or trace.</li>
+    <li>Canary on both SRE signals (5xx, p95) and product signals (judge score, tool error rate).</li>
+  </ul>
+</aside>
+
+<h3>Kill Switches and Flags</h3>
+
+<ul>
+  <li><strong>model_id</strong>: pin or shift traffic between registry versions.</li>
+  <li><strong>prompt_rev</strong>: roll back a prompt without redeploying weights.</li>
+  <li><strong>tools_enabled</strong>: disable a dangerous tool class during an incident.</li>
+  <li><strong>agent_max_steps</strong>: tighten budgets when a cost incident hits.</li>
+  <li><strong>rag_index_pointer</strong>: flip to the previous index digest.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Feature-flag shaped config the service reads each request (or each session).</figcaption>
+<pre><code>from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class AIRuntimeFlags:
+    model_id: str
+    prompt_rev: str
+    tools_enabled: frozenset[str]
+    agent_max_steps: int
+    rag_index_pointer: str
+
+# Load from Open Feature / LaunchDarkly / your config service.
+# Default deny on unknown tool names even if the model asks.</code></pre>
+</figure>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>Flags that change behaviour must themselves be audited. A wide-open <code>tools_enabled=*</code> in prod is an incident preset.</li>
+  </ul>
+</aside>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>"Snowflake" GPU boxes with hand-installed drivers.</li>
+  <li>Canaries that only watch HTTP 500s while quality collapses.</li>
+  <li>No link from deployed digest back to registry model card.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 9 -->
+<section class="chapter">
+<h2 id="ai-coding-tools">AI Coding Tools</h2>
+<p class="chapter-lede">Coding agents change how software is written. They do not change what
+"done" means: correct, reviewed, tested, licensed and operable. Treat Claude Code, Cursor, Copilot
+and peers as powerful but fallible collaborators.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>An engineer accepts a 400-line agent diff that "looks right". CI is green on weak tests. A
+  dependency does not exist on PyPI. A licence-incompatible snippet was pasted from training-like
+  memorisation. Production pages at 2 a.m. The agent was helpful. The process was absent.</p>
+</div>
+
+<p class="facet">What the evidence says</p>
+<ul>
+  <li>Code models solve many self-contained problems from a docstring; Codex (Chen et al., 2021) introduced HumanEval and the unbiased pass@k estimator used in Volume 10. Function-level benchmarks say little about repository work.</li>
+  <li>On real repositories, agents are limited as much by their interface as by the model. SWE-agent (Yang et al., 2024) showed that a purpose-built agent–computer interface (file viewer, search, lint-on-edit) raised SWE-bench resolution substantially over a raw shell.</li>
+  <li>Security: in a user study, participants with an AI assistant wrote less secure code <em>and</em> were more confident that it was secure (Perry et al., 2023). Review must not relax because the author was a model.</li>
+  <li>Productivity is task-dependent. In a randomised trial with experienced open-source developers working in their own mature repositories, allowing AI tools made them about 19% slower, although they believed they had been faster (Becker et al., 2025, METR). Measure on your own work; do not import headline speedups.</li>
+</ul>
+
+<table>
+  <caption>AI coding tools — working comparison (products move quickly; re-check capabilities).</caption>
+  <thead><tr><th>Tool</th><th>Interaction model</th><th>Strengths</th><th>Watch-outs</th></tr></thead>
+  <tbody>
+    <tr><td><strong>GitHub Copilot</strong></td><td>Inline completion + chat; PR helpers</td><td>Low-friction autocomplete in the editor; broad IDE support</td><td>Weaker repo-wide agency unless paired with agent modes; review still required</td></tr>
+    <tr><td><strong>Cursor</strong></td><td>AI-native IDE; agent modes; codebase context; rules</td><td>Strong multi-file edits; project rules; MCP integrations</td><td>Context and rules quality dominate outcomes; easy to over-trust large diffs</td></tr>
+    <tr><td><strong>Claude Code</strong></td><td>Terminal / CLI agent; repo tools; permissions</td><td>Strong agentic loops on real repos; explicit permission prompts</td><td>Needs clear instructions and sandboxes; same validation gates as any agent</td></tr>
+    <tr><td><strong>Other agents</strong> (Aider, Windsurf, open tools)</td><td>Vary: CLI, IDE, PR bots</td><td>Choice and competition</td><td>Evaluate with Chapter 1 scorecard on <em>your</em> repo</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Productivity gains are real and uneven. Measure on your tasks; do not quote marketing.</li>
+    <li>Security research shows AI-generated code can introduce vulnerabilities at concerning rates — see Pearce et al. (paper cards).</li>
+    <li>The tool is only as good as the repository context you give it (Chapter 10) and the gates you enforce (Chapter 12).</li>
+  </ul>
+</aside>
+
+<h3>Where Each Tool Fits</h3>
+
+<ul>
+  <li><strong>Copilot-style completion</strong>: accelerate typing within a file you still steer turn by turn.</li>
+  <li><strong>IDE agents (Cursor)</strong>: multi-file features, refactors, navigating large codebases with rules and MCP.</li>
+  <li><strong>CLI agents (Claude Code)</strong>: longer autonomous loops, scriptable sessions, permissioned shell/edit operations.</li>
+  <li><strong>PR bots</strong>: review assistance and suggested patches — never auto-merge without gates.</li>
+</ul>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">Benefits when used well</p>
+    <ul>
+      <li>Faster boilerplate, tests, migrations and exploration.</li>
+      <li>Better onboarding when docs and rules are solid.</li>
+      <li>More time for design and evaluation work.</li>
+    </ul></div>
+  <div class="cons"><p class="facet">Costs when used poorly</p>
+    <ul>
+      <li>Confident wrong code; hallucinated APIs and packages.</li>
+      <li>Homogenised mediocre design; skipped understanding.</li>
+      <li>Secret leakage into prompts; licence risk; weak review culture.</li>
+    </ul></div>
+</div>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>Do not paste production secrets into chat. Use secret scanners and exclude <code>.env</code> from indexed context.</li>
+    <li>Enterprise policies may restrict which repos and models are allowed — treat policy as a hard constraint.</li>
+  </ul>
+</aside>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>METR and related studies suggest that on some experienced-developer tasks, AI tools can slow people down even when they feel faster. Calibrate with measurement, not vibes (paper cards).</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption>Team policy sketch for AI coding tools (adapt; store in the repo).</figcaption>
+<pre><code># AI coding policy (excerpt)
+- Allowed: Cursor / Claude Code / Copilot on company-approved models.
+- Forbidden: pasting customer PII or production secrets into prompts.
+- Required: human review on every PR; CI green including Chapter 12 gates.
+- Required: no new dependency without licence check and lockfile update.
+- Required: agent-proposed architecture changes need an ADR, not only a diff.</code></pre>
+</figure>
+
+<h3>Choosing Among Copilot, Cursor and Claude Code</h3>
+
+<table>
+  <caption>Decision hints for teams standardising on one primary tool.</caption>
+  <thead><tr><th>If you need…</th><th>Lean toward</th><th>Still require</th></tr></thead>
+  <tbody>
+    <tr><td>Inline completions in existing VS Code/JetBrains habits</td><td>Copilot</td><td>PR review + CI gates</td></tr>
+    <tr><td>Multi-file agent edits with project rules and MCP in an AI IDE</td><td>Cursor</td><td>Scoped rules; small PRs</td></tr>
+    <tr><td>Terminal-native agent loops, scriptable automation, permission prompts</td><td>Claude Code</td><td>Sandbox + AGENTS.md/CLAUDE.md</td></tr>
+    <tr><td>Heterogeneous team preferences</td><td>Allow 2 tools max</td><td>Same CI gate for everyone</td></tr>
+  </tbody>
+</table>
+
+<ul>
+  <li><strong>Context quality beats model brand</strong> for repo tasks: instructions, tests and types.</li>
+  <li><strong>Permissions</strong>: prefer tools that ask before destructive shell/network actions.</li>
+  <li><strong>Data path</strong>: know whether code leaves your boundary (cloud models vs self-hosted).</li>
+  <li><strong>Cost</strong>: seat licences plus token usage plus review time — measure all three.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Practical Default</span>
+  <ul>
+    <li>Standardise CI and review; allow limited tool choice underneath.</li>
+    <li>Run a four-week pilot with revert rate and escaped-defect metrics before org-wide rollout.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Take one merged AI-assisted PR from last month. Classify each hunk: correct,
+subtle bug, hallucinated API, unnecessary scope. Share the tally in team retro.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 10 -->
+<section class="chapter">
+<h2 id="agent-instructions">Repository Context and Agent Instructions</h2>
+<p class="chapter-lede">Agents read what you leave for them. <code>AGENTS.md</code>,
+<code>CLAUDE.md</code>, Cursor rules and similar files are part of the product surface for
+AI-assisted development. Write them like runbooks, not like marketing.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>An agent invents a second HTTP client, a new logging format and a folder that violates your
+  package layout. Reviewers blame the model. The repository never stated the conventions. Humans
+  onboarded by oral tradition; the agent only has files.</p>
+</div>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Put durable instructions in version control next to the code.</li>
+    <li>Prefer short, testable rules over essays. Link to deeper docs.</li>
+    <li>One source of truth per concern; avoid contradictory <code>AGENTS.md</code> and <code>CLAUDE.md</code> clones that drift.</li>
+  </ul>
+</aside>
+
+<h3>What Belongs in Agent Instruction Files</h3>
+
+<table>
+  <caption>Suggested content for <code>AGENTS.md</code> / <code>CLAUDE.md</code> / editor rules.</caption>
+  <thead><tr><th>Section</th><th>Include</th><th>Exclude</th></tr></thead>
+  <tbody>
+    <tr><td>Setup</td><td>How to install, run tests, lint, typecheck</td><td>Secrets; machine-specific hacks</td></tr>
+    <tr><td>Layout</td><td>Where packages live; naming</td><td>Every historical folder</td></tr>
+    <tr><td>Engineering rules</td><td>Testing expectations; error handling; API style</td><td>Vague "write clean code"</td></tr>
+    <tr><td>Security</td><td>Never commit secrets; dangerous commands</td><td>Full threat model novels</td></tr>
+    <tr><td>Do / Don't</td><td>Concrete examples from this repo</td><td>Generic blog advice</td></tr>
+    <tr><td>Pointers</td><td>Links to ADRs, architecture docs</td><td>Duplicating those docs in full</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>Compact <code>AGENTS.md</code> skeleton for a Python monorepo.</figcaption>
+<pre><code># AGENTS.md
+
+## Commands
+- Install: `uv sync`
+- Tests: `pytest -q`
+- Lint: `ruff check .`
+- Types: `mypy src`
+- Security: `bandit -r src`
+
+## Layout
+- Package code: `src/forge/`
+- Tests: `tests/` mirroring package paths
+- Do not add top-level utility modules; extend an existing package
+
+## Rules
+- Prefer modifying existing modules over new frameworks
+- Every public function needs a test or a documented reason
+- No new dependencies without licence note in the PR
+- Never read or write `.env` secrets into prompts or logs
+
+## Out of scope
+- Do not redesign serving without an ADR
+- Do not disable CI gates</code></pre>
+</figure>
+
+<h3>Context Budgets and Noise</h3>
+
+<ul>
+  <li>Huge instruction files compete with code in the context window. Keep the always-on file short.</li>
+  <li>Use path-scoped rules (e.g. frontend vs backend) so agents do not load irrelevant constraints.</li>
+  <li>Generated code, vendor trees and lockfile blobs usually should be ignored by indexing.</li>
+  <li>Refresh instructions when CI commands change — stale commands cause hallucinated workflows.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>If both <code>AGENTS.md</code> and <code>CLAUDE.md</code> exist, make one canonical and have the other point to it, or generate one from the other in CI.</li>
+    <li>Cursor project rules and Claude Code instructions should not contradict Makefile / justfile / package scripts.</li>
+  </ul>
+</aside>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>Over-prescriptive rules make agents brittle. Under-prescriptive rules make them creative in the wrong places. Prefer rules you would enforce on a human junior hire.</li>
+  </ul>
+</aside>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Contradictory instructions across README, AGENTS.md and chat memory.</li>
+  <li>Instructions that say "always" for something CI does not check.</li>
+  <li>Dumping the entire style guide into the hot context path.</li>
+</ul>
+
+<h3>AGENTS.md versus CLAUDE.md versus Editor Rules</h3>
+
+<table>
+  <caption>Where instructions live — keep them consistent.</caption>
+  <thead><tr><th>File / surface</th><th>Audience</th><th>Guidance</th></tr></thead>
+  <tbody>
+    <tr><td><code>AGENTS.md</code></td><td>Cross-tool agent readers; emerging convention</td><td>Good canonical home for commands and repo rules</td></tr>
+    <tr><td><code>CLAUDE.md</code></td><td>Claude Code and related flows</td><td>Either canonical or a thin pointer to <code>AGENTS.md</code></td></tr>
+    <tr><td>Cursor rules / <code>.cursor/rules</code></td><td>Cursor agent modes</td><td>Path-scoped; must not contradict AGENTS.md</td></tr>
+    <tr><td>README</td><td>Humans first</td><td>Onboarding prose; link to AGENTS for commands</td></tr>
+    <tr><td>CI workflows</td><td>Truth of what runs</td><td>Instructions must match these commands exactly</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption><code>CLAUDE.md</code> as a pointer — avoids drift.</figcaption>
+<pre><code># CLAUDE.md
+# Canonical agent instructions live in AGENTS.md (same repo root).
+# Read and follow AGENTS.md for commands, layout and engineering rules.
+
+See @AGENTS.md</code></pre>
+</figure>
+
+<figure class="listing">
+<figcaption>Example path-scoped Cursor rule (illustrative YAML/Markdown frontmatter styles vary).</figcaption>
+<pre><code># .cursor/rules/python-forge.mdc
+# globs: src/forge/**/*.py
+- Use existing forge.* packages; do not invent parallel utilities
+- Public functions need type hints and tests under tests/
+- Prefer explicit errors over silent None returns
+- Run: uv run pytest tests/ -q --chdir repo root before claiming done</code></pre>
+</figure>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>CI is the constitution. Agent files are the annotated statute. If they disagree, agents and humans both lose.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Diff your README install steps against CI. Fix drift. Then copy the CI commands
+into <code>AGENTS.md</code> verbatim.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 11 -->
+<section class="chapter">
+<h2 id="assisted-workflows">AI-Assisted Engineering Workflows</h2>
+<p class="chapter-lede">The highest leverage use of coding agents is not "write my whole feature".
+It is structured loops: tests first, bisecting failures, review checklists and small PRs. SWE-bench
+and similar benchmarks reward repository-shaped problem solving — so should your workflow.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>An engineer prompts "implement the billing webhook" and receives a sprawling patch. Review
+  takes longer than writing would have. Bugs hide in error paths nobody specified. The team
+  concludes "AI doesn't work" when the workflow was unspecified.</p>
+</div>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Specify the contract before the implementation: types, tests, API shapes, acceptance checks.</li>
+    <li>Keep agent sessions task-scoped. Reset when the thread is confused.</li>
+    <li>Human owns design and merge decisions; agent owns draft labour under gates.</li>
+  </ul>
+</aside>
+
+<h3>TDD with an Agent</h3>
+
+<ol>
+  <li>Write or sketch failing tests that define behaviour (you or agent under your review).</li>
+  <li>Run tests; confirm they fail for the right reason.</li>
+  <li>Ask the agent to make tests pass — without changing the tests unless you approve.</li>
+  <li>Refactor with tests green; ask for edge cases next.</li>
+  <li>Run the full gate (Chapter 12) before opening the PR.</li>
+</ol>
+
+<figure class="diagram">
+<pre class="ascii">specify acceptance -&gt; failing test -&gt; agent implements -&gt; gate (lint/type/test/sec)
+        ^                                        |
+        |                                        v
+        +----- review / tighten tests &lt;---- failures / hallucinations</pre>
+<figcaption>TDD loop with an agent as the implementation worker, not the requirements owner.</figcaption>
+</figure>
+
+<h3>Debugging Workflow</h3>
+
+<ul>
+  <li>Paste the minimal failing reproduction, not the whole log firehose.</li>
+  <li>Ask for hypotheses ranked by likelihood; demand a single next experiment.</li>
+  <li>Prefer the agent to add a failing test that captures the bug before the fix.</li>
+  <li>When the agent spins, stop: re-state invariants, or debug yourself for ten minutes.</li>
+</ul>
+
+<h3>Review Workflow</h3>
+
+<table>
+  <caption>Human review checklist for AI-generated diffs.</caption>
+  <thead><tr><th>Check</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Does the diff match the requested scope?</td><td>Agents expand scope quietly</td></tr>
+    <tr><td>Are new dependencies real and licensed?</td><td>Package hallucinations (Spracklen et al.)</td></tr>
+    <tr><td>Are error paths and timeouts handled?</td><td>Happy-path bias</td></tr>
+    <tr><td>Is security-sensitive code correct?</td><td>Pearce et al.: vulnerable patterns</td></tr>
+    <tr><td>Do tests assert behaviour, not implementation trivia?</td><td>Agents game weak tests</td></tr>
+    <tr><td>Could a junior maintain this?</td><td>If not, simplify before merge</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout impl"><span class="title">Practical Default</span>
+  <ul>
+    <li>One PR = one intent. If the agent did three things, split the commits or discard and retry.</li>
+    <li>Use agents to draft review comments on others' PRs, then verify every claim against the diff.</li>
+    <li>For refactors: require characterisation tests first.</li>
+  </ul>
+</aside>
+
+<aside class="callout advanced"><span class="title">Research Frontier</span>
+  <ul>
+    <li>SWE-bench measures agents on real GitHub issues. Scores rise quickly; contamination and harness quality matter. Use it to choose tools, not to skip your own eval.</li>
+    <li>Productivity studies disagree by task and population (Peng/Ziegler vs METR). Instrument your team.</li>
+  </ul>
+</aside>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Endless chat refinement instead of running the code.</li>
+  <li>Accepting refactors mixed into feature PRs.</li>
+  <li>No human review because "CI passed".</li>
+</ul>
+
+<h3>Prompt Patterns That Work in Repos</h3>
+
+<ul>
+  <li><strong>Contract first</strong>: "Here is the failing test output. Do not change the test. Make it pass."</li>
+  <li><strong>File boundaries</strong>: "Only modify <code>src/forge/serve/router.py</code> and its tests."</li>
+  <li><strong>Done definition</strong>: "Done means ruff, mypy and pytest green; paste the commands' output."</li>
+  <li><strong>No drive-by</strong>: "Do not rename symbols or reformat unrelated files."</li>
+  <li><strong>Ask before deps</strong>: "If you need a dependency, stop and propose it; do not edit lockfiles yet."</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Session template for a feature slice.</figcaption>
+<pre><code>## Goal
+Add idempotent POST /v1/widgets with authz.
+
+## Constraints
+- Touch only forge.api.widgets and tests/api/test_widgets.py
+- No new dependencies
+- Follow AGENTS.md commands
+
+## Acceptance
+- test_create_widget_ok
+- test_create_widget_duplicate_returns_same_id
+- test_create_widget_forbidden
+
+## Process
+1. Write failing tests
+2. Implement
+3. Run: ruff, mypy, pytest
+4. Summarise residual risks</code></pre>
+</figure>
+
+<h3>Code Review with Agents</h3>
+
+<ol>
+  <li>Human opens the PR and skims scope before asking an agent to review.</li>
+  <li>Agent lists risks by severity with file:line references.</li>
+  <li>Human verifies each claim; discards hallucinated "bugs".</li>
+  <li>Security-sensitive files (auth, crypto, payments) get mandatory human deep-read regardless.</li>
+</ol>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>Agent review can rubber-stamp insecure patterns it also generates. Pearce et al. is the warning label: tools are not a secure SDLC by themselves.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Reproduce a SWE-bench-style loop on one open issue in your repo: failing test,
+patch, gate. Time yourself with and without an agent on two similar issues.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 12 -->
+<section class="chapter">
+<h2 id="validating-generated-code">Validating Generated Code</h2>
+<p class="chapter-lede">Generated code fails in characteristic ways: inventing packages, ignoring
+types, skipping tests, introducing insecure defaults and mishandling licences. Build an automatic
+gate that catches these before review burns out.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>An agent adds <code>import safe_requests_helper</code> and a plausible PyPI name in
+  <code>requirements.txt</code>. The name is unoccupied — or worse, later occupied by an attacker
+  (slopsquatting). Install fails in CI today; supply-chain compromise tomorrow. Without a
+  validation gate, review is the only thin line.</p>
+</div>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Never install a dependency the agent invented without verifying it exists and is the intended project.</li>
+    <li>Static gates (ruff, mypy, bandit, licence) are cheap. Use them always. Tests are necessary but not sufficient.</li>
+  </ul>
+</aside>
+
+<h3>Hallucinated Packages</h3>
+
+<ul>
+  <li>Check every new dependency against the official index and your allow-list / private mirror.</li>
+  <li>Prefer adding packages humans already use in the org; be suspicious of brand-new names in agent diffs.</li>
+  <li>Pin versions; avoid floating latest on security-sensitive libraries.</li>
+  <li>Monitor for typosquatting and slopsquatting on names agents commonly invent.</li>
+</ul>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>Spracklen et al. document widespread package hallucinations in LLM code suggestions. Treat new dependency lines as high severity in review.</li>
+  </ul>
+</aside>
+
+<h3>The Validation Gate</h3>
+
+<figure class="listing">
+<figcaption>Python validation-gate listing — compose these in CI; adjust paths to your repo.</figcaption>
+<pre><code>#!/usr/bin/env bash
+# validate_generated_code.sh — fail closed on AI-assisted changes
+set -euo pipefail
+
+echo "== lockfile / deps =="
+# Ensure declared deps resolve; prefer uv/poetry/pip-tools against a mirror
+uv sync --frozen
+
+echo "== hallucinated package guard =="
+# Example: compare newly added requirement names to an allow-list
+python - &lt;&lt;'PY'
+from pathlib import Path
+allow = {l.strip() for l in Path("deps/allowlist.txt").read_text().splitlines() if l.strip() and not l.startswith("#")}
+# Collect requirement names from pyproject/requirements (simplified)
+import re, sys
+text = Path("pyproject.toml").read_text()
+names = set(re.findall(r'"([a-zA-Z0-9_.-]+)(?:[&gt;&lt;=!~].*)?"', text))
+# In a real gate, parse properly and only check *added* deps in the PR diff
+unknown = sorted(n for n in names if n.lower() not in {a.lower() for a in allow} and n.isalpha())
+# unknown handling left to your org policy; print for visibility
+print(f"parsed_candidate_names={len(names)}")
+PY
+
+echo "== format / lint =="
+ruff format --check .
+ruff check .
+
+echo "== types =="
+mypy src
+
+echo "== tests =="
+pytest -q --maxfail=1
+
+echo "== security =="
+bandit -r src -ll
+# optional: pip-audit / uv audit against known CVEs
+pip-audit || true  # tighten to fail closed when baseline is clean
+
+echo "== licences =="
+# optional: pip-licenses / reuse / scancode — fail on GPL in proprietary ships
+pip-licenses --fail-on="GPL;AGPL" || true
+
+echo "OK: validation gate passed"</code></pre>
+</figure>
+
+<table>
+  <caption>Gate layers and what they catch.</caption>
+  <thead><tr><th>Layer</th><th>Tool</th><th>Catches</th></tr></thead>
+  <tbody>
+    <tr><td>Dependency reality</td><td>Allow-list, mirror, install from lockfile</td><td>Hallucinated / typosquat packages</td></tr>
+    <tr><td>Style / bugs</td><td><code>ruff</code></td><td>Unused imports, many footguns, style drift</td></tr>
+    <tr><td>Types</td><td><code>mypy</code> / <code>pyright</code></td><td>Wrong APIs, None misuse, inventing attributes</td></tr>
+    <tr><td>Behaviour</td><td><code>pytest</code></td><td>Broken logic — if tests are strong</td></tr>
+    <tr><td>Security smells</td><td><code>bandit</code>, semgrep</td><td>Naive <code>subprocess</code>, hard-coded secrets patterns</td></tr>
+    <tr><td>CVEs</td><td><code>pip-audit</code> / OS scanners</td><td>Known vulnerable versions</td></tr>
+    <tr><td>Licences</td><td><code>pip-licenses</code>, REUSE, scancode</td><td>Copyleft / unknown licence surprises</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>Minimal pytest contract the agent must not weaken.</figcaption>
+<pre><code># tests/test_billing_webhook.py
+def test_rejects_invalid_signature(client):
+    r = client.post("/webhooks/billing", json={"id": "evt_1"}, headers={"X-Sig": "nope"})
+    assert r.status_code == 401
+
+def test_idempotent_replay(client, valid_sig):
+    body = {"id": "evt_1", "type": "invoice.paid"}
+    assert client.post("/webhooks/billing", json=body, headers=valid_sig).status_code == 200
+    assert client.post("/webhooks/billing", json=body, headers=valid_sig).status_code == 200
+    # assert side effect happened once — query your ledger</code></pre>
+</figure>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Make the gate identical locally and in CI. Agents should be told the exact commands in <code>AGENTS.md</code>.</li>
+    <li>Fail closed on new dependencies outside the allow-list for production services.</li>
+    <li>Licence policy depends on your product; encode it in CI, not in wiki prose.</li>
+  </ul>
+</aside>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>Gates without good tests create false confidence. Invest in property tests and evals for AI product code; invest in unit/integration tests for agent-written application code.</li>
+  </ul>
+</aside>
+
+<h3>What Reviewers Still Own</h3>
+
+<ul>
+  <li>Architecture fit and API design quality.</li>
+  <li>Whether tests encode the real acceptance criteria.</li>
+  <li>Subtle authZ mistakes that pass unit tests.</li>
+  <li>Operability: metrics, runbooks, rollback story.</li>
+  <li>Whether the agent introduced complexity nobody asked for.</li>
+</ul>
+
+<p>Automate the mechanical checks. Spend human attention on judgement. That division of labour is
+the entire point of Chapters 9–12.</p>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Skipping mypy because the agent "fixed" types with <code>Any</code>.</li>
+  <li>Using <code>|| true</code> forever on audit steps.</li>
+  <li>Reviewers approving because the summary sounds authoritative.</li>
+</ul>
+
+<h3>A Stricter Python Dependency Guard</h3>
+
+<figure class="listing">
+<figcaption>Python validation helper: reject newly introduced requirement names not on an allow-list.</figcaption>
+<pre><code>"""gate_deps.py — compare PR-added requirement names to deps/allowlist.txt."""
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ALLOW = {
+    line.strip().lower()
+    for line in Path("deps/allowlist.txt").read_text(encoding="utf-8").splitlines()
+    if line.strip() and not line.startswith("#")
+}
+
+# Names from unified diff added lines in common requirement files
+DIFF_REQ = re.compile(
+    r"^\+\s*(?:- )?([A-Za-z0-9][A-Za-z0-9_.-]*)(?:\[[^\]]+\])?\s*(?:[=&lt;&gt;!~]=|[;&lt;&gt;]=?)?",
+)
+
+
+def added_requirement_names(base_ref: str = "origin/main") -&gt; set[str]:
+    diff = subprocess.check_output(
+        ["git", "diff", f"{base_ref}...HEAD", "--", "pyproject.toml", "requirements*.txt"],
+        text=True,
+    )
+    names: set[str] = set()
+    for line in diff.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        # skip poetry/uv noise; tighten parser for your format
+        m = DIFF_REQ.match(line)
+        if m:
+            names.add(m.group(1).lower())
+    return names
+
+
+def main() -&gt; int:
+    added = added_requirement_names()
+    unknown = sorted(n for n in added if n not in ALLOW)
+    if unknown:
+        print("Blocked dependencies not on allow-list:", ", ".join(unknown))
+        print("If legitimate: add to deps/allowlist.txt after licence review.")
+        return 1
+    print(f"OK: {len(added)} added requirement name(s) allowed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())</code></pre>
+</figure>
+
+<figure class="listing">
+<figcaption>Compose the full gate in CI (GitHub Actions shape).</figcaption>
+<pre><code># .github/workflows/validate.yml (excerpt)
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install uv &amp;&amp; uv sync --frozen
+      - run: uv run python ci/gate_deps.py
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run mypy src
+      - run: uv run pytest -q
+      - run: uv run bandit -r src -ll
+      - run: uv run pip-audit
+      - run: uv run pip-licenses --fail-on="GPL;AGPL"</code></pre>
+</figure>
+
+<h3>Licence Policy Sketch</h3>
+
+<table>
+  <caption>Common licence postures for proprietary products (consult counsel).</caption>
+  <thead><tr><th>Licence family</th><th>Typical stance</th><th>Gate behaviour</th></tr></thead>
+  <tbody>
+    <tr><td>MIT / BSD / Apache-2.0</td><td>Usually acceptable with attribution</td><td>Allow if on allow-list</td></tr>
+    <tr><td>MPL</td><td>File-level copyleft — review</td><td>Manual approve</td></tr>
+    <tr><td>LGPL</td><td>Dynamic linking nuances — review</td><td>Manual approve</td></tr>
+    <tr><td>GPL / AGPL</td><td>Often incompatible with closed SaaS</td><td>Fail CI by default</td></tr>
+    <tr><td>Unknown / proprietary oddball</td><td>Do not ship blind</td><td>Fail CI</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout advanced"><span class="title">Research Frontier</span>
+  <ul>
+    <li>As models improve, hallucinated packages may become rarer — but slopsquatting incentives remain. Keep the allow-list even when rates drop.</li>
+    <li>Agent benchmarks (SWE-bench) optimise for tests passing; your gate must still cover security and licence axes those benches ignore.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Add <code>gate_deps.py</code> to your repo. Open a branch that adds a fake package
+<code>secure_http_helpers</code>. Confirm CI fails. Document the allow-list update process in AGENTS.md.</p></div>
+</section>
+
+<!-- ================================================================ REVIEW -->
+<section class="review">
+<h1>Volume Review</h1>
+
+<h2>What You Learned</h2>
+<ul>
+  <li>Tools are evaluated like any other dependency: problem solved, mechanism, abstraction cost, when not to use them, lock-in and total cost of ownership, decided by a time-boxed spike on your own workload.</li>
+  <li>PyTorch plus Hugging Face is the default model-development stack; trackers and registries are separate concerns joined by run IDs and artefact digests.</li>
+  <li>Serving engines, RAG tooling, agent frameworks, eval platforms and deployment tools each abstract a specific layer of Volumes 11–22; knowing that layer is what lets you debug under the tool.</li>
+  <li>Agent frameworks provide control flow, not security; permissions, budgets and sandboxes stay in the harness (Volume 16).</li>
+  <li>AI coding tools range from completion to chat to autonomous agents; their output quality depends on repository context and explicit instructions as much as on the model.</li>
+  <li>Evidence on AI-assisted development is mixed: large gains on some tasks, slowdowns on others, and a measurable security risk. Verification gates, not trust, make it safe.</li>
+</ul>
+
+<h2>Skills Checklist</h2>
+<ul>
+  <li>Score a tool with an explicit scorecard and a time-boxed spike, including exit cost.</li>
+  <li>Pick a default model-development stack and explain when JAX or Lightning is justified.</li>
+  <li>Separate experiment tracking from model registry promotion.</li>
+  <li>Choose a serving engine for laptop vs GPU fleet vs mixed-model platforms.</li>
+  <li>Draw the line between agent frameworks, MCP and harnesses.</li>
+  <li>Write <code>AGENTS.md</code> / rules that match real CI commands.</li>
+  <li>Run an AI-assisted TDD / debug / review loop without abandoning human ownership.</li>
+  <li>Enforce a validation gate against hallucinated packages, lint, types, tests, security and licences.</li>
+</ul>
+
+<h2>What You Built</h2>
+<ul>
+  <li>A tool-evaluation scorecard and spike template with TCO and exit-cost fields (Chapter 1).</li>
+  <li>Experiment-tracking wrappers for MLflow and Weights &amp; Biases that log git SHA, data digest and config (Chapter 3).</li>
+  <li>A pure, testable decision function pattern for agent graphs, separating framework control flow from policy (Chapter 6).</li>
+  <li>A CI evaluation gate script and runtime AI feature flags (Chapters 7–8).</li>
+  <li><code>AGENTS.md</code>, <code>CLAUDE.md</code> and editor rule files wired to the real CI commands (Chapter 10).</li>
+  <li>A generated-code validation gate: dependency allow-list check, lint, types, tests, security and licence scanning in one workflow (Chapter 12).</li>
+</ul>
+
+<h2>Important Code</h2>
+<table>
+  <caption>Listings to keep; they seed the repository's <code>tooling/</code> and CI configuration.</caption>
+  <thead><tr><th>Listing</th><th>Location</th><th>Concept</th><th>Used in</th></tr></thead>
+  <tbody>
+    <tr><td>MLflow / W&amp;B run logging</td><td><code>tooling/tracking</code></td><td>Reproducible experiments</td><td>Volumes 8, 10, 24</td></tr>
+    <tr><td><code>build_index</code> pipeline steps</td><td><code>tooling/rag</code></td><td>Idempotent index builds</td><td>Volume 24 knowledge layer</td></tr>
+    <tr><td><code>should_escalate</code> + test</td><td><code>forge.agents</code></td><td>Policy outside the framework</td><td>Volumes 16, 24</td></tr>
+    <tr><td><code>ci/eval_gate.py</code></td><td>CI</td><td>Offline eval gate</td><td>Every release</td></tr>
+    <tr><td><code>AIRuntimeFlags</code></td><td><code>forge.core</code></td><td>Kill switches for AI features</td><td>Volume 24 control layer</td></tr>
+    <tr><td><code>AGENTS.md</code> / <code>CLAUDE.md</code> / rules</td><td>Repository root</td><td>Agent instructions</td><td>All AI-assisted work</td></tr>
+    <tr><td><code>gate_deps.py</code>, <code>validate.yml</code></td><td>CI</td><td>Generated-code validation gate</td><td>Volume 24 practical project</td></tr>
+  </tbody>
+</table>
+
+<h2>Important Architecture</h2>
+<figure class="diagram">
+<pre class="ascii">                 +---- training: PyTorch / HF / (JAX) ---- tracker ---- registry
+product need ---+---- serve: vLLM/SGLang/TGI/Ollama/llama.cpp/Triton
+                 +---- rag: load -&gt; chunk -&gt; embed -&gt; index -&gt; retrieve
+                 +---- agents: graph framework -&gt; harness -&gt; tools/MCP
+                 +---- observe: eval sets + OTel/traces
+                 +---- deploy: CI + images + canary + flags
+
+developer loop:  instructions (AGENTS.md) -&gt; coding agent -&gt; validation gate -&gt; human review</pre>
+<figcaption>Volume 23 map: production tool layers above; AI-assisted development loop below.</figcaption>
+</figure>
+
+<h2>Failure Modes</h2>
+<ul class="failure-modes">
+  <li>Framework-of-the-month without a scorecard.</li>
+  <li>Serving demos mistaken for fleet engines.</li>
+  <li>Registry without digests; tracker without metric definitions.</li>
+  <li>Agent framework used as a security boundary.</li>
+  <li>Empty or contradictory agent instruction files.</li>
+  <li>Merging AI diffs on weak tests; hallucinated dependencies.</li>
+  <li>Prompt logging that stores secrets.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<ul>
+  <li>Tool spikes measured on your workload and written into ADRs.</li>
+  <li>Serving bake-offs on goodput and $/MTok with pinned versions.</li>
+  <li>Offline eval gates on prompt/model changes; sampled prod traces.</li>
+  <li>For coding agents: time-to-merge, revert rate, security findings, and developer experience surveys — not only vibes.</li>
+</ul>
+
+<h2>Practical Project</h2>
+<div class="frame exercise" data-title="AI-assisted feature delivery">
+  <p>Volume 24 centres this project. Preview the deliverable:</p>
+  <ol>
+    <li><strong>Pick a small product feature</strong> in Forge or your service (API endpoint + tests).</li>
+    <li><strong>Write acceptance tests first</strong>; record them in the PR description.</li>
+    <li><strong>Use an approved coding agent</strong> with an updated <code>AGENTS.md</code> that lists gate commands.</li>
+    <li><strong>Run the Chapter 12 validation gate</strong>; fix until green without disabling checks.</li>
+    <li><strong>Human review</strong> against the Chapter 11 checklist; note any hallucinated API or dependency attempt.</li>
+    <li><strong>Retrospective</strong>: where the agent saved time, where it cost time, what instruction you will add.</li>
+  </ol>
+</div>
+
+<h2>Exercises</h2>
+<ol>
+  <li>Fill the Chapter 1 scorecard for vLLM vs SGLang on a trace sample from your team (or a public trace set).</li>
+  <li>Add MLflow (or W&amp;B) params for git SHA and data digest to one training or eval script.</li>
+  <li>Write a one-page ADR: LangGraph for control flow, custom harness for tool policy — or justify a different split.</li>
+  <li>Author an <code>AGENTS.md</code> for this book's <code>forge</code> package; open a PR that only adds that file.</li>
+  <li>Introduce a deliberate fake package name in a branch and confirm your CI gate rejects it.</li>
+  <li>Pair-review an AI-generated PR using the Chapter 11 checklist; file issues for anything CI missed.</li>
+</ol>
+
+<h2>Research Papers</h2>
+<table>
+  <caption>Evidence base for tooling and AI-assisted development claims in this volume.</caption>
+  <thead><tr><th>Source</th><th>Why it is here</th></tr></thead>
+  <tbody>
+    <tr><td>Pearce et al., 2022. <em>Asleep at the Keyboard? Assessing the Security of GitHub Copilot's Code Contributions</em>. IEEE S&amp;P.</td><td>Security defect rates in AI-generated code (Ch. 9, 12).</td></tr>
+    <tr><td>Spracklen et al., 2025. Package hallucination / slopsquatting analyses of LLM-suggested dependencies.</td><td>Why dependency allow-lists belong in CI (Ch. 12).</td></tr>
+    <tr><td>Peng et al., 2023; Ziegler et al., 2024. Copilot productivity studies (e.g. ACM Queue / GitHub research).</td><td>Measured speedups on certain tasks — not universal (Ch. 9, 11).</td></tr>
+    <tr><td>Jimenez et al., 2024. <em>SWE-bench</em>. ICLR.</td><td>Repository-level agent benchmarks (Ch. 11).</td></tr>
+    <tr><td>Chen et al., 2021. <em>Evaluating Large Language Models Trained on Code</em> (Codex, HumanEval). arXiv:2107.03374.</td><td>Function-level code generation and pass@k (Ch. 9).</td></tr>
+    <tr><td>Yang et al., 2024. <em>SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering</em>. NeurIPS.</td><td>Why the agent's tool interface matters for repository work (Ch. 9, 10).</td></tr>
+    <tr><td>Perry et al., 2023. <em>Do Users Write More Insecure Code with AI Assistants?</em> ACM CCS.</td><td>Less secure code with higher confidence (Ch. 9, 11).</td></tr>
+    <tr><td>Paszke et al., 2019. <em>PyTorch: An Imperative Style, High-Performance Deep Learning Library</em>. NeurIPS.</td><td>The default model-development substrate (Ch. 2).</td></tr>
+    <tr><td>Wolf et al., 2020. <em>Transformers: State-of-the-Art Natural Language Processing</em>. EMNLP Demos.</td><td>The Hugging Face model and tokenizer layer (Ch. 2).</td></tr>
+    <tr><td>Becker et al., 2025 (METR). <em>Measuring the Impact of Early-2025 AI on Experienced Open-Source Developer Productivity</em>. arXiv:2507.09089. Findings on AI tools and experienced developer productivity (task-dependent slowdowns).</td><td>Calibrate hype with measurement (Ch. 9).</td></tr>
+    <tr><td>Kwon et al., 2023. vLLM / PagedAttention. SOSP.</td><td>Serving engine foundations (Ch. 4; Volumes 11–12).</td></tr>
+    <tr><td>Zaharia et al., 2018. MLflow. IEEE Data Eng. Bull.</td><td>Tracking and registry patterns (Ch. 3).</td></tr>
+  </tbody>
+</table>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Asleep at the Keyboard? Assessing the Security of GitHub Copilot's Code Contributions</span>
+    <span class="paper-meta">Pearce et al., 2022 · IEEE Symposium on Security and Privacy</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Does AI pair-programming suggest code with security vulnerabilities at a concerning rate?</dd>
+    <dt>Previous limitation</dt><dd>Anecdotes about insecure snippets without a systematic, scenario-based study.</dd>
+    <dt>Approach</dt><dd>Design diversity of vulnerability scenarios (e.g. CWEs); query Copilot; classify outputs as vulnerable or not with manual analysis.</dd>
+    <dt>Contribution</dt><dd>A substantial fraction of completions in their scenarios were vulnerable — enough to make "just trust the model" untenable as a security strategy.</dd>
+    <dt>Practical impact</dt><dd>Chapters 9–12: mandatory human review and security tooling for AI-authored code, especially auth, crypto, OS and injection surfaces.</dd>
+    <dt>Limitations</dt><dd>Model versions change; absolute percentages are not eternal. The qualitative lesson remains: generate then verify.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Package Hallucinations in LLM-Generated Code</span>
+    <span class="paper-meta">Spracklen et al. · analyses of fabricated dependency names (slopsquatting risk)</span></div>
+  <dl>
+    <dt>Problem</dt><dd>LLMs invent package names that look real. Empty names are a supply-chain opportunity for attackers who later register them.</dd>
+    <dt>Previous limitation</dt><dd>Dependency review assumed humans typed names from memory of real projects.</dd>
+    <dt>Approach</dt><dd>Measure hallucination rates across models and ecosystems; discuss typo/slopsquatting implications.</dd>
+    <dt>Contribution</dt><dd>Evidence that fabricated dependencies are common enough to need automated controls, not only careful reading.</dd>
+    <dt>Practical impact</dt><dd>Chapter 12 allow-lists, install-from-lockfile, and high-severity review on new deps.</dd>
+    <dt>Limitations</dt><dd>Rates vary by model and prompt style; ecosystems differ (npm vs PyPI).</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Productivity Effects of AI Coding Assistants</span>
+    <span class="paper-meta">Peng et al., 2023; Ziegler et al., 2024 · Copilot / GitHub research line</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Do AI coding assistants make developers faster on realistic tasks?</dd>
+    <dt>Previous limitation</dt><dd>Vendor demos without controlled tasks or self-reported speed only.</dd>
+    <dt>Approach</dt><dd>Controlled experiments and large-scale telemetry on completions, acceptance and task time.</dd>
+    <dt>Contribution</dt><dd>Evidence of material speedups on certain classes of tasks and populations; also nuance about when suggestions are accepted.</dd>
+    <dt>Practical impact</dt><dd>Chapter 9: expect gains on boilerplate and familiar patterns; still measure locally.</dd>
+    <dt>Limitations</dt><dd>Task selection and developer seniority affect results; not a licence to skip review.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">SWE-bench: Can Language Models Resolve Real-World GitHub Issues?</span>
+    <span class="paper-meta">Jimenez et al., 2024 · ICLR</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Unit-test coding benchmarks miss repository-scale engineering: navigation, multi-file edits, real issues.</dd>
+    <dt>Previous limitation</dt><dd>HumanEval-style tasks understate what production coding agents must do.</dd>
+    <dt>Approach</dt><dd>Issues and tests mined from popular repositories; agents must produce patches that pass hidden tests.</dd>
+    <dt>Contribution</dt><dd>A durable benchmark family (and later hardened variants) for coding agents.</dd>
+    <dt>Practical impact</dt><dd>Chapter 11 workflows: issue reproduction, tests, patches — mirror the benchmark's shape in daily work.</dd>
+    <dt>Limitations</dt><dd>Contamination and harness details matter; leaderboard ≠ your codebase.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Measuring the Impact of Early-2025 AI on Experienced Open-Source Developer Productivity</span>
+    <span class="paper-meta">METR, 2025</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Do AI tools help experienced developers on real repository tasks as much as developers believe?</dd>
+    <dt>Previous limitation</dt><dd>Self-reported speedups and studies on junior/task-simplified settings may not generalise.</dd>
+    <dt>Approach</dt><dd>Controlled study with experienced open-source developers; compare AI-allowed vs not on real tasks; collect perception vs timing.</dd>
+    <dt>Contribution</dt><dd>Evidence that, in their setting, AI tools can slow experienced developers even when they feel faster — a calibration warning.</dd>
+    <dt>Practical impact</dt><dd>Chapter 9 trade-off: instrument team outcomes; do not manage by anecdote alone.</dd>
+    <dt>Limitations</dt><dd>One study design and time slice; tools improve; results may not apply to all task types.</dd>
+  </dl>
+</section>
+
+<h2>Interview Questions</h2>
+<ol class="questions">
+  <li>Walk through your tool scorecard. Which dimension would you weight highest for a regulated bank vs a startup prototype?</li>
+  <li>When would you pick JAX over PyTorch for an LLM fine-tune in industry?</li>
+  <li>What must be immutable in a model registry entry?</li>
+  <li>Contrast Ollama, vLLM and Triton for three different deployment contexts.</li>
+  <li>Where does LangGraph end and a harness begin?</li>
+  <li>What belongs in <code>AGENTS.md</code>, and what should stay in an ADR?</li>
+  <li>Describe a TDD loop with a coding agent that prevents scope creep.</li>
+  <li>How do you stop slopsquatting from an AI-suggested dependency?</li>
+  <li>Which CI steps are necessary vs sufficient for merging AI-generated code?</li>
+  <li>How would you measure whether Cursor or Copilot is worth the licence for your team?</li>
+</ol>
+
+<h2>Comparison Tables Index</h2>
+<ul>
+  <li>Chapter 1: scorecard dimensions; TCO components.</li>
+  <li>Chapter 2: model-development tools; adaptation paths; PyTorch vs JAX.</li>
+  <li>Chapter 3: MLflow vs Weights &amp; Biases.</li>
+  <li>Chapter 4: serving engines; workload hints.</li>
+  <li>Chapter 5: RAG tooling layers; vector stores.</li>
+  <li>Chapter 6: agent/orchestration surfaces; lock-in severity.</li>
+  <li>Chapter 7: eval/observability categories; offline vs online.</li>
+  <li>Chapter 8: deployment tooling map.</li>
+  <li>Chapter 9: Copilot / Cursor / Claude Code; selection hints.</li>
+  <li>Chapter 10: AGENTS.md / CLAUDE.md / editor rules.</li>
+  <li>Chapter 11: AI diff review checklist.</li>
+  <li>Chapter 12: gate layers; licence postures.</li>
+</ul>
+
+<h2>Glossary (Tooling)</h2>
+<ul>
+  <li><strong>Allow-list (deps)</strong>: approved package names/versions permitted in production services.</li>
+  <li><strong>Bake-off</strong>: time-boxed benchmark of two tools on the same workload and pins.</li>
+  <li><strong>Exit cost</strong>: engineering and organisational cost to leave a tool or vendor.</li>
+  <li><strong>Harness</strong>: runtime enforcing policy, budgets, approval and sandboxing around an agent (Volume 16).</li>
+  <li><strong>Model registry</strong>: immutable model versions with metadata and promotion stages.</li>
+  <li><strong>Slopsquatting</strong>: registering package names that models commonly hallucinate, for supply-chain attacks.</li>
+  <li><strong>Scorecard</strong>: weighted evaluation criteria recorded in an ADR before adoption.</li>
+</ul>
+
+<h2>Next Volume</h2>
+<p>Volume 24 is the project volume for AI-assisted feature delivery: take a real feature from
+acceptance tests through an agent-assisted implementation, validation gates, review and
+retrospective. Bring this volume's scorecards, instruction files and CI gate — they are the
+operating system for that project.</p>
+<p class="facet">Bring these with you</p>
+<ul>
+  <li>The Chapter 1 scorecard habit.</li>
+  <li>Open interfaces (OpenAI-compatible serve, OTel, MCP) to reduce lock-in.</li>
+  <li><code>AGENTS.md</code> aligned with real commands.</li>
+  <li>The Chapter 12 validation gate as a merge requirement.</li>
+  <li>Scepticism toward productivity anecdotes without measurement.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Closing</span>
+  <ul>
+    <li>Tools multiply judgement; they do not replace it.</li>
+    <li>The best stack is the one you can evaluate, operate, exit and teach.</li>
+    <li>Coding agents are part of that stack — gated like any other untrusted contributor.</li>
+  </ul>
+</aside>
+
+<p>When Volume 24 asks you to deliver a feature with an agent, treat this volume as the checklist:
+scorecard for any new library, instructions that match CI, and a gate that fails closed on
+hallucinated packages and silent licence risk.</p>
+
+</section>
+
+</body>
+</html>

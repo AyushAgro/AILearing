@@ -1,0 +1,2083 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 26 · AI Coding Agents in Practice</title>
+<meta name="volume" content="Volume 26 · AI Coding Agents in Practice">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 26</p>
+  <h1 class="no-toc">AI Coding Agents in Practice</h1>
+  <p class="tp-subtitle">Claude, ChatGPT, Cursor, Kiro: Files, Features and Optimised Workflows</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Treat modern AI coding products as a <em>system</em>: which tool for which job; which repo files each tool reads; how to structure rules, skills and MCP.</li>
+  <li>Run three disciplined workflows — learning, vibe prototyping and production delivery with verification — without confusing them.</li>
+  <li>Compare Claude, ChatGPT, Cursor and Kiro with an explicit <strong>Documented</strong> versus <strong>Inferred</strong> label on every vendor claim.</li>
+  <li>Ship a shared workspace module as <code>forge.devex</code>: scaffold, <code>AGENTS.md</code> linter, MCP allow-list checker, session checklists and gate metrics.</li>
+  <li>Prepare the handoff to Volume 27 (Forward Deployed AI Engineering) with secrets hygiene and customer-code policies already practised.</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>Volume 1: AI-assisted development habits and the difference between a demo and a system.</li>
+  <li>Volumes 15–16: agents, tools, MCP and harnesses — here the “agent” is a coding product, not your product runtime.</li>
+  <li>Volume 23: tool scorecards, <code>AGENTS.md</code>/<code>CLAUDE.md</code>, validation gates and the evidence that AI-authored code needs review.</li>
+  <li>You can run pytest, read a diff and refuse to paste a production key into a chat box.</li>
+</ul>
+
+<p class="facet">How to read the code</p>
+<ul>
+  <li>Every listing was executed with Python 3.12.8 on macOS. Printed output is real and unedited.</li>
+  <li>Listings seed <code>src/forge/devex/</code>: <code>scaffold</code>, <code>agents_lint</code>, <code>mcp_allowlist</code>, <code>gates</code>, <code>session</code>, <code>transcript</code> and a CLI via <code>python -m forge.devex</code>.</li>
+  <li>No listing calls a hosted coding agent API. The volume teaches <em>how you operate</em> those products; it does not invent fake proprietary UIs or claim official screenshots.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Package layout</span>
+  <ul>
+    <li><code>forge/devex/scaffold.py</code> — canonical <code>AGENTS.md</code>, <code>CLAUDE.md</code>, <code>.cursor/rules</code>, MCP stubs, skills.</li>
+    <li><code>forge/devex/agents_lint.py</code> — required sections, secret shapes, forbidden “disable CI” encouragement.</li>
+    <li><code>forge/devex/mcp_allowlist.py</code> — server name allow-list and secret-like env refusal.</li>
+    <li><code>forge/devex/gates.py</code> — ship-gate runner and fail-rate-by-category metrics.</li>
+    <li><code>forge/devex/session.py</code> — learning / vibe / ship checklists.</li>
+    <li><code>forge/devex/transcript.py</code> — toy metrics: files touched, tests run, gate failures.</li>
+  </ul>
+</aside>
+
+<aside class="callout core"><span class="title">Documented versus Inferred</span>
+  <ul>
+    <li><strong>Documented</strong>: behaviour described in vendor docs, public product pages or peer-reviewed papers cited in this volume.</li>
+    <li><strong>Inferred</strong>: engineering judgement, community practice or an extrapolation where the public record is thin or moving. Treat as provisional; re-check before writing policy.</li>
+    <li>Products change weekly. Prefer criteria and file layouts over memorising menu labels.</li>
+  </ul>
+</aside>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1   Coding-agent stack     chat / IDE / CLI / cloud; when not to use
+Chapter 2   Feature matrix         Claude · ChatGPT · Cursor · Kiro (Doc/Inf)
+Chapter 3   Workspace module       forge.devex: files every tool can share
+Chapter 4   Claude                 Projects, Artifacts, Claude Code, CLAUDE.md
+Chapter 5   ChatGPT                Projects, Custom GPTs, coding modes
+Chapter 6   Cursor                 Tab, Chat, Composer/Agent, Rules, MCP
+Chapter 7   Kiro                   Spec-driven / agentic IDE (AWS lineage)
+Chapter 8   Workflow A · Learning  Socratic loops, notes, tests
+Chapter 9   Workflow B · Vibe      throwaway branches, time-boxes
+Chapter 10  Workflow C · Ship      spec → tests → agent → gates → PR
+Chapter 11  Multi-tool playbooks   handoffs, parallel exploration, conflicts
+Chapter 12  Team / enterprise      shared rules, secrets, productivity eval</pre>
+<figcaption>Map of Volume 26. Volume 23 surveyed the stack; this volume operationalises coding agents as daily practice.</figcaption>
+</figure>
+
+<aside class="callout warning"><span class="title">How this volume relates to Volume 23</span>
+  <ul>
+    <li>Volume 23 surveyed the tooling landscape and introduced AGENTS.md, gates and coding-agent failure modes.</li>
+    <li>This volume goes deep on four products (Claude, ChatGPT, Cursor, Kiro), ships <code>forge.devex</code>, and separates learning / vibe / ship as named workflows.</li>
+    <li>If you only skim one prior chapter, skim Volume 23 Chapters 9–12.</li>
+  </ul>
+</aside>
+
+<p class="facet">British English note</p>
+<ul>
+  <li>This volume uses <em>optimised</em>, <em>behaviour</em> and <em>labelled</em> in prose; code identifiers stay ASCII where ecosystems expect them (<code>normalize</code> if added later).</li>
+  <li>Security callouts are dense on purpose: the failure mode is pasting production keys “just once”.</li>
+</ul>
+
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="coding-agent-stack">The Coding-Agent Stack</h2>
+<p class="chapter-lede">A coding agent is not one product. It is a family of interaction models —
+chat, IDE agent, CLI agent, cloud/background agent — with different context, permissions and
+failure modes. Choosing poorly wastes tokens; choosing blindly ships defects.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A team standardises on “the AI tool” after a demo. Six months later the same people use chat
+  for architecture, an IDE agent for multi-file edits, a CLI agent for overnight refactors and a
+  cloud bot for PR comments — with four contradictory instruction files and no shared gate. The
+  tools are fine. The stack was never designed.</p>
+</div>
+
+<p class="facet">Four interaction surfaces</p>
+<ul>
+  <li><strong>Chat (browser / app)</strong>: high-level reasoning, learning, rubber-ducking, light coding without deep repo coupling. Examples: ChatGPT, Claude.ai. <em>Documented</em></li>
+  <li><strong>IDE agent</strong>: multi-file edits inside an editor with project rules, @-context and optional MCP. Examples: Cursor; Kiro as an agentic IDE. <em>Documented</em> / <em>Inferred</em> for Kiro details</li>
+  <li><strong>CLI / terminal agent</strong>: permissioned shell and edit loops over a checkout. Example: Claude Code. <em>Documented</em></li>
+  <li><strong>Cloud / background agent</strong>: long-running or PR-attached agents that continue without your laptop. Cursor Cloud Agents / Bugbot-style review and peers. <em>Documented</em> where vendor-named; treat feature depth as moving.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">                    context depth          autonomy          best default use
+chat (web)          low–medium            low               learn, plan, rubber-duck
+IDE agent           medium–high           medium            multi-file feature in-repo
+CLI agent           high (repo tools)     medium–high       longer loops, scriptable
+cloud / PR agent    medium (diff-scoped)  high (async)      review, overnight tasks
+
+Shared requirement for all four: human ownership of merge + CI gates (Vol 23 Ch 12)</pre>
+<figcaption>Stack view. Autonomy without gates is not velocity; it is deferred incident cost.</figcaption>
+</figure>
+
+<table>
+  <caption>Where ChatGPT, Claude, Cursor and Kiro typically sit (products move; re-check).</caption>
+  <thead><tr><th>Product</th><th>Primary surface</th><th>Also offers</th><th>Evidence</th></tr></thead>
+  <tbody>
+    <tr><td>ChatGPT</td><td>Chat / Projects</td><td>Custom GPTs; coding agent modes; Advanced Data Analysis</td><td>Documented</td></tr>
+    <tr><td>Claude (claude.ai)</td><td>Chat / Projects</td><td>Artifacts; computer use where enabled</td><td>Documented</td></tr>
+    <tr><td>Claude Code</td><td>CLI agent</td><td>Repo tools; permission prompts; <code>CLAUDE.md</code></td><td>Documented</td></tr>
+    <tr><td>Cursor</td><td>AI-native IDE</td><td>Tab, Chat, Composer/Agent, Rules, MCP, cloud agents</td><td>Documented</td></tr>
+    <tr><td>Kiro</td><td>Agentic / spec-driven IDE</td><td>Steering files, hooks, autonomy levels (AWS-associated)</td><td>Documented at product level; deep UI details Inferred</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Match the surface to the job. Do not use a cloud agent to learn a concept you have not run locally.</li>
+    <li>Match the workflow to the risk. Learning and vibe coding are allowed; shipping requires gates (Chapters 8–10).</li>
+    <li>When <em>not</em> to use an agent: irreversible production changes, unclear requirements, security-sensitive code you cannot review, or when you need to build the mental model yourself first.</li>
+  </ul>
+</aside>
+
+<h3>When Not to Use an Agent</h3>
+
+<table>
+  <caption>Stop-conditions. Default to a smaller surface when any row fires.</caption>
+  <thead><tr><th>Signal</th><th>Prefer instead</th></tr></thead>
+  <tbody>
+    <tr><td>You cannot state acceptance criteria in one paragraph</td><td>Write the spec (or Workflow A notes) before any agent edit</td></tr>
+    <tr><td>The change touches auth, crypto, payments or tenancy</td><td>Human-designed patch; agent may draft tests only</td></tr>
+    <tr><td>Customer code or PII would enter the prompt</td><td>Redacted samples or local-only tooling per policy (Chapter 12)</td></tr>
+    <tr><td>You are tired and will rubber-stamp a large diff</td><td>Stop. Merge quality is a human property</td></tr>
+    <tr><td>The agent is looping on the same failing test</td><td>Reset context; fix one hypothesis yourself for ten minutes</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>Never paste production keys, customer PII or proprietary customer repositories into a consumer chat product unless your enterprise contract and DLP explicitly allow it.</li>
+    <li>Volume 17’s threat model still applies: the prompt channel is untrusted input from the model’s point of view when tools and MCP are attached.</li>
+  </ul>
+</aside>
+
+
+<h3>Cost, Context and Control as First-Class Variables</h3>
+
+<p>Volume 15 showed that agency costs tokens roughly quadratically in steps when every call
+re-reads the transcript. Coding agents inherit the same economics: a confused Composer or Claude
+Code session that retries the same failing test ten times is not “persistence”; it is a budget
+incident with a git branch attached.</p>
+
+<div class="math">\mathbb{E}[\text{session tokens}] \approx \sum_{i=1}^{n} (c_0 + i\Delta)
+= n c_0 + \tfrac{n(n+1)}{2}\Delta</div>
+
+<p>Here <span class="math">c_0</span> is the always-on context (rules, AGENTS.md, open files) and
+<span class="math">\Delta</span> is the growth per tool round. Prompt caching may reduce price; it
+does not reduce the cognitive load of reviewing a 2&nbsp;000-line diff that accrued while you were
+not watching.</p>
+
+<table>
+  <caption>Control knobs you actually own, independent of vendor brand.</caption>
+  <thead><tr><th>Knob</th><th>What it controls</th><th>Default for ship work</th></tr></thead>
+  <tbody>
+    <tr><td>Goal specificity</td><td>How many interpretations the agent can invent</td><td>Acceptance tests + file bounds</td></tr>
+    <tr><td>Context set</td><td>Which files and docs enter the window</td><td>Minimal <code>@</code> / explicit paths</td></tr>
+    <tr><td>Permissions</td><td>Shell, network, MCP, secret files</td><td>Ask before destructive; deny unknown MCP</td></tr>
+    <tr><td>Session length</td><td>Compounding error and review debt</td><td>Reset after two identical failures</td></tr>
+    <tr><td>Merge authority</td><td>Whether autonomous output becomes product</td><td>Human + CI only</td></tr>
+  </tbody>
+</table>
+
+<figure class="diagram">
+<pre class="ascii">decision tree (start here)
+
+clear acceptance + reversible change?
+   no  -&gt; Workflow A (learn) or write the spec
+   yes -&gt; needs deep repo tools?
+            no  -&gt; chat for plan, then stop
+            yes -&gt; production path?
+                     no  -&gt; Workflow B (vibe, timed)
+                     yes -&gt; Workflow C (gates)</pre>
+<figcaption>Stack choice is downstream of workflow choice. Do not pick a cloud agent because it is trendy.</figcaption>
+</figure>
+
+<aside class="callout advanced"><span class="title">Research Frontier</span>
+  <ul>
+    <li>SWE-agent (Yang et al., 2024) argues the agent–computer interface is as important as the base model for repository tasks. That is why IDE/CLI agents with search, lint feedback and file viewers systematically beat paste-into-chat for monorepos.</li>
+    <li>Function-level benchmarks (HumanEval / Codex) remain useful for model comparison and nearly useless as a substitute for your CI gate.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>List the last five agent sessions you ran. Classify each as chat / IDE / CLI / cloud and as
+Workflow A / B / C. How many ships were secretly vibes?</p></div>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Treating “ChatGPT said” and “the IDE agent patched” as the same evidence class.</li>
+  <li>Running a high-autonomy agent on a repo with empty or contradictory instruction files.</li>
+  <li>Using vibe-coding habits on a ship branch.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="feature-matrix">Feature Matrix</h2>
+<p class="chapter-lede">Completion, chat, multi-file edit, terminal tools, MCP, rules/skills,
+memory, cloud agents and review are different capabilities. Cost and context limits are engineering
+constraints, not footnotes.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A comparison spreadsheet copied from a blog ranks tools by “intelligence”. The team buys seats.
+  Six weeks later the real differentiators were: whether project rules are versioned, whether MCP is
+  allow-listed, and whether cloud agents can see secrets. The matrix was wrong because it measured
+  the model instead of the system.</p>
+</div>
+
+<aside class="callout warning"><span class="title">Accuracy policy for this chapter</span>
+  <ul>
+    <li>Cells are labelled <strong>Documented</strong> or <strong>Inferred</strong>.</li>
+    <li>We describe features in tables. We do not invent fake proprietary screenshots or claim to reproduce official UI.</li>
+    <li>When unsure, we mark Inferred and recommend re-checking vendor docs before policy decisions.</li>
+  </ul>
+</aside>
+
+<table>
+  <caption>Capability matrix — Claude (chat + Claude Code), ChatGPT, Cursor, Kiro.</caption>
+  <thead>
+    <tr><th>Capability</th><th>Claude</th><th>ChatGPT</th><th>Cursor</th><th>Kiro</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Inline completion / Tab</td>
+      <td>Via IDE integrations / Claude Code edit loop — <em>Inferred</em> as “not Cursor-Tab”</td>
+      <td>Copilot-adjacent / coding modes vary — <em>Inferred</em></td>
+      <td>Tab completion — <em>Documented</em></td>
+      <td>IDE completion expected — <em>Inferred</em></td>
+    </tr>
+    <tr>
+      <td>Chat over codebase</td>
+      <td>Projects + Claude Code tools — <em>Documented</em></td>
+      <td>Projects / uploaded context — <em>Documented</em></td>
+      <td>Chat with <code>@</code> context — <em>Documented</em></td>
+      <td>Chat in agentic IDE — <em>Documented</em> (product); depth <em>Inferred</em></td>
+    </tr>
+    <tr>
+      <td>Multi-file / composer-style edit</td>
+      <td>Claude Code multi-file edits — <em>Documented</em></td>
+      <td>Coding agent modes — <em>Documented</em> (product); parity <em>Inferred</em></td>
+      <td>Composer / Agent — <em>Documented</em></td>
+      <td>Spec-driven multi-step edits — <em>Inferred</em> detail</td>
+    </tr>
+    <tr>
+      <td>Terminal / tool use</td>
+      <td>Claude Code permissions — <em>Documented</em></td>
+      <td>Tool / agent modes; ADA for data — <em>Documented</em></td>
+      <td>Agent terminal + MCP tools — <em>Documented</em></td>
+      <td>Hooks / autonomy levels — <em>Inferred</em> from product positioning</td>
+    </tr>
+    <tr>
+      <td>MCP</td>
+      <td>Supported in Claude Code / tooling ecosystem — <em>Documented</em></td>
+      <td>Ecosystem varies by surface — <em>Inferred</em></td>
+      <td>First-class MCP config — <em>Documented</em></td>
+      <td>Likely / evolving — <em>Inferred</em>; verify before mandating</td>
+    </tr>
+    <tr>
+      <td>Rules / skills / instruction files</td>
+      <td><code>CLAUDE.md</code>, Projects knowledge — <em>Documented</em></td>
+      <td>Custom GPTs / Project instructions — <em>Documented</em></td>
+      <td>User/project Rules, memories, skills — <em>Documented</em></td>
+      <td>Steering files — <em>Documented</em> at concept level</td>
+    </tr>
+    <tr>
+      <td>Memory</td>
+      <td>Project/chat memory features evolve — <em>Inferred</em> specifics</td>
+      <td>Memory feature — <em>Documented</em></td>
+      <td>Memories — <em>Documented</em></td>
+      <td>Steering persistence — <em>Inferred</em></td>
+    </tr>
+    <tr>
+      <td>Cloud / background / review agents</td>
+      <td>Vendor cloud coding offerings evolve — <em>Inferred</em></td>
+      <td>Async / agent modes evolve — <em>Inferred</em></td>
+      <td>Cloud Agents, Bugbot-style review — <em>Documented</em> (names); scope moves</td>
+      <td>Async agentic flows — <em>Inferred</em></td>
+    </tr>
+  </tbody>
+</table>
+
+<table>
+  <caption>Engineering constraints that dominate tool choice more than brand.</caption>
+  <thead><tr><th>Constraint</th><th>Why it matters</th><th>Practice</th></tr></thead>
+  <tbody>
+    <tr><td>Context window &amp; retrieval</td><td>Wrong files in context beat a stronger model</td><td>Curate <code>@</code> refs; keep <code>AGENTS.md</code> short</td></tr>
+    <tr><td>Token / seat cost</td><td>Long agent loops are a budget line</td><td>Time-box; prefer Workflow B only on throwaway branches</td></tr>
+    <tr><td>Permission model</td><td>Shell and network are the blast radius</td><td>Prefer ask-before-destructive; deny by default for MCP</td></tr>
+    <tr><td>Data residency / training</td><td>Customer code may be forbidden in consumer tiers</td><td>Chapter 12 policies; enterprise contracts</td></tr>
+    <tr><td>Exit cost</td><td>Rules only in one vendor’s format lock you in</td><td>Canonical <code>AGENTS.md</code> + thin per-tool adapters (Chapter 3)</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Optimise for <em>shared repo files + shared CI gates</em>, then allow limited tool preference underneath.</li>
+    <li>A feature that cannot be expressed as a file, a permission or a gate is hard to teach and hard to audit.</li>
+  </ul>
+</aside>
+
+
+<h3>Reading the Matrix Without Marketing</h3>
+
+<p>Vendor blogs optimise for capability maximalism: every cell tends toward “yes”. Engineering
+comparisons optimise for <em>operability</em>: can you version the behaviour, audit the data path
+and exit? The Documented/Inferred labels are a discipline against wishful cells.</p>
+
+<table>
+  <caption>How to fill a cell when docs are ambiguous.</caption>
+  <thead><tr><th>Situation</th><th>Label</th><th>Action</th></tr></thead>
+  <tbody>
+    <tr><td>Named in official docs with behaviour description</td><td>Documented</td><td>Cite the doc date in the ADR</td></tr>
+    <tr><td>Seen in a demo video only</td><td>Inferred</td><td>Spike before policy</td></tr>
+    <tr><td>Third-party blog claim</td><td>Inferred</td><td>Do not train juniors on it</td></tr>
+    <tr><td>Former feature removed</td><td>Documented (historical)</td><td>Strike from runbooks</td></tr>
+    <tr><td>Enterprise-only SKU</td><td>Documented for that SKU</td><td>Do not assume consumer parity</td></tr>
+  </tbody>
+</table>
+
+<h3>Cost and Context Limits as Constraints</h3>
+
+<ul>
+  <li><strong>Seat licences</strong> are visible; <strong>token burn on Agent mode</strong> is often not. Measure both.</li>
+  <li><strong>Context pollution</strong> (huge rules, generated trees, lockfiles) lowers answer quality before you hit a hard token cap.</li>
+  <li><strong>Rate limits</strong> turn long autonomous loops into queue-shaped outages mid-refactor.</li>
+  <li><strong>Review time</strong> is part of cost. A “free” agent diff that takes four hours to review is not free.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Keep a living scorecard in the repo (Volume 23 Chapter 1) with a “last verified” date per tool.</li>
+    <li>When a Documented cell drives a security policy, link the vendor doc URL and archive a PDF snapshot.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption>Minimal scorecard row you can store next to <code>AGENTS.md</code>.</figcaption>
+<pre><code># tools/coding-agents.md (excerpt)
+| Tool   | Surface | MCP | Rules file        | Last verified | Notes              |
+|--------|---------|-----|-------------------|---------------|--------------------|
+| Cursor | IDE     | yes | .cursor/rules     | 2026-03-01    | Documented         |
+| Claude | CLI+web | yes | CLAUDE.md pointer | 2026-03-01    | Documented         |
+| Kiro   | IDE     | ?   | steering          | 2026-03-01    | Re-check (Inferred)|</code></pre>
+</figure>
+
+<div class="frame exercise"><p>Pick one capability row above. Open the current vendor docs for your licensed tools and
+re-label each cell Documented or Inferred from <em>today’s</em> docs. File any Inferred cell that
+your team treats as policy.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="workspace-module">The Workspace Module (<code>forge.devex</code>)</h2>
+<p class="chapter-lede">Every coding tool reads a slightly different set of files. The fix is not
+four contradictory manuals. It is one canonical workspace module that tools share, with thin
+adapters where vendors insist on their own filenames.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p><code>README.md</code> says <code>pytest</code>. <code>AGENTS.md</code> says <code>npm test</code>.
+  Cursor rules say “always use poetry”. Claude Code follows <code>CLAUDE.md</code> that nobody updated
+  after the monorepo move. Each agent is obedient — to a different fiction.</p>
+</div>
+
+<figure class="diagram">
+<pre class="ascii">repo root
+├── AGENTS.md                 # canonical commands + rules (cross-tool)
+├── CLAUDE.md                 # thin pointer → AGENTS.md
+├── .cursor/
+│   ├── rules/*.mdc           # path-scoped Cursor rules
+│   └── mcp.json              # MCP servers (allow-listed)
+├── .mcp.json                 # optional root MCP mirror for CLI tools
+├── .agents/skills/...        # reusable skill docs (ship-gate, etc.)
+├── .env.example              # never real secrets
+└── src/forge/devex/          # scaffold + linters + gates (this volume)</pre>
+<figcaption>Canonical layout written by <code>forge.devex.scaffold</code>. Adapt names; keep one source of truth.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption><code>forge/devex/scaffold.py</code>: generate the shared workspace module.</figcaption>
+<pre><code>from pathlib import Path
+from forge.devex import WorkspaceSpec, scaffold_workspace
+
+root = Path("demo-workspace")
+created = scaffold_workspace(root, WorkspaceSpec())
+for path in created:
+    print(path.relative_to(root))</code></pre>
+</figure>
+<pre class="output">AGENTS.md
+CLAUDE.md
+.cursor/rules/python-forge.mdc
+.cursor/mcp.json
+.mcp.json
+.agents/skills/ship-gate/SKILL.md
+.env.example</pre>
+
+<figure class="listing">
+<figcaption>Excerpt of the scaffolded <code>AGENTS.md</code> (full text is in <code>scaffold.AGENTS_MD</code>).</figcaption>
+<pre><code># AGENTS.md
+
+## Commands
+- Install: `uv sync`
+- Tests: `pytest -q`
+- Lint: `ruff check .`
+- Types: `mypy src`
+- Security: `bandit -r src`
+
+## Layout
+- Package code: `src/forge/`
+- Tests: `tests/` mirroring package paths
+
+## Rules
+- Prefer modifying existing modules over new frameworks
+- Never read or write `.env` secrets into prompts or logs
+- Never paste production keys, customer PII or proprietary customer code into chat
+
+## Out of scope
+- Do not redesign serving without an ADR
+- Do not disable CI gates</code></pre>
+</figure>
+
+<figure class="listing">
+<figcaption><code>CLAUDE.md</code> as a pointer — avoids drift between Claude Code and other tools.</figcaption>
+<pre><code># CLAUDE.md
+# Canonical agent instructions live in AGENTS.md (same repo root).
+# Read and follow AGENTS.md for commands, layout and engineering rules.
+
+See @AGENTS.md</code></pre>
+</figure>
+
+<figure class="listing">
+<figcaption>Path-scoped Cursor rule (illustrative frontmatter; styles vary by version).</figcaption>
+<pre><code>---
+description: Forge Python package conventions
+globs: src/forge/**/*.py
+alwaysApply: false
+---
+- Use existing forge.* packages; do not invent parallel utilities
+- Public functions need type hints and tests under tests/
+- Run: `pytest -q` from the repo root before claiming done
+- Never commit secrets or paste `.env` contents into chat</code></pre>
+</figure>
+
+<figure class="listing">
+<figcaption>MCP config stub — keep servers on an allow-list (Chapter 3 linter).</figcaption>
+<pre><code>{
+  "mcpServers": {
+    "forge-docs": {
+      "command": "python",
+      "args": ["-m", "forge.harness.mcp_server"],
+      "env": {}
+    }
+  }
+}</code></pre>
+</figure>
+
+<figure class="listing">
+<figcaption><code>forge/devex/agents_lint.py</code>: required headings and secret heuristics (abridged).</figcaption>
+<pre><code>from __future__ import annotations
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+REQUIRED_HEADINGS = ("## Commands", "## Layout", "## Rules")
+SECRET_PATTERNS = (
+    (re.compile(r"(?i)(api[_-]?key|secret|password|token)\s*[:=]\s*\S+"),
+     "possible secret assignment"),
+    (re.compile(r"sk-[A-Za-z0-9]{20,}"), "openai-like key shape"),
+)
+
+@dataclass(frozen=True)
+class LintFinding:
+    severity: str
+    message: str
+    line: int | None = None
+
+def _encourages_bad_practice(line: str) -&gt; str | None:
+    lower = line.strip().lower().lstrip("#-* ").strip()
+    if lower.startswith(("do not ", "don't ", "never ", "must not ")):
+        return None
+    if "disable ci" in lower:
+        return "must not tell agents to disable CI"
+    if "skip tests" in lower:
+        return "must not tell agents to skip tests"
+    if "paste" in lower and ".env" in lower:
+        return "must not encourage pasting .env into prompts"
+    return None
+
+def lint_agents_md(text: str | Path) -&gt; list[LintFinding]:
+    body = text.read_text(encoding="utf-8") if isinstance(text, Path) else text
+    findings: list[LintFinding] = []
+    lower = body.lower()
+    for heading in REQUIRED_HEADINGS:
+        if heading.lower() not in lower:
+            findings.append(LintFinding("error", f"missing required section: {heading}"))
+    for i, line in enumerate(body.splitlines(), start=1):
+        for pattern, label in SECRET_PATTERNS:
+            if pattern.search(line):
+                findings.append(LintFinding("error", f"{label} on line {i}", i))
+        label = _encourages_bad_practice(line)
+        if label:
+            findings.append(LintFinding("error", f"{label} (line {i})", i))
+    return findings</code></pre>
+</figure>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>CI commands in <code>AGENTS.md</code> must match workflow YAML exactly. Drift is a defect.</li>
+    <li>Skills are runbooks the agent can be pointed at; they are not a substitute for failing tests.</li>
+    <li>Local MCP overrides (e.g. <code>mcp.local.json</code>) stay gitignored — they often hold machine paths or tokens.</li>
+  </ul>
+</aside>
+
+<h3>Linting <code>AGENTS.md</code> and MCP</h3>
+
+<figure class="listing">
+<figcaption>Lint the canonical file; reject secret shapes and “please disable CI”.</figcaption>
+<pre><code>from forge.devex.agents_lint import format_findings, lint_agents_md
+from forge.devex.scaffold import AGENTS_MD
+
+print(format_findings(lint_agents_md(AGENTS_MD)))
+
+bad = "# hi\nPlease disable CI always\nAPI_KEY=sk-abcdefghijklmnopqrstuvwxyz012345\n"
+print(format_findings(lint_agents_md(bad)))</code></pre>
+</figure>
+<pre class="output">AGENTS.md lint: OK
+AGENTS.md lint: 7 finding(s)
+  [error] missing required section: ## Commands
+  [error] missing required section: ## Layout
+  [error] missing required section: ## Rules
+  [warning] Commands section should mention how to run tests
+  [error] L2 must not tell agents to disable CI (line 2)
+  [error] L3 possible secret assignment on line 3
+  [error] L3 openai-like key shape on line 3</pre>
+
+<figure class="listing">
+<figcaption>MCP allow-list checker — unknown servers and secret-like env fail closed.</figcaption>
+<pre><code>from forge.devex.mcp_allowlist import check_mcp_allowlist, format_mcp_findings
+
+ok = {"mcpServers": {"forge-docs": {"command": "python", "args": ["-m", "x"], "env": {}}}}
+print(format_mcp_findings(check_mcp_allowlist(ok)))
+
+bad = {"mcpServers": {"shadow-exfil": {"command": "npx", "env": {"TOKEN": "sk-abc"}}}}
+print(format_mcp_findings(check_mcp_allowlist(bad)))</code></pre>
+</figure>
+<pre class="output">MCP allow-list: OK
+MCP allow-list: 2 finding(s)
+  [error] (shadow-exfil) server 'shadow-exfil' not on allow-list ['filesystem', 'forge-docs', 'git', 'sqlite']
+  [error] (shadow-exfil) refusing secret-like env for 'shadow-exfil': TOKEN</pre>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>MCP expands the agent’s tool surface. An allow-list is the minimum; argument policy still belongs in your harness (Volume 16).</li>
+    <li><code>.env.example</code> is documentation. Real secrets never belong in instruction files, MCP env blocks or chat.</li>
+  </ul>
+</aside>
+
+
+<h3>Rules versus Skills versus MCP</h3>
+
+<table>
+  <caption>Three different kinds of “make the agent better” artefacts.</caption>
+  <thead><tr><th>Artefact</th><th>What it is</th><th>Failure when misused</th></tr></thead>
+  <tbody>
+    <tr><td>Rules / AGENTS.md</td><td>Always-on or path-scoped constraints</td><td>Novel-length essays that crowd out code</td></tr>
+    <tr><td>Skills</td><td>On-demand runbooks for a job (e.g. ship-gate)</td><td>Skills that duplicate CI instead of pointing at it</td></tr>
+    <tr><td>MCP</td><td>External tools the agent may call</td><td>Unreviewed servers with network and secrets</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Rules constrain. Skills teach a procedure. MCP extends capability. Confusing the three produces either paralysis or unbounded agency.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption>Skill stub from the scaffold — a procedure, not a second constitution.</figcaption>
+<pre><code># Skill: ship-gate
+
+## When to use
+Before opening a PR that includes agent-authored code.
+
+## Steps
+1. Confirm AGENTS.md commands still match CI.
+2. Run lint, types, tests and bandit.
+3. Reject any new dependency not on the allow-list.
+4. Human review of security-sensitive paths (auth, crypto, OS, SQL).</code></pre>
+</figure>
+
+<h3>Hooks and Local Fakes</h3>
+
+<p>Some products support hooks (pre-edit, post-command). Treat them like CI lite: useful for
+formatting and secret scanning reminders; dangerous if they silently mutate policy. Local fakes
+(Volume 15’s <code>ScriptedModel</code> pattern) still belong in tests — do not ask a coding agent
+to “pretend” a production API when you can run a deterministic fake in-process.</p>
+
+<figure class="listing">
+<figcaption>CLI: scaffold then lint in one breath.</figcaption>
+<pre><code># from code/ with PYTHONPATH=src
+python -m forge.devex scaffold /tmp/forge-ws
+python -m forge.devex lint-agents /tmp/forge-ws/AGENTS.md
+python -m forge.devex check-mcp /tmp/forge-ws/.cursor/mcp.json</code></pre>
+</figure>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>One shared module reduces drift. Over-sharing (forcing frontend rules into backend paths) creates noise. Use globs.</li>
+  </ul>
+</aside>
+
+<div class="frame checklist">
+  <ul>
+    <li><code>AGENTS.md</code> Commands match CI exactly.</li>
+    <li><code>CLAUDE.md</code> does not fork Commands.</li>
+    <li>Cursor rules are path-scoped where possible.</li>
+    <li>MCP servers are on the allow-list; no secret env.</li>
+    <li><code>.env</code> is gitignored; only <code>.env.example</code> is committed.</li>
+  </ul>
+</div>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Four full copies of the style guide that drift independently.</li>
+  <li>MCP servers added “just for a spike” and left in the shared config.</li>
+  <li>Instruction files that contradict CI.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="claude">Claude (Chat, Projects, Claude Code)</h2>
+<p class="chapter-lede">Claude’s strength for many engineering teams is long-context reasoning and
+an explicit CLI agent (Claude Code) that asks before destructive actions. Use chat for architecture;
+use Claude Code when the repo and permissions matter.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>An engineer pastes half a codebase into claude.ai, gets a beautiful design, then re-types it
+  into the IDE by hand — or worse, pastes secrets from <code>.env</code> “so Claude can debug”.
+  The model was helpful. The boundary was missing.</p>
+</div>
+
+<table>
+  <caption>Claude surfaces used in this volume.</caption>
+  <thead><tr><th>Surface</th><th>Use when</th><th>Evidence</th></tr></thead>
+  <tbody>
+    <tr><td>Claude.ai chat</td><td>Architecture, trade-off analysis, learning plans</td><td>Documented</td></tr>
+    <tr><td>Projects / knowledge</td><td>Sticky context for a repo or design pack without full IDE coupling</td><td>Documented</td></tr>
+    <tr><td>Artifacts</td><td>Self-contained drafts (docs, small apps) to iterate in-chat</td><td>Documented</td></tr>
+    <tr><td>Computer use</td><td>Where enabled: UI-driving tasks — high risk; rare in ship workflows</td><td>Documented (capability); use Inferred for your org’s enablement</td></tr>
+    <tr><td>Claude Code</td><td>Repo-native agent loops with tools and permission prompts</td><td>Documented</td></tr>
+    <tr><td><code>CLAUDE.md</code></td><td>Repo instructions Claude Code reads</td><td>Documented</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Prefer Claude (chat) when the bottleneck is reasoning quality and the artefact is a design, ADR or learning note.</li>
+    <li>Prefer Claude Code when the bottleneck is navigating and editing a real checkout under permissions.</li>
+    <li>Keep <code>CLAUDE.md</code> as a pointer to <code>AGENTS.md</code> unless you have a deliberate Claude-only section.</li>
+  </ul>
+</aside>
+
+<h3><code>CLAUDE.md</code> Patterns</h3>
+
+<ul>
+  <li><strong>Pointer pattern</strong> (default): one line “see <code>AGENTS.md</code>” — Chapter 3.</li>
+  <li><strong>Delta pattern</strong>: pointer plus Claude-Code-only notes (permission preferences, forbidden commands).</li>
+  <li><strong>Monorepo pattern</strong>: root pointer + package-local deltas that never rewrite Commands.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Practical Default</span>
+  <ul>
+    <li>Put “never cat <code>.env</code>” in <code>AGENTS.md</code> so every tool sees it.</li>
+    <li>In Claude Code sessions, require the agent to paste command output for lint/tests before claiming done — same as Volume 23.</li>
+  </ul>
+</aside>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>Projects knowledge can accumulate stale secrets and customer snippets. Periodically audit uploads.</li>
+    <li>Computer use and broad tool permissions are not appropriate for production credentials.</li>
+  </ul>
+</aside>
+
+
+<h3>Projects and Knowledge Hygiene</h3>
+
+<p>Claude Projects are sticky context. That is their value and their risk. A Project that began as
+“architecture notes” often accretes API keys from a debugging session six weeks ago. Schedule an
+audit the way you schedule dependency updates.</p>
+
+<ol>
+  <li>List every uploaded file and pasted snippet in the Project.</li>
+  <li>Delete anything with credentials, customer identifiers or production hostnames.</li>
+  <li>Replace with redacted fixtures or public sample schemas.</li>
+  <li>Record the audit date in the Project description.</li>
+</ol>
+
+<h3>Artifacts versus Repository Truth</h3>
+
+<p>Artifacts are excellent for iterating on a self-contained draft. They are not the source of
+truth once code must live in git. Promote Artifact contents through Workflow C: tests, review,
+PR — never “download and force-push”.</p>
+
+<figure class="listing">
+<figcaption>Claude Code session template aligned with <code>AGENTS.md</code>.</figcaption>
+<pre><code>## Goal
+Add TranscriptMetrics.secret_warnings unit coverage.
+
+## Bounds
+- Only touch tests/test_devex.py and forge/devex/transcript.py
+- No new dependencies
+- Do not modify AGENTS.md
+
+## Done means
+Paste output of: pytest -q tests/test_devex.py
+and: ruff check src/forge/devex</code></pre>
+</figure>
+
+<aside class="callout impl"><span class="title">Permissions</span>
+  <ul>
+    <li>Prefer Claude Code’s ask-before-destructive defaults for ship work.</li>
+    <li>Deny network for sessions that only need local tests unless MCP is explicitly required.</li>
+  </ul>
+</aside>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Using computer use against production admin UIs.</li>
+  <li>Duplicating the entire style guide into CLAUDE.md until it drifts from AGENTS.md.</li>
+  <li>Trusting Artifacts that never ran under CI.</li>
+</ul>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">Lean on Claude when</p>
+    <ul>
+      <li>You need careful architecture or long-document synthesis.</li>
+      <li>You want an explicit permissioned CLI agent on a checkout.</li>
+    </ul></div>
+  <div class="cons"><p class="facet">Prefer another surface when</p>
+    <ul>
+      <li>You need tight IDE Tab-completion UX all day (Cursor).</li>
+      <li>Your org’s approved path is ChatGPT Enterprise only.</li>
+    </ul></div>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="chatgpt">ChatGPT (and Codex-Style Coding)</h2>
+<p class="chapter-lede">ChatGPT is often the best learning and planning surface, and a reasonable
+light-coding partner when you are not deeply coupled to a private monorepo. Do not confuse a good
+plan in chat with a merged PR.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A junior engineer asks ChatGPT for “the full microservice”, copies it into main, and skips
+  tests because “the model already reasoned about edge cases”. The plan looked complete. The
+  repository never ran.</p>
+</div>
+
+<table>
+  <caption>ChatGPT capabilities relevant to coding practice.</caption>
+  <thead><tr><th>Capability</th><th>Role in workflows</th><th>Evidence</th></tr></thead>
+  <tbody>
+    <tr><td>Chat + Projects</td><td>Sticky project context for plans and learning</td><td>Documented</td></tr>
+    <tr><td>Custom GPTs</td><td>Packaged instructions/tools for a recurring job</td><td>Documented</td></tr>
+    <tr><td>Memory</td><td>Cross-chat preferences — audit for secret leakage</td><td>Documented</td></tr>
+    <tr><td>Advanced Data Analysis</td><td>Notebook-like exploration of tables/plots</td><td>Documented</td></tr>
+    <tr><td>Coding agent modes / Codex-style flows</td><td>Heavier coding assistance; product names move</td><td>Documented at product level; exact IDE parity Inferred</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Use ChatGPT for Workflow A (learning) and for drafting Workflow C specs — then implement in a repo-coupled tool.</li>
+    <li>Custom GPTs are not a security boundary. They are prompts with optional tools.</li>
+    <li>Rubber-ducking is valuable: force the model to ask you questions before writing code.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption>Learning-plan prompt template (Workflow A) — no secrets, no customer code.</figcaption>
+<pre><code>Goal: understand how our forge.devex AGENTS.md linter decides severity.
+Constraints: do not write production patches; ask me Socratic questions first.
+Done when: I can explain required sections and secret heuristics without notes,
+and I have one pytest that encodes the rule.</code></pre>
+</figure>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>ChatGPT without repo tools invents plausible APIs. Always run code locally before trusting a snippet.</li>
+    <li>Enterprise retention and training settings are policy inputs (Chapter 12), not preferences.</li>
+  </ul>
+</aside>
+
+
+<h3>Custom GPTs without Theatre</h3>
+
+<p>A Custom GPT with a long instruction block and three actions looks like a product. It is still
+a prompt. Use Custom GPTs for recurring <em>learning</em> and <em>planning</em> jobs (generate a
+session checklist; quiz me on Volume 16 harness phases). Do not use them as the merge gate.</p>
+
+<table>
+  <caption>Safe versus unsafe Custom GPT patterns.</caption>
+  <thead><tr><th>Pattern</th><th>Verdict</th></tr></thead>
+  <tbody>
+    <tr><td>Quiz me on forge.devex gates using only public book text</td><td>Safe learning aid</td></tr>
+    <tr><td>Actions that POST to internal deploy webhooks</td><td>Unsafe without enterprise controls</td></tr>
+    <tr><td>Instructions that include a “temporary” API key</td><td>Incident — rotate immediately</td></tr>
+    <tr><td>Pointer to AGENTS.md contents you paste once</td><td>Will rot; prefer repo files</td></tr>
+  </tbody>
+</table>
+
+<h3>Advanced Data Analysis for Engineers</h3>
+
+<p>ADA (or equivalent code-execution chat modes) helps when you have a CSV of gate metrics and want
+a quick plot. It is not your production notebook platform. Export results; re-run critical
+analyses in a reviewed script under <code>src/</code>.</p>
+
+<aside class="callout advanced"><span class="title">Codex-style coding</span>
+  <ul>
+    <li>OpenAI’s coding-agent surfaces evolve in name and IDE depth. Treat “Codex” as a family of coding-agent behaviours: stronger autonomy, still untrusted for merge.</li>
+    <li>Label exact menu claims Inferred unless your licensed SKU’s docs match.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Convert one successful ChatGPT plan from last week into a Workflow C acceptance-test file.
+Delete any secrets from the chat export first.</p></div>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Pastes of proprietary customer code into a consumer ChatGPT session.</li>
+  <li>Custom GPT instructions that contradict <code>AGENTS.md</code>.</li>
+  <li>Treating Advanced Data Analysis as a production ETL runtime.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="cursor">Cursor</h2>
+<p class="chapter-lede">Cursor is an AI-native IDE: Tab for completion, Chat for questions,
+Composer/Agent for multi-file work, Rules and Memories for durable context, MCP for tools. The
+failure mode is infinite edit loops on an under-specified goal.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>An engineer opens Agent mode with “fix the flaky tests”. The agent touches twelve packages,
+  renames utilities, and still fails CI. The thread is polluted. Starting over feels like defeat —
+  so they keep prompting. Two hours later the branch is unreviewable.</p>
+</div>
+
+<table>
+  <caption>Cursor building blocks (names per public product docs; depth evolves).</caption>
+  <thead><tr><th>Feature</th><th>Engineering use</th><th>Evidence</th></tr></thead>
+  <tbody>
+    <tr><td>Tab</td><td>Low-friction completion while you steer</td><td>Documented</td></tr>
+    <tr><td>Chat</td><td>Q&amp;A with optional <code>@</code> file/folder/doc context</td><td>Documented</td></tr>
+    <tr><td>Composer / Agent</td><td>Multi-file edits and tool-using loops</td><td>Documented</td></tr>
+    <tr><td><code>@</code> context</td><td>Explicit context curation — prefer over dumping the monorepo</td><td>Documented</td></tr>
+    <tr><td>Rules (user / project)</td><td>Versionable conventions under <code>.cursor/rules</code></td><td>Documented</td></tr>
+    <tr><td>Memories</td><td>Sticky preferences — audit like chat memory</td><td>Documented</td></tr>
+    <tr><td>MCP</td><td>External tools; allow-list via <code>forge.devex</code></td><td>Documented</td></tr>
+    <tr><td>Bugbot / Cloud Agents</td><td>Async review or background work</td><td>Documented (product names); treat scope as moving</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Context quality beats model brand for repo tasks: rules, tests, types and narrow <code>@</code> refs.</li>
+    <li>Bound Agent sessions: files, packages, “do not rename”, “do not add deps”.</li>
+    <li>When the agent loops twice on the same failure, reset — do not negotiate with a confused thread.</li>
+  </ul>
+</aside>
+
+<figure class="diagram">
+<pre class="ascii">good Cursor loop
+
+goal + file bounds + failing test
+        |
+        v
+Agent edits --&gt; run AGENTS.md commands --&gt; fix or STOP
+        |                                      |
+        +-- scope creep? --&gt; revert drive-bys -+
+        +-- third identical failure? --&gt; new chat / human debug</pre>
+<figcaption>Optimising Cursor is mostly session hygiene, not prompt cleverness.</figcaption>
+</figure>
+
+<aside class="callout impl"><span class="title">Practical Default</span>
+  <ul>
+    <li>Project Rules for path-scoped conventions; user Rules for personal taste that must not override CI.</li>
+    <li>Keep always-apply rules short. Put essays in docs the agent <code>@</code>-reads when needed.</li>
+    <li>Cloud Agents and Bugbot still require the same merge gates as a human PR.</li>
+  </ul>
+</aside>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>Indexing and chat can pull secrets from ignored-but-open files. Exclude <code>.env</code>; use secret scanners.</li>
+    <li>MCP servers with network or filesystem scope are part of your threat model (Volume 17).</li>
+  </ul>
+</aside>
+
+
+<h3>Optimising <code>@</code> Context</h3>
+
+<ul>
+  <li>Prefer <code>@file</code> and <code>@folder</code> for the slice you are changing over “whole codebase”.</li>
+  <li>Attach the failing test output, not the entire CI log.</li>
+  <li>Attach <code>AGENTS.md</code> only when the agent is inventing commands — otherwise it should already be indexed via rules.</li>
+  <li>Exclude generated code, vendored trees and huge lockfiles from indexing where the product allows.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Anti-loop prompt when Composer starts thrashing.</figcaption>
+<pre><code>Stop editing. Summarise in five bullets:
+1) what you believe is failing
+2) what you changed so far
+3) the single next experiment
+Do not modify files until I approve the experiment.
+Bounds remain: only tests/test_devex.py</code></pre>
+</figure>
+
+<h3>Memories and Rules Drift</h3>
+
+<p>Memories that say “we use poetry” while the repo uses <code>uv</code> will sabotage every Agent
+session. Audit Memories quarterly. Project Rules that always-apply should be short enough to read
+in one screen.</p>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>Bugbot / cloud review can catch issues humans miss; they can also flood PRs with low-signal comments. Triage like any static analyser: severity, suppressions, owners.</li>
+  </ul>
+</aside>
+
+<table>
+  <caption>Cursor session budgets (team defaults you can adopt).</caption>
+  <thead><tr><th>Mode</th><th>Time-box</th><th>Max files touched before mandatory reset</th></tr></thead>
+  <tbody>
+    <tr><td>Tab-only</td><td>n/a</td><td>n/a — you steer</td></tr>
+    <tr><td>Chat</td><td>30 min</td><td>0 edits unless you paste deliberately</td></tr>
+    <tr><td>Agent (ship)</td><td>45–60 min</td><td>8 files; else split the PR</td></tr>
+    <tr><td>Agent (vibe)</td><td>60–90 min</td><td>unlimited on throwaway branch only</td></tr>
+  </tbody>
+</table>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Always-apply rules that contradict <code>AGENTS.md</code>.</li>
+  <li>Accepting huge Composer diffs without reading security-sensitive hunks.</li>
+  <li>Infinite “one more fix” loops instead of narrowing the goal.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="kiro">Kiro</h2>
+<p class="chapter-lede">Kiro is positioned as an AWS-associated, spec-driven agentic IDE: steering
+files, hooks and autonomy levels shape how much the agent may do without you. Treat deep UI claims
+as Inferred until you verify against current docs.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A team hears “spec-driven agentic IDE” and assumes the tool will invent a correct
+  specification, implement it and open a perfect PR. Spec-driven only helps if a human owns the
+  spec and the gates. Autonomy without a contract is vibe coding with better branding.</p>
+</div>
+
+<table>
+  <caption>Kiro concepts used in this volume (verify before writing org policy).</caption>
+  <thead><tr><th>Concept</th><th>Working meaning</th><th>Evidence</th></tr></thead>
+  <tbody>
+    <tr><td>Spec-driven flow</td><td>Write/agree behaviour before bulk edits</td><td>Documented at product positioning; workflow detail Inferred</td></tr>
+    <tr><td>Steering files</td><td>Durable instructions analogous to rules / AGENTS</td><td>Documented (concept)</td></tr>
+    <tr><td>Hooks</td><td>Lifecycle automations around agent actions</td><td>Inferred depth — confirm in current docs</td></tr>
+    <tr><td>Autonomy levels</td><td>How much the agent may do without confirmation</td><td>Documented (concept); map to your permission policy</td></tr>
+    <tr><td>AWS / enterprise fit</td><td>May align with AWS identity and compliance stories</td><td>Inferred for your account — check contracts</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Choose Kiro when spec-first agentic IDE fit and AWS-enterprise constraints dominate — after a Volume 23 scorecard spike.</li>
+    <li>Still keep canonical <code>AGENTS.md</code>. Steering files should not fork Commands.</li>
+    <li>Map autonomy levels onto Workflow B vs C: high autonomy only on throwaway branches or behind gates.</li>
+  </ul>
+</aside>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">Kiro may fit when</p>
+    <ul>
+      <li>Your organisation already standardises on AWS tooling and wants an IDE-shaped agent.</li>
+      <li>You want explicit autonomy dials for less experienced contributors.</li>
+    </ul></div>
+  <div class="cons"><p class="facet">Prefer Cursor / Claude Code when</p>
+    <ul>
+      <li>Your team already has Rules/MCP/CLAUDE.md muscle memory and green CI gates.</li>
+      <li>Exit cost and multi-cloud portability outrank AWS alignment.</li>
+    </ul></div>
+</div>
+
+
+<h3>Spec-Driven Does Not Mean Spec-Optional</h3>
+
+<p>If Kiro (or any agentic IDE) generates a specification artefact, a human still owns its
+correctness. Treat generated specs like generated code: review, then freeze acceptance tests that
+encode the spec before bulk implementation.</p>
+
+<figure class="diagram">
+<pre class="ascii">human problem statement
+        |
+        v
+  draft spec (tool-assisted) --&gt; human edit --&gt; acceptance tests
+        |                                           |
+        +---- autonomy dial low --------------------+
+        |                                           v
+        +---- implementation agent ------&gt; Workflow C gates</pre>
+<figcaption>Spec-driven flow with a human freeze point. Autonomy dials apply after the freeze.</figcaption>
+</figure>
+
+<h3>Steering Files and the Canonical Module</h3>
+
+<p>Map steering files onto the Chapter 3 layout:</p>
+<ul>
+  <li>Commands and layout → still live in <code>AGENTS.md</code>.</li>
+  <li>Kiro-specific autonomy or hook preferences → thin steering delta, not a second Commands section.</li>
+  <li>If steering and Cursor rules disagree, CI wins; then fix the files.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Spike protocol for Kiro</span>
+  <ul>
+    <li>One engineer, three days, one Forge feature slice.</li>
+    <li>Scorecard: exit cost, MCP story, secrets path, autonomy controls, CI fit.</li>
+    <li>Deliverable: ADR with Documented vs Inferred table dated to the docs you read.</li>
+  </ul>
+</aside>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Assuming AWS association implies your account’s compliance controls automatically apply to prompts.</li>
+  <li>Max autonomy on a customer delivery branch.</li>
+  <li>Training slides with invented Kiro screenshots.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Accuracy</span>
+  <ul>
+    <li>Do not invent menu labels or claim official screenshots for Kiro in internal training decks.</li>
+    <li>Re-run the Chapter 2 matrix against current Kiro docs before a buy decision.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="workflow-learning">Workflow A — Learning</h2>
+<p class="chapter-lede">Learning mode uses agents to build mental models: spaced prompts, Socratic
+dialogue, notes and tests. Copying without running is the anti-pattern.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Someone “learns RAG” by pasting a tutorial into chat, saving the answer, and never running a
+  retriever. In the interview they recite vocabulary. In production they cannot debug a bad chunk.
+  The agent accelerated illusion, not skill.</p>
+</div>
+
+<figure class="listing">
+<figcaption>Session checklist from <code>forge.devex.session</code> for learning mode.</figcaption>
+<pre><code>from forge.devex.session import check_session, format_checklist
+print(format_checklist(check_session("learning")))</code></pre>
+</figure>
+<pre class="output">workflow=learning
+items:
+  1. State the concept you want to understand in one sentence
+  2. Ask for a Socratic explanation, not a paste-ready solution
+  3. Run a tiny experiment yourself before accepting an answer
+  4. Write one note and one test that encode what you learned
+  5. Mark Documented vs Inferred when quoting vendor or paper claims
+hard_stops:
+  - Do not merge learning-session code to main
+  - Do not paste production secrets or customer code</pre>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>The artefact of Workflow A is notes + a failing-then-passing test, not a PR.</li>
+    <li>Force the model to ask questions. If it only lectures, you are consuming, not learning.</li>
+    <li>Spaced repetition beats one mega-chat: revisit the same concept with a new experiment.</li>
+  </ul>
+</aside>
+
+<ol>
+  <li>Write one sentence: what you want to be able to explain tomorrow.</li>
+  <li>Ask for a Socratic session; answer out loud or in a scratch buffer.</li>
+  <li>Run a 20-line experiment (even a toy) yourself.</li>
+  <li>Encode the invariant in a test under <code>tests/</code> on a learning branch.</li>
+  <li>File Documented vs Inferred claims in your note so marketing does not become memory.</li>
+</ol>
+
+
+<h3>Spaced Prompts and Mental Models</h3>
+
+<p>One marathon chat creates familiarity, not mastery. Prefer three short sessions across days:</p>
+<ol>
+  <li>Day 0 — Socratic dialogue; you explain back; no code merge.</li>
+  <li>Day 2 — rebuild the toy experiment from memory; ask only when stuck for five minutes.</li>
+  <li>Day 5 — write a test that fails if the invariant is wrong; keep it.</li>
+</ol>
+
+<figure class="listing">
+<figcaption>Note template that forces Documented vs Inferred.</figcaption>
+<pre><code># Learning note: MCP allow-lists
+Claim: Cursor supports project MCP config in .cursor/mcp.json
+Evidence: Documented (vendor docs, date ____)
+
+Claim: Kiro MCP parity with Cursor
+Evidence: Inferred — re-check before policy
+
+Experiment run: python -m forge.devex check-mcp ...
+Output: (paste)
+Test added: tests/test_devex.py::test_mcp_allowlist</code></pre>
+</figure>
+
+<aside class="callout warning"><span class="title">Anti-pattern</span>
+  <ul>
+    <li>“Explain like I’m five” forever. Eventually you must operate the real interface: pytest, git, the gate CLI.</li>
+  </ul>
+</aside>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">Learning mode gains</p>
+    <ul>
+      <li>Durable notes and tests.</li>
+      <li>Calibrated confidence.</li>
+    </ul></div>
+  <div class="cons"><p class="facet">Learning mode costs</p>
+    <ul>
+      <li>Slower than vibe for demos.</li>
+      <li>Temptation to “just merge the learning branch”.</li>
+    </ul></div>
+</div>
+
+<p class="facet">Anti-patterns</p>
+<ul class="failure-modes">
+  <li>Copying solutions without running them.</li>
+  <li>Merging “learning” patches that rename production modules.</li>
+  <li>Asking for interview cheat-sheets instead of experiments.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 9 -->
+<section class="chapter">
+<h2 id="workflow-vibe">Workflow B — Vibe Coding</h2>
+<p class="chapter-lede">Vibe coding is allowed: fast prototypes on throwaway branches with a
+time-box. It must stop before production. The skill is knowing when the vibe ends.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A spike that felt magical becomes the production service because “we already have code”.
+  There are no tests, no threat model and a hallucinated dependency. The vibe never ended; it
+  was renamed “MVP”.</p>
+</div>
+
+<figure class="listing">
+<figcaption>Vibe checklist — note the hard stops.</figcaption>
+<pre><code>from forge.devex.session import check_session, format_checklist
+print(format_checklist(check_session("vibe")))</code></pre>
+</figure>
+<pre class="output">workflow=vibe
+items:
+  1. Create a throwaway branch with a time-box (e.g. 60–90 minutes)
+  2. Write a one-line goal; refuse scope expansion mid-session
+  3. Prefer disposable prototypes over production paths
+  4. Capture what worked in a note; delete or quarantine the branch
+  5. Stop when the timer ends — decide ship-gate or discard
+hard_stops:
+  - Do not open a production PR from a vibe session without Workflow C
+  - Do not disable CI to keep the vibe going
+  - Do not paste production secrets or customer code</pre>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Vibe coding maximises exploration rate, not merge readiness.</li>
+    <li>When the timer ends: discard, or promote through Workflow C (spec → tests → gates).</li>
+    <li>Package hallucination risk is highest here — never <code>pip install</code> an unfamiliar name without verification (Spracklen et al.).</li>
+  </ul>
+</aside>
+
+<table>
+  <caption>When vibe coding is allowed versus forbidden.</caption>
+  <thead><tr><th>Allowed</th><th>Forbidden</th></tr></thead>
+  <tbody>
+    <tr><td>Throwaway branches, prototypes, UX sketches</td><td>Direct commits to main / release branches</td></tr>
+    <tr><td>Local fakes and sample data</td><td>Customer production data in prompts</td></tr>
+    <tr><td>Discovering APIs you will later specify</td><td>Skipping security review on auth code “because it’s a spike”</td></tr>
+  </tbody>
+</table>
+
+
+<h3>Throwaway Branches as a Social Contract</h3>
+
+<p>Name vibe branches so humans are not confused: <code>vibe/2026-03-29-widgets</code>. Set a calendar
+or kitchen timer. When it rings, you may only: discard, note-take, or open a <em>new</em> ship
+branch that cherry-picks nothing until tests exist.</p>
+
+<figure class="listing">
+<figcaption>End-of-vibe decision record (five lines max).</figcaption>
+<pre><code>Goal: ____
+What worked: ____
+What hallucinated: ____
+Promote to ship?: yes/no
+If yes: write failing tests before any cherry-pick</code></pre>
+</figure>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>Vibe sessions are when people paste prod keys “to unblock”. Hard stop remains: never.</li>
+    <li>Slopsquatting risk peaks when the agent invents a package mid-flow and you install it to keep momentum.</li>
+  </ul>
+</aside>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Renaming <code>vibe/</code> to <code>feature/</code> without Workflow C.</li>
+  <li>Disabling ruff “temporarily” to finish the demo.</li>
+  <li>No note — the only artefact is an unreviewable branch.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>METR (Becker et al., 2025) found experienced developers can feel faster with AI while being slower on real tasks. Vibe sessions are especially prone to that miscalibration — use the timer, not the feeling.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 10 -->
+<section class="chapter">
+<h2 id="workflow-ship">Workflow C — Ship with Gates</h2>
+<p class="chapter-lede">Shipping is a pipeline: spec → tests → agent → review → static analysis →
+security → PR. Measure how often each gate catches defects. This extends Volume 23’s validation
+story into a daily coding-agent practice.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>CI is green on weak tests. A hallucinated package slipped in. Reviewers skim because the diff
+  is “AI-generated so probably fine”. Production pages. The team blames the model. The missing
+  object was a gate with a measured catch rate.</p>
+</div>
+
+<figure class="diagram">
+<pre class="ascii">spec (acceptance) -&gt; failing tests -&gt; agent implements (bounded files)
+        |                                  |
+        v                                  v
+ human review &lt;---------------------- static + security + deps allow-list
+        |
+        v
+   small PR + record which gates failed before merge</pre>
+<figcaption>Workflow C. The agent is labour under contract, not the merge authority.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption>Ship checklist CLI.</figcaption>
+<pre><code>from forge.devex.session import check_session, format_checklist
+print(format_checklist(check_session("ship")))</code></pre>
+</figure>
+<pre class="output">workflow=ship
+items:
+  1. Write acceptance criteria and failing tests first
+  2. Bound the agent to specific files / packages
+  3. Run the ship gate (lint, types, tests, security, deps)
+  4. Human review: scope, security paths, hallucinated APIs
+  5. Open a small PR; record gate failures caught before merge
+hard_stops:
+  - Do not merge without human review
+  - Do not add dependencies without allow-list check
+  - Do not paste production secrets or customer code</pre>
+
+<figure class="listing">
+<figcaption><code>forge.devex.gates</code>: pedagogical gate runner with fail-rate-by-category.</figcaption>
+<pre><code>from forge.devex.gates import default_gates
+
+ok = default_gates(
+    has_spec=True, tests_green=True, human_reviewed=True,
+    lint_clean=True, no_secret_diff=True, deps_allowed=True, pr_scoped=True,
+)
+print(ok.format())
+print("---")
+bad = default_gates(
+    has_spec=True, tests_green=True, human_reviewed=True,
+    lint_clean=True, no_secret_diff=True, deps_allowed=False, pr_scoped=True,
+)
+print(bad.format())</code></pre>
+</figure>
+<pre class="output">[PASS] (spec) spec written — acceptance criteria present
+[PASS] (test) tests green — pytest -q
+[PASS] (review) human review — checklist done
+[PASS] (static) static analysis — ruff+mypy
+[PASS] (security) no secrets in diff — clean
+[PASS] (security) deps allow-listed — ok
+[PASS] (pr) PR scoped — one intent
+summary: 7/7 passed; fail_rate_by_category={'spec': 0.0, 'test': 0.0, 'review': 0.0, 'static': 0.0, 'security': 0.0, 'pr': 0.0}
+---
+[PASS] (spec) spec written — acceptance criteria present
+[PASS] (test) tests green — pytest -q
+[PASS] (review) human review — checklist done
+[PASS] (static) static analysis — ruff+mypy
+[PASS] (security) no secrets in diff — clean
+[FAIL] (security) deps allow-listed — unknown package
+[PASS] (pr) PR scoped — one intent
+summary: 6/7 passed; fail_rate_by_category={'spec': 0.0, 'test': 0.0, 'review': 0.0, 'static': 0.0, 'security': 0.5, 'pr': 0.0}</pre>
+
+<p>In the failing demo, the security category’s fail rate is <span class="math">0.5</span> because one of two security gates failed. Over many PRs, track catch rate per gate as
+<span class="math">\mathrm{catch}_g = \frac{\#\{\text{PRs where } g \text{ failed before merge}\}}{\#\{\text{PRs that reached } g\}}</span>.
+A gate that never fails is either perfect or unused — investigate which.</p>
+
+<figure class="listing">
+<figcaption>Toy transcript metrics — files touched, tests, gate failures.</figcaption>
+<pre><code>from forge.devex.transcript import score_transcript
+
+events = [
+    {"kind": "edit", "path": "src/forge/devex/gates.py"},
+    {"kind": "edit", "path": "tests/test_devex.py"},
+    {"kind": "test", "run": 7, "failed": 0},
+    {"kind": "gate_fail", "name": "deps allow-listed"},
+    {"kind": "command", "cmd": "pytest -q"},
+]
+print(score_transcript(events).format())</code></pre>
+</figure>
+<pre class="output">files=2 ['src/forge/devex/gates.py', 'tests/test_devex.py']; tests_run=7 failed=0; gate_failures=1 ['deps allow-listed']; secret_warnings=0</pre>
+
+
+<h3>Extending Volume 23’s Gate</h3>
+
+<p>Volume 23 defined validation layers (hallucinated packages, lint, types, tests, security,
+licence). Workflow C adds <em>process metrics</em>: which gate failed, how often, and whether
+review found issues CI missed.</p>
+
+<table>
+  <caption>Suggested metrics per 20 agent-assisted PRs.</caption>
+  <thead><tr><th>Metric</th><th>Definition</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr><td>Gate catch rate</td><td>PRs where gate <span class="math">g</span> failed pre-merge</td><td>Tune gate severity</td></tr>
+    <tr><td>Review-only catches</td><td>Issues humans found after green CI</td><td>Strengthen tests or rules</td></tr>
+    <tr><td>Revert rate</td><td>Reverts within 7 days</td><td>Productivity reality check</td></tr>
+    <tr><td>Mean files/PR</td><td>Paths touched</td><td>Detect scope creep</td></tr>
+    <tr><td>Secret warnings</td><td>From transcript heuristics</td><td>Training trigger</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>Comparing three workflow runs on the same feature (toy numbers).</figcaption>
+<pre><code>import statistics as st
+
+# (minutes, gate_failures_caught, review_defects)
+learning = [(90, 0, 0)]          # no merge
+vibe = [(70, 0, 3)]              # defects found only when someone later read it
+ship = [(120, 2, 0)]             # gates caught deps + lint before review
+
+for name, rows in [("learning", learning), ("vibe", vibe), ("ship", ship)]:
+    mins = [r[0] for r in rows]
+    print(f"{name:8s} time_mean={st.mean(mins):.0f} "
+          f"gate_catch={sum(r[1] for r in rows)} "
+          f"review_defects={sum(r[2] for r in rows)}")</code></pre>
+</figure>
+<pre class="output">learning time_mean=90 gate_catch=0 review_defects=0
+vibe     time_mean=70 gate_catch=0 review_defects=3
+ship     time_mean=120 gate_catch=2 review_defects=0</pre>
+
+<p>The vibe path was “faster” and worse. The ship path spent time in gates that prevented review
+debt. That is the comparison the practical project asks you to run on a real Forge feature.</p>
+
+<aside class="callout impl"><span class="title">Wire into CI later</span>
+  <ul>
+    <li>Today <code>default_gates</code> takes booleans for pedagogy.</li>
+    <li>Tomorrow replace each lambda with subprocess calls to ruff/mypy/pytest/bandit and the Volume 23 package allow-list.</li>
+  </ul>
+</aside>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>Pearce et al. (2022): AI-suggested code can be vulnerable at concerning rates — security review is mandatory on auth, crypto, OS and injection surfaces.</li>
+    <li>Perry et al. (2023): users with AI assistants wrote less secure code <em>and</em> were more confident. Confidence is not a gate.</li>
+  </ul>
+</aside>
+
+<aside class="callout impl"><span class="title">CLI</span>
+  <ul>
+    <li><code>python -m forge.devex demo-gates</code></li>
+    <li><code>python -m forge.devex demo-gates --fail-deps</code></li>
+    <li><code>python -m forge.devex score-transcript path.jsonl</code></li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 11 -->
+<section class="chapter">
+<h2 id="multi-tool-playbooks">Multi-Tool Playbooks</h2>
+<p class="chapter-lede">Serious teams use more than one product. The skill is handoffs: ChatGPT
+plans, Cursor implements, Claude reviews — with conflict rules when tools disagree.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Three engineers paste three incompatible designs from three tools into the same PR description.
+  Debate becomes brand loyalty. Nobody owns the ADR. The merge is a coin flip.</p>
+</div>
+
+<table>
+  <caption>Example handoff playbook (adapt; keep gates shared).</caption>
+  <thead><tr><th>Stage</th><th>Tool</th><th>Artefact</th></tr></thead>
+  <tbody>
+    <tr><td>Learn / plan</td><td>ChatGPT or Claude chat</td><td>One-page spec + open questions (Workflow A/C)</td></tr>
+    <tr><td>Implement</td><td>Cursor Agent or Claude Code</td><td>Bounded diff + test output</td></tr>
+    <tr><td>Review</td><td>Other model / Bugbot / human</td><td>Checklist findings, not vibes</td></tr>
+    <tr><td>Merge</td><td>Human + CI</td><td>Green gates; no tool may auto-merge</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Parallel exploration is fine on throwaway branches. Serialise before merge.</li>
+    <li>When tools disagree: write a decision table (options × criteria), pick with evidence, record in an ADR.</li>
+    <li>Never “average” two incompatible patches. Choose one lineage and delete the other.</li>
+  </ul>
+</aside>
+
+<figure class="diagram">
+<pre class="ascii">parallel spikes (vibe branches)
+   Cursor idea A ----\
+                      +--&gt; compare on tests + scorecard --&gt; one ship branch
+   Claude idea B ----/
+                              |
+                              v
+                     Workflow C gates + human merge</pre>
+<figcaption>Parallel exploration, single ship path.</figcaption>
+</figure>
+
+
+<h3>Playbook: Plan → Implement → Review</h3>
+
+<ol>
+  <li><strong>Plan (ChatGPT or Claude chat)</strong>: produce a one-page spec with acceptance bullets. No code.</li>
+  <li><strong>Freeze</strong>: human edits the spec; writes failing tests in the repo.</li>
+  <li><strong>Implement (Cursor Agent or Claude Code)</strong>: bounds from the spec; paste gate output.</li>
+  <li><strong>Review (other model + human)</strong>: second model proposes checklist findings; human verifies every claim against the diff.</li>
+  <li><strong>Merge</strong>: human only, CI green.</li>
+</ol>
+
+<aside class="callout warning"><span class="title">Brand loyalty failure</span>
+  <ul>
+    <li>If the review model disagrees with the implement model, do not pick based on which vendor you like. Pick based on tests, threat model and maintainability.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption>Conflict log template.</figcaption>
+<pre><code>Conflict: Cursor proposes libX; Claude proposes stdlib-only
+Criterion scores (1-5): correctness, security, exit cost, team skill
+Decision: stdlib-only
+ADR: docs/adr/00xx-no-libX.md
+Loser branch: deleted</code></pre>
+</figure>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Three tools editing the same branch concurrently.</li>
+  <li>Review model rubber-stamping because the prompt said “be supportive”.</li>
+  <li>No ADR when architecture diverged.</li>
+</ul>
+
+<p class="facet">Conflict resolution rules</p>
+<ul>
+  <li><strong>Tests over prose</strong>: the design that passes the acceptance tests wins.</li>
+  <li><strong>Security over elegance</strong>: if either tool’s patch weakens authz, reject both and redesign.</li>
+  <li><strong>Smaller diff over cleverness</strong>: prefer the change a junior can maintain.</li>
+  <li><strong>Documented over Inferred</strong>: when citing vendor limits, prefer Documented cells.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 12 -->
+<section class="chapter">
+<h2 id="team-enterprise">Team and Enterprise Practice</h2>
+<p class="chapter-lede">Individuals can improvise. Teams need shared rules repos, secrets hygiene,
+customer-code policies and productivity measures that are not vanity.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Each engineer invents personal Cursor rules. Customer code ends up in consumer chat logs.
+  Leadership asks for “AI productivity” and gets acceptance-rate screenshots. Nothing connects to
+  escaped defects or time-to-revert.</p>
+</div>
+
+<aside class="callout security"><span class="title">Security callouts (non-negotiable)</span>
+  <ul>
+    <li><strong>Secrets</strong>: never paste production keys, tokens or <code>.env</code> contents into chat, Projects, Custom GPTs, Memories or MCP env blocks.</li>
+    <li><strong>Customer code</strong>: treat proprietary customer repositories as regulated input — use approved enterprise tiers, DLP and redacted samples.</li>
+    <li><strong>Production keys</strong>: rotate any key that might have entered a prompt. Assume logs are durable.</li>
+  </ul>
+</aside>
+
+<table>
+  <caption>Shared practice for organisations.</caption>
+  <thead><tr><th>Practice</th><th>What to do</th><th>Anti-pattern</th></tr></thead>
+  <tbody>
+    <tr><td>Shared rules repo</td><td>Version <code>AGENTS.md</code> templates; sync via scaffold</td><td>Oral tradition only</td></tr>
+    <tr><td>Tool allow-list</td><td>Approve 1–2 coding agents + MCP servers</td><td>Every new demo installs a new MCP</td></tr>
+    <tr><td>Secrets hygiene</td><td>Scanners in CI; gitignore local MCP overrides</td><td>“Just this once” pastes</td></tr>
+    <tr><td>Customer-code policy</td><td>Written allow/deny by data class</td><td>Hoping people remember</td></tr>
+    <tr><td>Productivity eval</td><td>Revert rate, escaped defects, cycle time, survey</td><td>Autocomplete acceptance alone</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Peng et al. / Ziegler et al. show speedups on some tasks; METR shows slowdowns for experienced developers on others. Instrument <em>your</em> team.</li>
+    <li>Vanity metrics (suggestions accepted) optimise for clicking, not for shipping correct software.</li>
+    <li>Tool lock-in is reduced by canonical <code>AGENTS.md</code> and open gates — not by banning all tools.</li>
+  </ul>
+</aside>
+
+
+<h3>Shared Rules Repos</h3>
+
+<p>Large orgs maintain a template repository that <code>forge.devex.scaffold</code> mirrors: AGENTS
+skeleton, Cursor rule packs, MCP allow-lists, and a CODEOWNERS entry so policy changes are
+reviewed. Product repos pin a version of the template and patch only deltas.</p>
+
+<figure class="listing">
+<figcaption>Policy excerpt for customer engagements (feeds Volume 27).</figcaption>
+<pre><code># AI coding — customer data classes
+- Public samples: allowed in approved tools
+- Synthetic customer-like data: allowed if scrubbed
+- Real customer code/PII: only on approved enterprise tiers with DLP;
+  never in consumer ChatGPT/Claude/Cursor accounts
+- Production secrets: never in prompts; rotate on suspicion</code></pre>
+</figure>
+
+<h3>Evaluating Productivity Without Vanity</h3>
+
+<table>
+  <caption>Metrics ladder.</caption>
+  <thead><tr><th>Tier</th><th>Metric</th><th>Verdict</th></tr></thead>
+  <tbody>
+    <tr><td>Vanity</td><td>Suggestions accepted %</td><td>Do not use for OKRs</td></tr>
+    <tr><td>Weak</td><td>Self-reported “feels faster”</td><td>Survey only, pair with timing</td></tr>
+    <tr><td>Better</td><td>Cycle time, revert rate, escaped defects</td><td>Primary</td></tr>
+    <tr><td>Best</td><td>Above + gate catch rates + developer survey</td><td>Decision-grade</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout advanced"><span class="title">Evidence</span>
+  <ul>
+    <li>Peng et al. (2023) and related Copilot studies: speedups exist for some tasks and populations.</li>
+    <li>METR (Becker et al., 2025): experienced OSS developers can slow down while feeling faster.</li>
+    <li>Your org is neither paper. Measure.</li>
+  </ul>
+</aside>
+
+<div class="frame production">
+  <p>Production posture: approved tools list, shared <code>AGENTS.md</code> template, MCP allow-list in
+  CI, secret scanning, customer-code policy linked from onboarding, and a quarterly productivity
+  review that includes revert rate — not acceptance rate.</p>
+</div>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Enterprise policy that bans tools without providing an approved path — shadow IT agents appear.</li>
+  <li>Productivity OKRs based on “lines generated”.</li>
+  <li>No owner for the shared rules repo.</li>
+</ul>
+
+<div class="frame exercise" data-title="Practical project — three workflows, one feature">
+  <p>Instrument one Forge feature (for example a small <code>forge.devex</code> helper) three ways:</p>
+  <ol>
+    <li><strong>Learning</strong>: notes + one test; no merge to main.</li>
+    <li><strong>Vibe</strong>: timed throwaway branch; capture what worked; discard or quarantine.</li>
+    <li><strong>Ship</strong>: full gate; record which gates failed; merge only when green.</li>
+  </ol>
+  <p>Compare defect rates (gate failures + review findings) and wall-clock time. Write five lines
+  on what you will change in <code>AGENTS.md</code>.</p>
+</div>
+</section>
+
+
+<!-- runbook sits with review materials; not a numbered MASTER_PLAN chapter -->
+<section class="review" id="runbook-cheatsheet-wrap">
+<h1 id="runbook-cheatsheet">Runbook Cheatsheet</h1>
+<p>A single page you can keep open while working. It does not replace the
+twelve chapters; it routes you to the right workflow and the right <code>forge.devex</code> command.</p>
+
+<table>
+  <caption>If you are about to… then do this.</caption>
+  <thead><tr><th>You are about to…</th><th>Workflow</th><th>Command / artefact</th></tr></thead>
+  <tbody>
+    <tr><td>Learn how a Forge module works</td><td>A</td><td><code>python -m forge.devex session learning</code></td></tr>
+    <tr><td>Spike a UI or API shape for an hour</td><td>B</td><td>throwaway branch + timer; session vibe</td></tr>
+    <tr><td>Merge agent-authored code</td><td>C</td><td>session ship + demo-gates + human review</td></tr>
+    <tr><td>Onboard a repo to agents</td><td>—</td><td><code>scaffold</code> + <code>lint-agents</code> + <code>check-mcp</code></td></tr>
+    <tr><td>Debug a thrashing Agent thread</td><td>—</td><td>stop edits; five-bullet summary; new chat</td></tr>
+    <tr><td>Cite a vendor feature in policy</td><td>—</td><td>Documented cell + doc date; else Inferred</td></tr>
+  </tbody>
+</table>
+
+<h3>Command Reference</h3>
+
+<figure class="listing">
+<figcaption>All <code>forge.devex</code> CLI entry points.</figcaption>
+<pre><code>PYTHONPATH=src python -m forge.devex scaffold PATH
+PYTHONPATH=src python -m forge.devex lint-agents AGENTS.md
+PYTHONPATH=src python -m forge.devex check-mcp .cursor/mcp.json
+PYTHONPATH=src python -m forge.devex session learning|vibe|ship
+PYTHONPATH=src python -m forge.devex demo-gates [--fail-deps]
+PYTHONPATH=src python -m forge.devex score-transcript events.jsonl</code></pre>
+</figure>
+
+<h3>Human Review Checklist (AI Diffs)</h3>
+
+<div class="frame checklist">
+  <ul>
+    <li>Diff matches requested scope (no drive-by renames).</li>
+    <li>New dependencies exist on the registry and are allow-listed.</li>
+    <li>Auth, crypto, OS, SQL and tenancy paths reviewed line-by-line.</li>
+    <li>Tests assert behaviour; they were not weakened to go green.</li>
+    <li>No secrets, customer PII or prod hostnames in prompts or commits.</li>
+    <li>AGENTS.md / rules still match CI commands.</li>
+  </ul>
+</div>
+
+<aside class="callout security"><span class="title">Incident starter</span>
+  <ul>
+    <li>If a production key may have entered a chat: revoke/rotate, purge Project/GPT/Memory copies if possible, notify security, document the channel and time.</li>
+  </ul>
+</aside>
+
+<h3>Mapping Products to Workflows</h3>
+
+<table>
+  <caption>Default recommendations — override with org policy.</caption>
+  <thead><tr><th>Workflow</th><th>Default tools</th><th>Avoid</th></tr></thead>
+  <tbody>
+    <tr><td>A Learning</td><td>ChatGPT or Claude chat</td><td>Cloud agents with write access to main</td></tr>
+    <tr><td>B Vibe</td><td>Cursor Agent or Claude Code on vibe/*</td><td>Production credentials, customer repos</td></tr>
+    <tr><td>C Ship</td><td>Cursor/Claude Code + CI gates + human</td><td>Auto-merge; disabling gates</td></tr>
+  </tbody>
+</table>
+
+<figure class="diagram">
+<pre class="ascii">forge.devex data flow
+
+scaffold --&gt; AGENTS.md / CLAUDE.md / rules / MCP / skills
+                |
+                v
+          lint-agents ----+----&gt; errors block "ready for agents"
+                |
+          check-mcp ------+
+                |
+session (A/B/C) checklist for humans
+                |
+agent works on branch
+                |
+demo-gates / CI + score-transcript metrics
+                |
+human merge</pre>
+<figcaption>The package is not an agent. It is the workspace and measurement layer around agents.</figcaption>
+</figure>
+
+<h3>Example Transcript JSONL</h3>
+
+<figure class="listing">
+<figcaption>Events <code>score_transcript</code> understands.</figcaption>
+<pre><code>{"kind": "edit", "path": "src/forge/devex/gates.py"}
+{"kind": "edit", "path": "tests/test_devex.py"}
+{"kind": "test", "run": 7, "failed": 0}
+{"kind": "gate_fail", "name": "deps allow-listed"}
+{"kind": "command", "cmd": "pytest -q"}
+{"kind": "command", "cmd": "cat .env"}</code></pre>
+</figure>
+<pre class="output"># secret_warnings increments on cat .env
+files=2 [...]; tests_run=7 failed=0; gate_failures=1 ['deps allow-listed']; secret_warnings=1</pre>
+
+<aside class="callout impl"><span class="title">Extending the toy transcript</span>
+  <ul>
+    <li>In a real harness, emit these events from wrappers around the agent’s tool calls.</li>
+    <li>Join with Volume 16 session IDs if coding agents ever call your product tools.</li>
+  </ul>
+</aside>
+
+<h3>Package Hallucination Drill</h3>
+
+<ol>
+  <li>On a branch, ask an agent to “add a helper library” without naming one.</li>
+  <li>Capture any invented package names.</li>
+  <li>Confirm they are absent from your allow-list and (often) from the real registry.</li>
+  <li>Ensure Workflow C’s deps gate would fail the PR.</li>
+</ol>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Drills beat slogans. One failed gate on a fake package teaches more than a slide on slopsquatting.</li>
+  </ul>
+</aside>
+
+<h3>Context Curation Patterns</h3>
+
+<table>
+  <caption>What to put in the window for common jobs.</caption>
+  <thead><tr><th>Job</th><th>Include</th><th>Exclude</th></tr></thead>
+  <tbody>
+    <tr><td>Fix failing test</td><td>Test file, SUT, failure output</td><td>Unrelated packages, full monorepo</td></tr>
+    <tr><td>Add endpoint</td><td>Router module, schema, similar endpoint, tests</td><td>Frontend trees (unless full-stack)</td></tr>
+    <tr><td>Explain design</td><td>ADR, interface types</td><td>Implementation noise</td></tr>
+    <tr><td>Security review</td><td>Authz code, threat notes</td><td>Marketing docs</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>Full agents_lint logic sketch (see source for production code).</figcaption>
+<pre><code>REQUIRED = ("## Commands", "## Layout", "## Rules")
+
+def lint_agents_md(body: str) -&gt; list:
+    findings = []
+    lower = body.lower()
+    for h in REQUIRED:
+        if h.lower() not in lower:
+            findings.append(("error", f"missing {h}"))
+    # secret shapes + "please disable CI" heuristics ...
+    return findings</code></pre>
+</figure>
+
+<aside class="callout warning"><span class="title">Stale instructions</span>
+  <ul>
+    <li>When CI changes from <code>pytest</code> to <code>hatch test</code>, update AGENTS.md in the same PR. Stale commands cause agents to invent workflows.</li>
+  </ul>
+</aside>
+
+<h3>Team Adoption Sequence</h3>
+
+<ol>
+  <li>Week 0: scaffold + lint in one repo; no mandate.</li>
+  <li>Week 2: same CI gate for all AI PRs; tool choice still free within allow-list.</li>
+  <li>Week 4: measure revert rate and gate catches; revisit seat spend.</li>
+  <li>Week 8: shared template repo; customer-code policy training.</li>
+</ol>
+
+<div class="frame why-complex">
+  <p>Why not “just let people use whatever”? Because MCP, secrets and customer code create shared
+  blast radius. Autonomy at the keyboard becomes systemic risk at the org boundary.</p>
+</div>
+
+<h3>Linking Back to Harness Thinking</h3>
+
+<p>Volume 16’s harness mediates tool calls for <em>product</em> agents. Coding agents are a parallel
+universe with their own tools (shell, edit, MCP). Borrow the principles: default deny, complete
+mediation for MCP allow-lists, budgets (time-boxes), and durable logs (transcripts) — even when the
+vendor UI does not expose them cleanly.</p>
+
+<figure class="diagram">
+<pre class="ascii">product agent (Vol 15-16)          coding agent (Vol 26)
+harness policy                     MCP allow-list + permissions
+session budgets                    workflow time-boxes
+tool sandbox                       local-only / no prod keys
+eval harness                       ship gates + review checklist</pre>
+<figcaption>Same engineering instincts; different runtime.</figcaption>
+</figure>
+
+<p class="facet">Failure Modes</p>
+<ul class="failure-modes">
+  <li>Runbook that lists tools but not workflows.</li>
+  <li>Cheatsheet that becomes the only document and drifts from chapters.</li>
+  <li>Skipping the package-hallucination drill because “we would never install that”.</li>
+</ul>
+</section>
+
+
+<h3>Quick Threat Reminders for Coding Agents</h3>
+<ul>
+  <li>Prompt channel may see whatever you <code>@</code>-attach — treat open editors carefully.</li>
+  <li>MCP is tool RCE with bureaucracy: allow-list names, still validate arguments.</li>
+  <li>Cloud/background agents extend the window of autonomy; shrink permissions accordingly.</li>
+  <li>Review bots are untrusted advisors; they do not hold merge rights.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Minimal <code>.gitignore</code> additions for agent workspaces.</figcaption>
+<pre><code>.env
+.env.*
+!.env.example
+.cursor/mcp.local.json
+*.pem
+credentials.json</code></pre>
+</figure>
+
+<aside class="callout core"><span class="title">Remember</span>
+  <ul>
+    <li>Twelve chapters. Three workflows. One shared workspace module. Gates before merge.</li>
+  </ul>
+</aside>
+
+<!-- ================================================================ REVIEW -->
+<section class="review">
+<h1>Review and Next Steps</h1>
+
+<h2>What You Should Be Able to Do</h2>
+<ul>
+  <li>Place ChatGPT, Claude, Claude Code, Cursor and Kiro on the chat / IDE / CLI / cloud stack and know when not to use an agent.</li>
+  <li>Read a feature matrix with Documented vs Inferred labels and refuse fake-screenshot training material.</li>
+  <li>Scaffold and lint a shared workspace module with <code>forge.devex</code>.</li>
+  <li>Run Workflows A, B and C without confusing them; measure gate catch rates on ship work.</li>
+  <li>Hand off across tools and resolve conflicts with tests and ADRs.</li>
+  <li>State secrets and customer-code hard stops for your organisation.</li>
+</ul>
+
+<h2>Key Concepts</h2>
+<ul>
+  <li>Coding-agent workspace; rules versus skills versus MCP; context curation.</li>
+  <li>Learning versus vibe versus ship workflows; verification gates.</li>
+  <li>Package hallucination; tool lock-in; Documented versus Inferred claims.</li>
+</ul>
+
+<h2>Package Map</h2>
+<ul>
+  <li><code>python -m forge.devex scaffold &lt;dir&gt;</code></li>
+  <li><code>python -m forge.devex lint-agents AGENTS.md</code></li>
+  <li><code>python -m forge.devex check-mcp .cursor/mcp.json</code></li>
+  <li><code>python -m forge.devex session {learning,vibe,ship}</code></li>
+  <li><code>python -m forge.devex demo-gates [--fail-deps]</code></li>
+  <li><code>python -m forge.devex score-transcript events.jsonl</code></li>
+</ul>
+
+<h2>Research Papers</h2>
+<table>
+  <caption>Evidence base for coding-agent practice claims.</caption>
+  <thead><tr><th>Source</th><th>Why it is here</th></tr></thead>
+  <tbody>
+    <tr><td>Pearce et al., 2022. <em>Asleep at the Keyboard?</em> IEEE S&amp;P.</td><td>Vulnerable AI-suggested code (Ch. 10, 12).</td></tr>
+    <tr><td>Perry et al., 2023. <em>Do Users Write More Insecure Code with AI Assistants?</em> CCS.</td><td>Less secure + more confident (Ch. 10).</td></tr>
+    <tr><td>Spracklen et al., 2024/25. Package hallucination analyses.</td><td>Deps allow-list gates (Ch. 9–10).</td></tr>
+    <tr><td>Peng et al., 2023; related Copilot productivity work.</td><td>Measured speedups on some tasks (Ch. 12).</td></tr>
+    <tr><td>Becker et al., 2025 (METR). Experienced developer productivity.</td><td>Calibration warning (Ch. 9, 12).</td></tr>
+    <tr><td>Yang et al., 2024. <em>SWE-agent</em>. NeurIPS.</td><td>Agent–computer interface matters (Ch. 1, 6).</td></tr>
+  </tbody>
+</table>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Asleep at the Keyboard? Assessing the Security of GitHub Copilot's Code Contributions</span>
+    <span class="paper-meta">Pearce et al., 2022 · IEEE Symposium on Security and Privacy</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Do AI coding assistants suggest vulnerable code at a concerning rate?</dd>
+    <dt>Previous limitation</dt><dd>Anecdotes without systematic, scenario-based evaluation.</dd>
+    <dt>Approach</dt><dd>Vulnerability scenarios across CWEs; query the assistant; classify outputs.</dd>
+    <dt>Contribution</dt><dd>A substantial fraction of completions in their scenarios were vulnerable.</dd>
+    <dt>Practical impact</dt><dd>Workflow C security review and scanners are mandatory, especially on auth and injection surfaces.</dd>
+    <dt>Limitations</dt><dd>Models change; percentages are not eternal. The process lesson remains.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Do Users Write More Insecure Code with AI Assistants?</span>
+    <span class="paper-meta">Perry et al., 2023 · ACM CCS</span></div>
+  <dl>
+    <dt>Problem</dt><dd>How does AI assistance change both security outcomes and developer confidence?</dd>
+    <dt>Previous limitation</dt><dd>Security studies of suggestions without the human-in-the-loop behaviour.</dd>
+    <dt>Approach</dt><dd>User study comparing assistants vs not on security-relevant tasks.</dd>
+    <dt>Contribution</dt><dd>Participants with AI wrote less secure code and were more confident it was secure.</dd>
+    <dt>Practical impact</dt><dd>Confidence is not a gate; review must not relax because the author was a model.</dd>
+    <dt>Limitations</dt><dd>Task and population specific; still a strong warning for Workflow C.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Package Hallucinations in LLM-Generated Code</span>
+    <span class="paper-meta">Spracklen et al. · fabricated dependency names / slopsquatting risk</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Models invent package names that look real; attackers may register them later.</dd>
+    <dt>Previous limitation</dt><dd>Dependency review assumed humans typed names from real projects.</dd>
+    <dt>Approach</dt><dd>Measure hallucination rates; discuss supply-chain implications.</dd>
+    <dt>Contribution</dt><dd>Evidence that fabricated dependencies need automated controls.</dd>
+    <dt>Practical impact</dt><dd><code>deps allow-listed</code> gate in <code>forge.devex</code>; install from lockfiles only.</dd>
+    <dt>Limitations</dt><dd>Rates vary by model and ecosystem.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Measuring the Impact of Early-2025 AI on Experienced Open-Source Developer Productivity</span>
+    <span class="paper-meta">Becker et al., 2025 · METR · arXiv:2507.09089</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Do AI tools help experienced developers as much as they believe?</dd>
+    <dt>Previous limitation</dt><dd>Self-reports and junior/task-simplified studies may not generalise.</dd>
+    <dt>Approach</dt><dd>Controlled study on real repository tasks; compare timing vs perception.</dd>
+    <dt>Contribution</dt><dd>In their setting, AI tools could slow experienced developers who felt faster.</dd>
+    <dt>Practical impact</dt><dd>Time-box vibe sessions; measure ship metrics, not vibes.</dd>
+    <dt>Limitations</dt><dd>One design and time slice; tools improve.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering</span>
+    <span class="paper-meta">Yang et al., 2024 · NeurIPS</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Repository work fails when agents have a poor interface to files, search and feedback.</dd>
+    <dt>Previous limitation</dt><dd>Raw shell or chat-only interfaces understate what interface design can buy.</dd>
+    <dt>Approach</dt><dd>Purpose-built agent–computer interface; evaluate on SWE-bench-style tasks.</dd>
+    <dt>Contribution</dt><dd>Shows interface design materially changes resolution rates.</dd>
+    <dt>Practical impact</dt><dd>Why IDE/CLI agents with good tools beat paste-into-chat for repo work; invest in rules and MCP carefully.</dd>
+    <dt>Limitations</dt><dd>Benchmarks are not your monorepo; harness details matter.</dd>
+  </dl>
+</section>
+
+
+<h2>Exercises</h2>
+<ol>
+  <li>Scaffold a throwaway workspace with <code>forge.devex</code>; break AGENTS.md on purpose; confirm the linter fails.</li>
+  <li>Add a fake MCP server name to a config and confirm allow-list rejection.</li>
+  <li>Re-label five cells of the Chapter 2 matrix from today’s vendor docs.</li>
+  <li>Run the practical project: one Forge helper via learning, vibe and ship; record times and defects.</li>
+  <li>Write a one-page customer-code policy for your team using Chapter 12’s data classes.</li>
+  <li>Pair-review an AI diff with Perry et al. in mind: where did confidence exceed evidence?</li>
+</ol>
+
+<h2>Comparison Tables Index</h2>
+<ul>
+  <li>Chapter 1: product surfaces; stop-conditions.</li>
+  <li>Chapter 2: full capability matrix; engineering constraints.</li>
+  <li>Chapter 3: rules vs skills vs MCP; workspace checklist.</li>
+  <li>Chapter 4–7: per-tool capability tables.</li>
+  <li>Chapter 9: vibe allow/forbid.</li>
+  <li>Chapter 10: gate metrics.</li>
+  <li>Chapter 11: handoff playbook.</li>
+  <li>Chapter 12: org practices; metrics ladder.</li>
+</ul>
+
+<h2>Glossary</h2>
+<ul>
+  <li><strong>Documented</strong>: claim grounded in vendor docs or cited papers as of the stated date.</li>
+  <li><strong>Inferred</strong>: provisional engineering judgement; re-check before policy.</li>
+  <li><strong>Steering file</strong>: Kiro-oriented durable instruction artefact (concept).</li>
+  <li><strong>Ship gate</strong>: ordered checks that must pass before merge of agent-authored code.</li>
+  <li><strong>Vibe branch</strong>: explicitly throwaway branch with a time-box.</li>
+  <li><strong>Workspace module</strong>: shared AGENTS/rules/MCP/skills layout every tool can read.</li>
+</ul>
+
+<h2>Interview Questions</h2>
+<ol class="questions">
+  <li>When would you refuse to use any coding agent on a change?</li>
+  <li>Explain Documented vs Inferred using one cell from the Chapter 2 matrix.</li>
+  <li>Why should <code>CLAUDE.md</code> often be a pointer to <code>AGENTS.md</code>?</li>
+  <li>How do you stop an MCP server from becoming shadow infrastructure?</li>
+  <li>Contrast Workflows A, B and C with one sentence each and one hard stop each.</li>
+  <li>Your gate summary shows security fail_rate 0.5 — what do you investigate?</li>
+  <li>Design a ChatGPT → Cursor → Claude handoff that still has a single merge authority.</li>
+  <li>What productivity metrics would you reject for an AI coding OKR, and what would you keep?</li>
+  <li>A colleague pastes a production key into chat “temporarily”. What do you do next?</li>
+  <li>How does Yang et al.’s ACI argument change how you evaluate Cursor vs a raw chat window?</li>
+</ol>
+
+<h2>Next Volume</h2>
+<p>Volume 27 — Forward Deployed AI Engineering — takes these habits into customer engagements:
+discovery, PoC, pilot and handoff. The secrets and customer-code rules in Chapter 12 become
+engagement constraints; the ship gates become how you keep PoCs from pretending to be production.</p>
+
+<p class="facet">Bring these with you</p>
+<ul>
+  <li>The shared workspace module (<code>forge.devex</code>) and Documented/Inferred discipline.</li>
+  <li>Three named workflows — never vibe into a customer production PR.</li>
+  <li>Gate catch-rate thinking for any agent-authored change.</li>
+  <li>Hard stops on production keys and customer code in prompts.</li>
+</ul>
+
+
+<p class="facet">Sources for vendor cells</p>
+<ul>
+  <li>Prefer primary vendor documentation over aggregator blogs.</li>
+  <li>Archive a PDF or HTML snapshot when a Documented cell drives security policy.</li>
+  <li>Re-verify Inferred cells at least quarterly, or after any major product rename.</li>
+  <li>Never train staff using fabricated UI screenshots attributed to vendors.</li>
+</ul>
+
+<p>Volume 26 closes the coding-agent practice loop for Forge. Volume 27 takes the same discipline —
+shared files, named workflows, secrets hard stops — into customer delivery engagements where the
+blast radius includes another organisation’s data and trust.</p>
+
+<aside class="callout core"><span class="title">Closing</span>
+  <ul>
+    <li>Coding agents multiply judgement; they do not replace ownership of the merge.</li>
+    <li>Files, permissions and gates are the system. Models are components.</li>
+    <li>Optimise workflows, not brand loyalty.</li>
+  </ul>
+</aside>
+
+<h2>Self-Check Before Volume 27</h2>
+<div class="frame checklist">
+  <ul>
+    <li>I can name the four interaction surfaces and give one stop-condition for agents.</li>
+    <li>I can explain Documented vs Inferred with an example cell from Chapter 2.</li>
+    <li>I have run <code>python -m forge.devex scaffold</code>, <code>lint-agents</code> and <code>check-mcp</code> once.</li>
+    <li>I can recite the hard stops for Workflows A, B and C without looking them up.</li>
+    <li>I know what to do if a production key may have entered a chat.</li>
+    <li>I will not invent vendor UI screenshots for training material.</li>
+  </ul>
+</div>
+
+<figure class="diagram">
+<pre class="ascii">Volume 26 deliverables into Volume 27
+
+workspace module (AGENTS / rules / MCP allow-list)
+        |
+        +--&gt; engagement brief constraints (no customer code in consumer chats)
+        |
+three workflows
+        |
+        +--&gt; PoC = often vibe+gates; pilot = ship only
+        |
+gate catch-rate habit
+        |
+        +--&gt; customer success metrics that are not vanity demos</pre>
+<figcaption>What Forward Deployed work inherits from coding-agent practice.</figcaption>
+</figure>
+
+<p>If a checklist item failed, re-read the matching chapter and re-run the practical project on a
+tiny Forge helper before opening Volume 27. Customer environments amplify every shortcut you take
+with prompts, MCP and unverified diffs.</p>
+
+</section>
+
+</body>
+</html>
+
+

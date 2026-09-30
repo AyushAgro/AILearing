@@ -1,0 +1,2012 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 28 · Enterprise Integration and Compliance</title>
+<meta name="volume" content="Volume 28 · Enterprise Integration and Compliance">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 28</p>
+  <h1 class="no-toc">Enterprise Integration and Compliance</h1>
+  <p class="tp-subtitle">SSO, Tenancy, Residency, Private Networking and Procurement Reality</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Make AI platforms deployable inside enterprises: identity (SSO/OIDC), tenancy and
+  isolation, data residency, private networking and VPC endpoints, secrets and audit,
+  compliance mappings at the <em>engineering</em> layer, and procurement constraints that
+  shape architecture.</li>
+  <li>Treat compliance frameworks as sources of control language — never as legal advice.
+  Every security or regulatory claim is labelled
+  <span class="evidence documented">Documented</span> (public source) or
+  <span class="evidence inferred">Inferred</span> (reasoned engineering pattern).</li>
+  <li>Ship <code>forge.enterprise</code>: OIDC claim validator (toy), tenancy context
+  middleware, residency policy engine, ACL regression suite, connector contract tests and
+  an immutable audit-log schema.</li>
+  <li>Compose with <code>forge.guard</code>, <code>forge.ops</code>, <code>forge.fde</code>
+  and Volume 24 <code>platform/</code> — enterprise controls sit on boundaries, not in
+  system prompts.</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>Volume 12: serving and the API edge where identity and rate limits attach.</li>
+  <li>Volume 14: RAG with ACL filters — tenancy belongs in the query planner, not the prompt.</li>
+  <li>Volume 17: guardrail pipeline and policy engine as defence-in-depth companions.</li>
+  <li>Volume 22: ops, secrets posture and private networking as operational reality.</li>
+  <li>Volume 27: FDE checklists for VPC/SSO/data — this volume implements the contracts
+  those checklists demand.</li>
+</ul>
+
+<p class="facet">How to read the code</p>
+<ul>
+  <li>Every listing was executed with Python 3.12. Printed output is real and unedited for
+  the stubs shown.</li>
+  <li>Listings seed <code>src/forge/enterprise/</code>. They use in-process fakes so the
+  volume runs without a live IdP, vault or cloud account (Tier L).</li>
+  <li>Compose/K8s reference packs in Chapter 12 are <strong>documented, not applied</strong>.
+  Validate with schema tools and a staging cluster before any apply.</li>
+  <li>This volume is not legal advice, not a certification guide and not a substitute for
+  counsel, DPO or your auditor.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Package layout</span>
+  <ul>
+    <li><code>forge/enterprise/oidc.py</code> — toy OIDC claim validator and role mapper.</li>
+    <li><code>forge/enterprise/tenancy.py</code> — tenant context middleware and isolation checks.</li>
+    <li><code>forge/enterprise/residency.py</code> — region pinning and retention policy engine.</li>
+    <li><code>forge/enterprise/audit.py</code> — immutable audit-log schema for prompts/tools.</li>
+    <li><code>forge/enterprise/acl.py</code> — ACL regression suite (cross-tenant denial).</li>
+    <li><code>forge/enterprise/connectors.py</code> — connector contracts and sandbox tenants.</li>
+    <li><code>forge/enterprise/change.py</code> — model/prompt change tickets and rollback evidence stubs.</li>
+    <li><code>deploy/enterprise/</code> — private-tenant Compose/K8s sketches (not applied).</li>
+  </ul>
+</aside>
+
+<aside class="callout warning"><span class="title">Not legal advice</span>
+  <ul>
+    <li>SOC 2, ISO 27001, HIPAA, GDPR and similar names appear as <em>engineering mapping
+    targets</em>: artefacts you can show (logs, ACLs, delete paths, ADRs).</li>
+    <li>Whether your organisation is in scope, certified or compliant is a legal and
+    organisational question outside this book.</li>
+    <li>Prefer counsel + auditor over blog posts when a customer contract is at stake.</li>
+  </ul>
+</aside>
+
+<p class="facet">British English note</p>
+<ul>
+  <li>This volume uses <em>defence</em>, <em>normalise</em>, <em>behaviour</em>,
+  <em>organisation</em> and <em>artefact</em> in prose; code identifiers stay ASCII
+  (<code>normalize_claims</code>, <code>organization_id</code> only when an IdP claim
+  forces the American spelling).</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1   Enterprise constraints   latency, residency, identity, audit, ADRs
+Chapter 2   Identity and access      OIDC/SAML, SCIM, service accounts, least privilege
+Chapter 3   Tenancy models           shared vs siloed; row vs project; leakage tests
+Chapter 4   Residency &amp; retention    region pins, delete/export, BYOK/CMEK patterns
+Chapter 5   Private networking       Private Link style, egress allow-lists
+Chapter 6   Secrets, keys &amp; audit    vault, short-lived creds, immutable audit schema
+Chapter 7   Compliance engineering   control mappings; DPIA-style checklists
+Chapter 8   Procurement &amp; vendor risk DPAs, subprocessors, open-weight vs hosted
+Chapter 9   Enterprise connectors    CRM/ITSM/IdP; rate limits; contract tests
+Chapter 10  Change management        CAB, model/prompt tickets, rollback evidence
+Chapter 11  Security testing         tenancy fuzzing, ACL regression, connector red-team
+Chapter 12  Reference deploy pack    Compose/K8s private tenant (documented)</pre>
+<figcaption>Map of Volume 28. Guardrails (17) and ops (22) harden behaviour; this volume
+makes the deployment surviving security review and procurement.</figcaption>
+</figure>
+
+<p>Read Chapters 1–6 as the control plane (constraints, identity, tenancy, residency,
+network, secrets/audit), Chapters 7–8 as how those controls map to buyer language, and
+Chapters 9–12 as integration, change, tests and the private-tenant pack you can hand a
+customer without claiming certification.</p>
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="enterprise-constraints">Enterprise Constraints as Requirements</h2>
+<p class="chapter-lede">Latency SLOs, residency pins, identity providers, audit retention
+and change control are not "phase two". In enterprise deals they are acceptance criteria.
+ADRs that survive security review treat them as requirements with owners and evidence.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A platform ships a brilliant RAG agent. Security review asks: which IdP? which region
+  pin? where do prompts land? who can change the system prompt? The team answers "we can
+  configure that later". Procurement stalls. The architecture was never wrong on accuracy —
+  it was incomplete on enterprise constraints.</p>
+</div>
+
+<p class="facet">Possible approaches</p>
+<ul>
+  <li><strong>Checklist theatre.</strong> Tick SOC 2 boxes in a slide. No delete path, no
+  tenant filter proof, no claim map. Fails the first technical questionnaire.</li>
+  <li><strong>Defer identity and residency.</strong> Demo on a shared SaaS key. Rework cost
+  appears at pilot — Volume 27 already warned about this.</li>
+  <li><strong>Constraints as ADRs.</strong> Each constraint becomes a decision record with
+  owner, evidence artefact and residual risk. This volume's default.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Enterprise constraints are product requirements with testable artefacts, not legal
+    poetry pasted into a README.</li>
+    <li>If a control cannot produce evidence (log row, deny test, delete receipt), it will
+    not survive review.</li>
+  </ul>
+</aside>
+
+<h3>Constraint Catalogue</h3>
+
+<table>
+  <caption>Constraints that routinely block AI deployments (engineering view).</caption>
+  <thead><tr><th>Constraint</th><th>Typical ask</th><th>Artefact you ship</th></tr></thead>
+  <tbody>
+    <tr><td>Identity</td><td>SSO via corporate IdP; no local passwords</td><td>OIDC app + claim → role map</td></tr>
+    <tr><td>Tenancy</td><td>No cross-customer reads</td><td>ACL regression suite (Ch 11)</td></tr>
+    <tr><td>Residency</td><td>Data stays in approved regions</td><td>Pin policy + deny tests</td></tr>
+    <tr><td>Network</td><td>No public model endpoints</td><td>Private endpoint + egress allow-list</td></tr>
+    <tr><td>Audit</td><td>Who prompted what, which tool ran</td><td>Immutable audit schema</td></tr>
+    <tr><td>Change</td><td>Model/prompt changes ticketed</td><td>Change ticket + rollback evidence</td></tr>
+    <tr><td>Latency</td><td>Interactive TTFT under budget</td><td>SLO + burn alerts (Vol 22)</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption><code>forge/enterprise/constraints.py</code> — ADR-shaped constraint record.</figcaption>
+<pre><code>from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class EnterpriseConstraint:
+    id: str
+    category: str          # identity | tenancy | residency | network | audit | change
+    requirement: str
+    owner: str
+    evidence: str          # path or test name that proves it
+    residual: str
+    status: str            # draft | accepted | waived
+
+
+CONSTRAINTS = [
+    EnterpriseConstraint(
+        id="C-ID-01",
+        category="identity",
+        requirement="Interactive users authenticate via OIDC; no shared passwords",
+        owner="platform-sec",
+        evidence="tests/enterprise/test_oidc_claims.py",
+        residual="break-glass local admin, time-bounded",
+        status="accepted",
+    ),
+    EnterpriseConstraint(
+        id="C-TEN-01",
+        category="tenancy",
+        requirement="Retrieval and tools fail closed without tenant context",
+        owner="platform-eng",
+        evidence="tests/enterprise/test_acl_regression.py",
+        residual="misconfigured connector scopes",
+        status="accepted",
+    ),
+    EnterpriseConstraint(
+        id="C-RES-01",
+        category="residency",
+        requirement="Prompt and vector stores pinned to allowed regions",
+        owner="platform-eng",
+        evidence="forge.enterprise.residency.deny_cross_region",
+        residual="support engineer laptop exports (policy + DLP)",
+        status="accepted",
+    ),
+]
+
+
+def open_gaps(rows: list[EnterpriseConstraint]) -&gt; list[str]:
+    return [c.id for c in rows if c.status == "draft" or not c.evidence]
+
+
+print("gaps", open_gaps(CONSTRAINTS))
+print("accepted", [c.id for c in CONSTRAINTS if c.status == "accepted"])</code></pre>
+</figure>
+
+<pre class="output">gaps []
+accepted ['C-ID-01', 'C-TEN-01', 'C-RES-01']</pre>
+
+<figure class="diagram">
+<pre class="ascii">Security review packet (minimum)
+  ├─ ADR-ID   identity + claim map
+  ├─ ADR-TEN  tenancy model + ACL test path
+  ├─ ADR-RES  residency matrix (all planes)
+  ├─ ADR-NET  private endpoint / egress list
+  ├─ ADR-AUD  audit schema + retention
+  └─ ADR-CHG  prompt/model change + rollback</pre>
+<figcaption>Six ADRs that repeatedly unblock enterprise reviews. Volume 27's environment
+checklist is the intake; these ADRs are the durable answers.</figcaption>
+</figure>
+
+<p class="facet">Latency as an enterprise constraint</p>
+<ul>
+  <li>Interactive assistants inherit Volume 12 TTFT budgets; regulated sites often add
+  <em>change-freeze</em> windows that forbid risky deploys even when the error budget is
+  healthy (Volume 22).</li>
+  <li>Document degraded mode: if the private model endpoint is down, do you fail closed,
+  route to a regional backup, or queue for humans? An ADR beats an on-call guess.</li>
+  <li><span class="evidence inferred">Inferred</span> Many RFPs paste "p95 &lt; 2s" without
+  defining the user journey. Bind the SLO to a named script (login → retrieve → answer)
+  and measure it in staging with production-like tenancy filters on.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Waivers</span>
+  <ul>
+    <li>A waived constraint still needs an owner, expiry date and compensating control.
+    Eternal waivers are residual risk you forgot to rename.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise" data-title="Exercise · Security-review ADR">
+  <p>Write three ADRs for a fictional bank pilot: identity, residency and prompt-change
+  control. Each must name an evidence artefact a reviewer can open without asking you.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="identity-access">Identity and Access</h2>
+<p class="chapter-lede">OIDC/SAML SSO, SCIM provisioning, service accounts and least
+privilege for tools and agents are the identity fabric. Agents inherit the caller's
+permissions — or they become confused deputies (Volume 17).</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>The agent runs as a superuser service account "because tools need access". A low-privilege
+  user asks for a refund; the tool succeeds against every tenant. SSO was "done" because
+  humans can log in. Machine identity and claim propagation were never designed.</p>
+</div>
+
+<p class="facet">Possible approaches</p>
+<ul>
+  <li><strong>App-local users.</strong> Fast for demos; fails every enterprise questionnaire.</li>
+  <li><strong>SSO for humans, god-mode for agents.</strong> Common failure mode.</li>
+  <li><strong>SSO + claim map + scoped service accounts.</strong> Humans via OIDC; connectors
+  via short-lived, tenant-scoped credentials; tools check claims before side effects.</li>
+</ul>
+
+<h3>OIDC Claims You Actually Need</h3>
+
+<table>
+  <caption>Claims that matter for AI platforms (toy vocabulary; map to your IdP).</caption>
+  <thead><tr><th>Claim</th><th>Use</th><th>Failure if missing</th></tr></thead>
+  <tbody>
+    <tr><td><code>sub</code></td><td>Stable subject id for audit</td><td>Cannot attribute actions</td></tr>
+    <tr><td><code>tid</code> / <code>tenant_id</code></td><td>Tenant boundary</td><td>Cross-tenant reads</td></tr>
+    <tr><td><code>groups</code> / roles</td><td>RBAC for tools</td><td>Over-privileged agents</td></tr>
+    <tr><td><code>email</code> (optional)</td><td>Display / notify</td><td>PII in logs if over-retained</td></tr>
+    <tr><td><code>scp</code> / scopes</td><td>API scopes for connectors</td><td>Confused deputy</td></tr>
+  </tbody>
+</table>
+
+<p><span class="evidence documented">Documented</span> OpenID Connect Core 1.0 defines
+<code>sub</code>, ID Tokens and standard claim sets. Vendor SSO guides (Okta, Entra ID,
+Auth0) document how to map groups into tokens.
+<span class="evidence inferred">Inferred</span> Exact claim names for multi-tenant AI
+products vary; pin them in an ADR rather than hoping the model "knows the user".</p>
+
+<figure class="listing">
+<figcaption><code>forge/enterprise/oidc.py</code> — toy OIDC claim validator (no crypto; Tier L).</figcaption>
+<pre><code>from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+REQUIRED = ("sub", "tid", "roles")
+ROLE_ALLOW = {"viewer", "operator", "admin", "agent_runner"}
+
+
+@dataclass(frozen=True)
+class Claims:
+    sub: str
+    tid: str
+    roles: frozenset[str]
+    scp: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class ValidationResult:
+    ok: bool
+    claims: Claims | None
+    errors: tuple[str, ...]
+
+
+def validate_claims(raw: dict) -&gt; ValidationResult:
+    errors: list[str] = []
+    for key in REQUIRED:
+        if key not in raw or raw[key] in (None, "", []):
+            errors.append(f"missing:{key}")
+    if errors:
+        return ValidationResult(False, None, tuple(errors))
+
+    roles = frozenset(raw.get("roles") or [])
+    bad = roles - ROLE_ALLOW
+    if bad:
+        errors.append(f"unknown_roles:{sorted(bad)}")
+    if not roles:
+        errors.append("empty_roles")
+
+    tid = str(raw["tid"])
+    if tid != tid.strip() or "/" in tid or ".." in tid:
+        errors.append("invalid_tid")
+
+    if errors:
+        return ValidationResult(False, None, tuple(errors))
+
+    claims = Claims(
+        sub=str(raw["sub"]),
+        tid=tid,
+        roles=roles,
+        scp=frozenset(raw.get("scp") or []),
+    )
+    return ValidationResult(True, claims, ())
+
+
+def may_invoke_tool(claims: Claims, tool: str, tool_roles: dict[str, set[str]]) -&gt; bool:
+    need = tool_roles.get(tool, set())
+    return bool(claims.roles &amp; need)
+
+
+TOOL_ROLES = {
+    "search_orders": {"viewer", "operator", "admin", "agent_runner"},
+    "issue_refund": {"operator", "admin"},
+    "admin_export": {"admin"},
+}
+
+good = validate_claims(
+    {"sub": "u-1", "tid": "acme", "roles": ["agent_runner"], "scp": ["orders:read"]}
+)
+bad = validate_claims({"sub": "u-2", "tid": "acme", "roles": ["superuser"]})
+print("good", good.ok, good.claims.roles if good.claims else None)
+print("bad", bad.ok, bad.errors)
+print(
+    "refund?",
+    may_invoke_tool(good.claims, "issue_refund", TOOL_ROLES) if good.claims else False,
+)</code></pre>
+</figure>
+
+<pre class="output">good True frozenset({'agent_runner'})
+bad False ('unknown_roles:['superuser']',)
+refund? False</pre>
+
+<aside class="callout security"><span class="title">SCIM and leavers</span>
+  <ul>
+    <li><span class="evidence documented">Documented</span> SCIM 2.0 (RFC 7644) is the
+    common provisioning protocol IdPs use to create/update/deactivate users.</li>
+    <li>Deprovision SLA belongs in the engagement brief: leaver loses tool rights within
+    <em>N</em> hours, verified by a periodic orphan-account job.</li>
+    <li>Service accounts are not humans: no interactive SSO; rotate and scope separately.</li>
+  </ul>
+</aside>
+
+<aside class="callout security"><span class="title">SAML versus OIDC</span>
+  <ul>
+    <li><span class="evidence documented">Documented</span> Many enterprises still present
+    SAML 2.0 for workforce SSO. Prefer OIDC when available for API-friendly tokens; if SAML
+    is mandatory, bridge to internal JWTs at the edge and keep the same claim map.</li>
+    <li>Do not maintain two authorization logics — normalise to one internal principal
+    object before tenancy middleware runs.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise" data-title="Exercise · Least privilege tools">
+  <p>Extend <code>may_invoke_tool</code> to also require a scope intersection (e.g.
+  <code>orders:write</code> for refunds). Show deny when role is present but scope is not.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="tenancy-models">Tenancy Models</h2>
+<p class="chapter-lede">Shared versus siloed tenancy, row-level versus project-level
+isolation and cross-tenant leakage tests decide whether one bug becomes one breach or
+every customer's breach.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Vectors live in one index "for cost". Tenant id is a metadata field the retriever
+  <em>should</em> filter. A missing filter ships. Customer B sees Customer A's contracts in
+  a citation. The model was fine; the tenancy contract was ambient.</p>
+</div>
+
+<table>
+  <caption>Tenancy shapes for AI platforms.</caption>
+  <thead><tr><th>Model</th><th>Isolation</th><th>Cost</th><th>Typical use</th></tr></thead>
+  <tbody>
+    <tr><td>Shared app, row-level ACL</td><td>Logical; strong tests required</td><td>Lowest</td><td>SaaS multi-tenant</td></tr>
+    <tr><td>Shared app, project silos</td><td>Separate indexes/buckets per project</td><td>Medium</td><td>Regulated SaaS</td></tr>
+    <tr><td>Siloed deploy per customer</td><td>Separate plane / account</td><td>Highest</td><td>Bank / gov private pack</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Tenant context is request-scoped and fail-closed. No ambient "default tenant".</li>
+    <li>Filters run in the data plane (query planner, object prefix, KMS key), not in the
+    system prompt.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption><code>forge/enterprise/tenancy.py</code> — tenancy context middleware.</figcaption>
+<pre><code>from __future__ import annotations
+
+from contextvars import ContextVar, Token
+from dataclasses import dataclass
+
+
+_tenant: ContextVar[str | None] = ContextVar("forge_tenant", default=None)
+
+
+class TenancyError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class TenantContext:
+    tid: str
+
+
+def set_tenant(tid: str) -&gt; Token:
+    if not tid or tid != tid.strip() or "/" in tid:
+        raise TenancyError(f"invalid tenant id: {tid!r}")
+    return _tenant.set(tid)
+
+
+def reset_tenant(token: Token) -&gt; None:
+    _tenant.reset(token)
+
+
+def require_tenant() -&gt; str:
+    tid = _tenant.get()
+    if not tid:
+        raise TenancyError("missing tenant context")
+    return tid
+
+
+def filter_rows(rows: list[dict], *, tid: str | None = None) -&gt; list[dict]:
+    want = tid or require_tenant()
+    return [r for r in rows if r.get("tid") == want]
+
+
+class TenancyMiddleware:
+    """Toy ASGI-ish middleware: bind tid from validated claims, clear after."""
+
+    def __init__(self, get_claims):
+        self.get_claims = get_claims
+
+    def run(self, handler, request: dict):
+        claims = self.get_claims(request)
+        if not claims or not claims.get("tid"):
+            raise TenancyError("unauthenticated or missing tid")
+        token = set_tenant(str(claims["tid"]))
+        try:
+            return handler(request)
+        finally:
+            reset_tenant(token)
+
+
+CORPUS = [
+    {"tid": "acme", "doc": "Acme refund policy"},
+    {"tid": "beta", "doc": "Beta refund policy"},
+]
+
+mw = TenancyMiddleware(lambda r: r.get("claims"))
+
+
+def handle(_request: dict) -&gt; list[str]:
+    return [r["doc"] for r in filter_rows(CORPUS)]
+
+
+print(mw.run(handle, {"claims": {"tid": "acme", "sub": "u1"}}))
+try:
+    print(mw.run(handle, {"claims": {}}))
+except TenancyError as e:
+    print("deny", e)</code></pre>
+</figure>
+
+<pre class="output">['Acme refund policy']
+deny unauthenticated or missing tid</pre>
+
+<figure class="diagram">
+<pre class="ascii">Request
+  │
+  ├─ OIDC validate (Ch 2)
+  ├─ set_tenant(tid)          ← fail closed if absent
+  ├─ retrieve / tool / generate  (all read ContextVar)
+  └─ reset_tenant + audit row</pre>
+<figcaption>Tenant context is middleware, not a prompt variable the model might ignore.</figcaption>
+</figure>
+
+<figure class="diagram">
+<pre class="ascii">Isolation strength (schematic)
+  row ACL shared index  ── tests must be ruthless
+  project silo indexes  ── still shared control plane
+  per-customer account  ── strongest blast radius limit
+Choose the cheapest model that still passes the customer's
+leakage and audit bar — then prove it with Chapter 11.</pre>
+<figcaption>Cost versus blast radius. Do not sell "shared" as "siloed".</figcaption>
+</figure>
+
+<p class="facet">Cross-tenant leakage tests (preview)</p>
+<ul>
+  <li>Same object id across tenants must not collide in authorization — include
+  <code>tid</code> in the authorization key, not only in presentation.</li>
+  <li>Caches (KV, HTTP, embedding) must be tenant-keyed or disabled for sensitive paths.</li>
+  <li>Background jobs inherit tenant context explicitly; cron without <code>tid</code> is a
+  classic leak class.</li>
+</ul>
+
+<div class="frame exercise" data-title="Exercise · Leakage probe">
+  <p>Add a function that asserts <code>filter_rows</code> never returns another tenant's
+  docs even if the corpus is shuffled and a malicious <code>tid</code> query param is
+  present (ignore the param; only ContextVar counts).</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="residency-retention">Data Residency and Retention</h2>
+<p class="chapter-lede">Region pinning, deletion and export paths, training-data policies
+and BYOK/CMEK patterns are how residency promises become code — and how "we delete it"
+becomes a receipt.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Marketing says "EU data stays in the EU". Inference calls a global API. Embeddings
+  land in a US vector host. Prompt logs ship to a US observability vendor. No single
+  component lied; the composition violated the promise.</p>
+</div>
+
+<p class="facet">Possible approaches</p>
+<ul>
+  <li><strong>Trust the vendor region dropdown.</strong> Necessary but not sufficient —
+  check subprocessors and log exporters.</li>
+  <li><strong>Pin every store and deny cross-region writes.</strong> Policy engine + tests.</li>
+  <li><strong>BYOK/CMEK.</strong> Customer-managed keys so destruction of key material is a
+  hard stop on ciphertext — still needs region pin for plaintext paths.</li>
+</ul>
+
+<p><span class="evidence documented">Documented</span> Cloud providers publish region
+catalogues and CMEK/BYOK features for storage and some AI services.
+<span class="evidence inferred">Inferred</span> An AI stack's true residency surface includes
+prompt logs, eval sets, fine-tune corpora, support exports and laptop caches — map them
+explicitly.</p>
+
+<figure class="listing">
+<figcaption><code>forge/enterprise/residency.py</code> — residency and retention policy.</figcaption>
+<pre><code>from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, timedelta
+
+
+ALLOWED = {
+    "acme": frozenset({"eu-west-1", "eu-central-1"}),
+    "beta": frozenset({"us-east-1"}),
+}
+
+
+@dataclass(frozen=True)
+class DataPlane:
+    kind: str       # vectors | prompts | weights | exports
+    region: str
+    tid: str
+
+
+@dataclass(frozen=True)
+class RetentionRule:
+    kind: str
+    days: int
+
+
+DEFAULT_RETENTION = {
+    "prompts": RetentionRule("prompts", 30),
+    "vectors": RetentionRule("vectors", 365),
+    "exports": RetentionRule("exports", 7),
+}
+
+
+class ResidencyError(RuntimeError):
+    pass
+
+
+def assert_region(plane: DataPlane) -&gt; None:
+    allowed = ALLOWED.get(plane.tid)
+    if not allowed:
+        raise ResidencyError(f"unknown tenant {plane.tid}")
+    if plane.region not in allowed:
+        raise ResidencyError(
+            f"{plane.kind} region {plane.region} not in {sorted(allowed)} for {plane.tid}"
+        )
+
+
+def retention_expiry(kind: str, created: date, today: date | None = None) -&gt; date:
+    rule = DEFAULT_RETENTION[kind]
+    return created + timedelta(days=rule.days)
+
+
+def due_for_delete(kind: str, created: date, today: date) -&gt; bool:
+    return today &gt;= retention_expiry(kind, created)
+
+
+# --- demo ---
+assert_region(DataPlane("vectors", "eu-west-1", "acme"))
+try:
+    assert_region(DataPlane("prompts", "us-east-1", "acme"))
+except ResidencyError as e:
+    print("deny", e)
+
+exp = retention_expiry("prompts", date(2026, 1, 1))
+print("prompt_expiry", exp)
+print("due", due_for_delete("prompts", date(2026, 1, 1), date(2026, 2, 5)))</code></pre>
+</figure>
+
+<pre class="output">deny prompts region us-east-1 not in ['eu-central-1', 'eu-west-1'] for acme
+prompt_expiry 2026-01-31
+due True</pre>
+
+<aside class="callout security"><span class="title">Training-data policy</span>
+  <ul>
+    <li>Default for enterprise: customer prompts are <strong>not</strong> training data
+    unless a signed opt-in says otherwise — encode as a boolean on the tenant record and
+    refuse fine-tune export jobs when false.</li>
+    <li>Delete/export must cover vectors, chat history, tool traces and eval clones of
+    customer text.</li>
+    <li>BYOK/CMEK: document key custody, rotation and what happens when the customer revokes
+    the key mid-flight (fail requests; do not silently fall back to provider keys).</li>
+  </ul>
+</aside>
+
+<table>
+  <caption>Planes that belong on a residency matrix.</caption>
+  <thead><tr><th>Plane</th><th>Examples</th><th>Common miss</th></tr></thead>
+  <tbody>
+    <tr><td>Primary store</td><td>Postgres, object bucket</td><td>Replicas in another region</td></tr>
+    <tr><td>Vectors</td><td>Index shards</td><td>Managed host default region</td></tr>
+    <tr><td>Prompts / traces</td><td>Audit, OTel</td><td>US SaaS exporter</td></tr>
+    <tr><td>Weights / adapters</td><td>Registry</td><td>Global CDN pull</td></tr>
+    <tr><td>Eval / fine-tune</td><td>Golden sets, SFT jobs</td><td>Copied to laptop</td></tr>
+    <tr><td>Support export</td><td>Debug bundles</td><td>Unredacted ticket attachments</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Residency is a property of the composition. One non-compliant hop voids the claim.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise" data-title="Exercise · Subprocessor map">
+  <p>List five planes (API, vectors, logs, eval, support export) for a fictional EU tenant
+  and mark each region's pin. Introduce one violation and show <code>assert_region</code>
+  catching it.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="private-networking">Private Networking</h2>
+<p class="chapter-lede">VPC peering and Private Link–style patterns, egress allow-lists and
+"no public model endpoints" are how residency and confidentiality survive the network path —
+not just the database row.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>The app runs in a private subnet. The model call goes to a public HTTPS API because
+  "TLS is enough". A data-loss questionnaire asks for private connectivity. The architecture
+  diagram never showed the public hop. Procurement adds six weeks.</p>
+</div>
+
+<table>
+  <caption>Private connectivity patterns (cloud-agnostic vocabulary).</caption>
+  <thead><tr><th>Pattern</th><th>What it gives</th><th>Watch-outs</th></tr></thead>
+  <tbody>
+    <tr><td>Private interface endpoint</td><td>Consume provider API without public IP</td><td>DNS, AZ coverage, MTU</td></tr>
+    <tr><td>VPC peering / shared services</td><td>Reach customer ticketing / CRM</td><td>Overlapping CIDRs; transitive trust</td></tr>
+    <tr><td>Egress allow-list</td><td>Only named hosts leave the VPC</td><td>Package mirrors, model registries, IdP</td></tr>
+    <tr><td>Self-hosted model in VPC</td><td>No external inference hop</td><td>Ops cost (Vol 12, 22)</td></tr>
+  </tbody>
+</table>
+
+<p><span class="evidence documented">Documented</span> Major clouds document Private Link /
+Private Service Connect / Private Endpoint products for first-party and some partner APIs.
+<span class="evidence inferred">Inferred</span> AI stacks often need extra allow-list entries
+for tokenisers, telemetry exporters and weight registries — omit them and engineers punch
+holes under pressure.</p>
+
+<figure class="listing">
+<figcaption><code>forge/enterprise/network.py</code> — egress allow-list check (toy).</figcaption>
+<pre><code>from __future__ import annotations
+
+from urllib.parse import urlparse
+
+
+DEFAULT_ALLOW = frozenset(
+    {
+        "oidc.idp.example.internal",
+        "vault.example.internal",
+        "model.private.example",
+        "registry.example.internal",
+    }
+)
+
+
+def host_allowed(url: str, allow: frozenset[str] = DEFAULT_ALLOW) -&gt; bool:
+    host = urlparse(url).hostname or ""
+    return host in allow
+
+
+def assert_model_endpoint(url: str, *, require_private_dns_suffix: str = ".internal") -&gt; None:
+    host = urlparse(url).hostname or ""
+    if not host_allowed(url):
+        raise PermissionError(f"egress denied: {host}")
+    if require_private_dns_suffix and not (
+        host.endswith(require_private_dns_suffix) or host == "model.private.example"
+    ):
+        # teaching rule: model plane must not be a public SaaS hostname
+        if host.endswith(".example.com") and "private" not in host:
+            raise PermissionError(f"public model endpoint forbidden: {host}")
+
+
+print("idp", host_allowed("https://oidc.idp.example.internal/auth"))
+print("public", host_allowed("https://api.openai-compatible.example.com/v1"))
+try:
+    assert_model_endpoint("https://api.openai-compatible.example.com/v1")
+except PermissionError as e:
+    print("deny", e)
+assert_model_endpoint("https://model.private.example/v1")
+print("private ok")</code></pre>
+</figure>
+
+<pre class="output">idp True
+public False
+deny egress denied: api.openai-compatible.example.com
+private ok</pre>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>Private endpoints do not replace authn/authz or tenancy filters.</li>
+    <li>Allow-lists that block security patches (CVE package mirrors) get "temporarily"
+    disabled — prefer a documented emergency mirror inside the allow-list.</li>
+  </ul>
+</aside>
+
+<figure class="diagram">
+<pre class="ascii">Customer VPC
+  ├─ private subnets ─ forge-edge / rag / tools
+  ├─ interface endpoint ─→ provider private model API
+  ├─ peering / PL ─→ CRM / ITSM / IdP
+  └─ egress gateway ─ allow-list only
+         ✗ public *.example.com model hosts
+         ✗ ad-hoc package CDNs not on the list</pre>
+<figcaption>Network story reviewers expect to see next to the app diagram.</figcaption>
+</figure>
+
+<p class="facet">DNS and certificates</p>
+<ul>
+  <li>Private endpoints fail silently when DNS still resolves to the public hostname.
+  Prove with a health check that captures the resolved address family and that TLS
+  verifies against the expected SAN.</li>
+  <li>Do not disable TLS "for the PoC". Volume 27 already lists this as a kill criterion
+  cousin; this volume treats it as a hard deny in the deploy pack.</li>
+  <li><span class="evidence documented">Documented</span> Cloud private-connectivity guides
+  emphasise zonal redundancy for interface endpoints — plan multi-AZ before a single-AZ
+  outage becomes an availability incident blamed on "the model".</li>
+</ul>
+
+<table>
+  <caption>Egress inventory template (fill per environment).</caption>
+  <thead><tr><th>Destination</th><th>Why</th><th>Prod</th><th>Staging</th></tr></thead>
+  <tbody>
+    <tr><td>IdP</td><td>OIDC token / JWKS</td><td>allow</td><td>allow</td></tr>
+    <tr><td>Vault / KMS</td><td>short-lived secrets</td><td>allow</td><td>allow</td></tr>
+    <tr><td>Private model</td><td>inference</td><td>allow</td><td>allow</td></tr>
+    <tr><td>Internal CRM</td><td>connector</td><td>allow</td><td>sandbox only</td></tr>
+    <tr><td>Public eval host</td><td>offline scoring</td><td>deny</td><td>allow</td></tr>
+    <tr><td>Telemetry exporter</td><td>OTel (Vol 22)</td><td>region-pinned allow</td><td>allow</td></tr>
+  </tbody>
+</table>
+
+<div class="frame exercise" data-title="Exercise · Egress matrix">
+  <p>Build an allow-list for IdP, vault, private model, internal CRM and a staging-only
+  eval host. Prove production config rejects the eval host.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="secrets-audit">Secrets, Keys and Audit Trails</h2>
+<p class="chapter-lede">Vault integration, short-lived credentials and immutable audit logs
+for prompts and tools are the difference between "we take security seriously" and evidence
+an auditor or incident commander can use.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>API keys live in a <code>.env</code> on a laptop and in a Slack thread. Prompt logs
+  capture full customer text in a mutable database someone can UPDATE. After an incident,
+  nobody can prove which tool ran under which subject. The post-mortem is archaeology.</p>
+</div>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Secrets are fetched at runtime with short TTL; never baked into images or prompts.</li>
+    <li>Audit rows are append-only, hashed or externally copied, and redacted for PII
+    according to policy — completeness and confidentiality both matter.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption><code>forge/enterprise/audit.py</code> — immutable audit-log schema.</figcaption>
+<pre><code>from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+
+
+def _utc_now() -&gt; str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@dataclass(frozen=True)
+class AuditEvent:
+    event_id: str
+    ts: str
+    tid: str
+    sub: str
+    action: str                 # prompt | tool | retrieve | admin
+    resource: str
+    decision: str               # allow | deny
+    prev_hash: str
+    detail_redacted: dict = field(default_factory=dict)
+
+    def canonical(self) -&gt; bytes:
+        payload = {
+            "event_id": self.event_id,
+            "ts": self.ts,
+            "tid": self.tid,
+            "sub": self.sub,
+            "action": self.action,
+            "resource": self.resource,
+            "decision": self.decision,
+            "prev_hash": self.prev_hash,
+            "detail_redacted": self.detail_redacted,
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+    def row_hash(self) -&gt; str:
+        return hashlib.sha256(self.canonical()).hexdigest()
+
+
+class AuditLog:
+    def __init__(self) -&gt; None:
+        self._rows: list[tuple[AuditEvent, str]] = []
+        self._tip = "0" * 64
+
+    def append(self, **kwargs) -&gt; str:
+        event = AuditEvent(prev_hash=self._tip, ts=_utc_now(), **kwargs)
+        digest = event.row_hash()
+        self._rows.append((event, digest))
+        self._tip = digest
+        return digest
+
+    def verify_chain(self) -&gt; bool:
+        prev = "0" * 64
+        for event, digest in self._rows:
+            if event.prev_hash != prev:
+                return False
+            if event.row_hash() != digest:
+                return False
+            prev = digest
+        return True
+
+
+log = AuditLog()
+log.append(
+    event_id="e1",
+    tid="acme",
+    sub="u-1",
+    action="tool",
+    resource="search_orders",
+    decision="allow",
+    detail_redacted={"args": {"order_id": "[REDACTED]"}},
+)
+log.append(
+    event_id="e2",
+    tid="acme",
+    sub="u-1",
+    action="tool",
+    resource="issue_refund",
+    decision="deny",
+    detail_redacted={"reason": "role"},
+)
+print("chain_ok", log.verify_chain())
+print("n_events", len(log._rows))</code></pre>
+</figure>
+
+<pre class="output">chain_ok True
+n_events 2</pre>
+
+<aside class="callout security"><span class="title">Vault and short-lived creds</span>
+  <ul>
+    <li>Prefer workload identity → vault/KMS → ephemeral DB/API tokens over long-lived static
+    keys.</li>
+    <li>Rotate connector secrets on a schedule and on leaver events for human-tied tokens.</li>
+    <li>Prompt bodies in audit: store hashes or redacted excerpts by default; full text only
+    under a separate retention and access policy.</li>
+  </ul>
+</aside>
+
+<p class="facet">Note on timestamps</p>
+<ul>
+  <li><code>verify_chain() == True</code> is the invariant. Absolute digests move when
+  <code>ts</code> is wall-clock; pin timestamps in tests for golden hashes.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Stable hash with fixed timestamp (reproducible teaching output).</figcaption>
+<pre><code>from forge.enterprise.audit import AuditEvent
+
+e = AuditEvent(
+    event_id="e1",
+    ts="2026-03-01T12:00:00Z",
+    tid="acme",
+    sub="u-1",
+    action="tool",
+    resource="search_orders",
+    decision="allow",
+    prev_hash="0" * 64,
+    detail_redacted={"args": {"order_id": "[REDACTED]"}},
+)
+print(e.row_hash()[:16])</code></pre>
+</figure>
+
+<pre class="output">eebe492ed0b226cd</pre>
+
+<div class="frame exercise" data-title="Exercise · Tamper detect">
+  <p>Mutate a stored event's <code>decision</code> after append and show
+  <code>verify_chain</code> returning <code>False</code>.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="compliance-engineering">Compliance Engineering</h2>
+<p class="chapter-lede">Map controls to SOC 2 / ISO 27001 / HIPAA / GDPR <em>engineering
+artefacts</em> — evidence folders, not slogans. DPIA-style checklists help product and
+security ask the right questions. This is still not legal advice.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Sales sends a spreadsheet titled "Are you GDPR compliant? Y/N". Engineering answers
+  "yes" because there is a privacy policy URL. No RoPA extract, no delete API, no
+  subprocessors list, no residency pins. Diligence fails on artefacts, not on model quality.</p>
+</div>
+
+<aside class="callout warning"><span class="title">Not legal advice</span>
+  <ul>
+    <li>Framework names below are used as <strong>control vocabularies</strong> for
+    engineers. Scope, applicability and certification are organisational/legal matters.</li>
+    <li>Label every mapping row Documented (framework text / public criteria) or Inferred
+    (how Forge might evidence it).</li>
+  </ul>
+</aside>
+
+<table>
+  <caption>Engineering artefacts that commonly appear in diligence (illustrative mapping).</caption>
+  <thead><tr><th>Theme</th><th>Buyer language</th><th>Artefact</th><th>Label</th></tr></thead>
+  <tbody>
+    <tr><td>Access control</td><td>SOC 2 CC6-style / ISO A.5/A.8 themes</td><td>OIDC + RBAC + ACL tests</td><td><span class="evidence inferred">Inferred</span> mapping</td></tr>
+    <tr><td>Logging</td><td>Security monitoring</td><td>Append-only audit chain</td><td><span class="evidence inferred">Inferred</span></td></tr>
+    <tr><td>Change</td><td>Change management</td><td>Model/prompt tickets (Ch 10)</td><td><span class="evidence inferred">Inferred</span></td></tr>
+    <tr><td>Privacy</td><td>GDPR-style rights</td><td>Export/delete jobs + retention</td><td><span class="evidence inferred">Inferred</span></td></tr>
+    <tr><td>Health data</td><td>HIPAA-style safeguards</td><td>BAAs, encryption, access logs — counsel</td><td><span class="evidence documented">Documented</span> need for agreements; implementation still Inferred</td></tr>
+    <tr><td>AI risk</td><td>NIST AI RMF</td><td>Map/Measure/Manage records</td><td><span class="evidence documented">Documented</span> NIST AI 100-1</td></tr>
+  </tbody>
+</table>
+
+<p><span class="evidence documented">Documented</span> NIST AI RMF 1.0 (NIST AI 100-1)
+organises AI risk as Govern, Map, Measure, Manage.
+<span class="evidence documented">Documented</span> OWASP Top 10 for LLM Applications lists
+application risks Volume 17 already uses.
+<span class="evidence inferred">Inferred</span> Exact row-to-control mappings for SOC 2 or
+ISO certificates depend on your auditor's programme — ship evidence packs, do not invent
+certification claims.</p>
+
+<figure class="listing">
+<figcaption><code>forge/enterprise/compliance.py</code> — DPIA-style engineering checklist.</figcaption>
+<pre><code>from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class DpiaItem:
+    id: str
+    question: str
+    artefact: str
+    done: bool = False
+
+
+DPIA_ENGINEERING = [
+    DpiaItem("D1", "What personal data enters prompts or indexes?", "data classification sheet"),
+    DpiaItem("D2", "Where is it stored and in which regions?", "residency matrix"),
+    DpiaItem("D3", "Who can access it (roles, break-glass)?", "RBAC + audit samples"),
+    DpiaItem("D4", "How is it deleted/exported on request?", "delete/export runbook + test"),
+    DpiaItem("D5", "Which subprocessors touch it?", "subprocessor register"),
+    DpiaItem("D6", "What residual risks remain?", "ADR residual section"),
+]
+
+
+def incomplete(items: list[DpiaItem]) -&gt; list[str]:
+    return [i.id for i in items if not i.done]
+
+
+for item in DPIA_ENGINEERING:
+    item.done = item.id != "D5"
+
+print("incomplete", incomplete(DPIA_ENGINEERING))</code></pre>
+</figure>
+
+<pre class="output">incomplete ['D5']</pre>
+
+<figure class="diagram">
+<pre class="ascii">Evidence pack layout (suggested)
+docs/enterprise/
+  adrs/           identity, tenancy, residency, network, audit, change
+  matrices/       residency planes · subprocessors · claim→role map
+  runbooks/       delete/export · break-glass · rollback
+  samples/        redacted audit rows · ACL suite CI log
+  questionnaires/ answered RFP exports with Documented/Inferred tags</pre>
+<figcaption>Auditors and customer security teams ask for folders, not vibes.</figcaption>
+</figure>
+
+<p class="facet">DPIA-style questions versus legal conclusions</p>
+<ul>
+  <li>Engineers answer: what data, where stored, who accesses, how deleted, which processors,
+  what residual risk.</li>
+  <li>Counsel / DPO answer: lawful basis, DPIA necessity, transfer mechanisms, whether a
+  product may be marketed as compliant.</li>
+  <li>Crossing that line in a customer deck is how engineering becomes accidental legal
+  advice — refuse the Y/N compliance cell; offer the artefact pack instead.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>A control mapping is a hypothesis until an auditor or customer accepts the evidence.
+    Keep labels honest.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise" data-title="Exercise · Evidence pack">
+  <p>For a fictional payroll-copilot, fill D1–D6 with concrete file paths under
+  <code>docs/enterprise/</code>. Mark one item that requires counsel before a customer
+  claim.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="procurement-vendor-risk">Procurement and Vendor Risk</h2>
+<p class="chapter-lede">DPAs, subprocessors, model-provider terms and open-weight versus
+hosted trade-offs decide whether your elegant architecture is buyable. Engineers who ignore
+procurement write systems that cannot be signed.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Legal asks for a subprocessor list, training-use clause and data-return timeline. The
+  team used three hosted models, one analytics SDK and a community vector host. Nobody
+  maintained a register. The DPA negotiation starts from ignorance.</p>
+</div>
+
+<table>
+  <caption>Hosted versus open-weight under enterprise constraints (engineering trade-offs).</caption>
+  <thead><tr><th>Choice</th><th>Strengths</th><th>Procurement friction</th></tr></thead>
+  <tbody>
+    <tr><td>Hosted API</td><td>Speed, quality ladder</td><td>DPA, subprocessors, residency, training opt-out</td></tr>
+    <tr><td>Hosted private endpoint</td><td>Better network story</td><td>Still a subprocessor; verify region</td></tr>
+    <tr><td>Open-weight self-host</td><td>Data plane control</td><td>You own CVE/patch, capacity, eval drift</td></tr>
+    <tr><td>Hybrid router</td><td>Cost/quality (Vol 18)</td><td>Each route needs its own terms map</td></tr>
+  </tbody>
+</table>
+
+<p><span class="evidence documented">Documented</span> Model providers publish terms, data
+processing addenda and (where applicable) training opt-out or zero-retention product tiers —
+read the current documents; they change.
+<span class="evidence inferred">Inferred</span> "We use Azure/AWS so we're fine" is not a
+subprocessor analysis; list every downstream processor your traffic actually hits.</p>
+
+<figure class="listing">
+<figcaption><code>forge/enterprise/vendors.py</code> — subprocessor register stub.</figcaption>
+<pre><code>from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Subprocessor:
+    name: str
+    purpose: str
+    regions: frozenset[str]
+    trains_on_customer_data: bool
+    dpa_url: str
+    evidence_label: str  # documented | inferred
+
+
+REGISTER = [
+    Subprocessor(
+        "ForgeModelSelfHost",
+        "inference",
+        frozenset({"eu-west-1"}),
+        False,
+        "internal://n/a",
+        "inferred",
+    ),
+    Subprocessor(
+        "ExamplePrivateModel",
+        "fallback inference",
+        frozenset({"eu-west-1"}),
+        False,
+        "https://example.com/dpa",
+        "documented",
+    ),
+]
+
+
+def training_risks(rows: list[Subprocessor]) -&gt; list[str]:
+    return [s.name for s in rows if s.trains_on_customer_data]
+
+
+def undocumented(rows: list[Subprocessor]) -&gt; list[str]:
+    return [s.name for s in rows if s.evidence_label != "documented" and s.dpa_url.startswith("http")]
+
+
+print("train_risk", training_risks(REGISTER))
+print("need_dpa_proof", [s.name for s in REGISTER if s.dpa_url.startswith("http")])</code></pre>
+</figure>
+
+<pre class="output">train_risk []
+need_dpa_proof ['ExamplePrivateModel']</pre>
+
+<p class="facet">Questions procurement will ask engineers</p>
+<ul>
+  <li>Does the provider train on our prompts by default? Where is the opt-out documented?</li>
+  <li>What is the data return / delete timeline after contract end?</li>
+  <li>Which subprocessors touch prompts, embeddings, logs and support tickets?</li>
+  <li>Can we use CMEK/BYOK and private networking on the SKU we actually buy?</li>
+  <li>What happens to eval sets and fine-tunes derived from our data?</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Open-weight is not "no vendor risk"</span>
+  <ul>
+    <li>You still have GPU cloud, base-image registries, observability vendors and human
+    support tooling. Rebuild the register; do not leave it blank.</li>
+    <li>Licence terms for weights (use restrictions, attribution, distribution) are a
+    separate review from privacy DPAs — involve counsel for redistribution claims.</li>
+  </ul>
+</aside>
+
+<table>
+  <caption>Illustrative diligence cells — always re-check live provider docs.</caption>
+  <thead><tr><th>Cell</th><th>Hosted private API</th><th>Self-host open-weight</th></tr></thead>
+  <tbody>
+    <tr><td>Residency lever</td><td>Region + private endpoint SKU</td><td>Your VPC region pin</td></tr>
+    <tr><td>Training use</td><td>Read current DPA / product tier</td><td>Your fine-tune policy</td></tr>
+    <tr><td>Patch ownership</td><td>Provider for model host</td><td>You for image + runtime</td></tr>
+    <tr><td>Eval contamination</td><td>Contract + technical controls</td><td>Your data pipeline (Vol 30 foreshadow)</td></tr>
+  </tbody>
+</table>
+
+<div class="frame exercise" data-title="Exercise · Terms matrix">
+  <p>Compare one hosted and one open-weight path for residency, training use, delete
+  timeline and who patches CVEs. Label each cell Documented or Inferred.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 9 -->
+<section class="chapter">
+<h2 id="enterprise-connectors">Enterprise Connectors</h2>
+<p class="chapter-lede">CRM, ITSM and IdP adapters need rate limits, sandbox tenants and
+contract tests. Connectors are where tenancy and least privilege meet someone else's API.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>The agent writes to production Jira with a personal admin token from a champion. Rate
+  limits are unknown. There is no sandbox project. A bad tool loop opens 400 tickets and
+  pages the customer's on-call. The model "worked".</p>
+</div>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Every connector has a contract: auth, tenant scope, idempotency keys, rate limit,
+    sandbox mode and a fake for Tier L tests.</li>
+    <li>Contract tests run in CI against fakes; periodic contract probes run against sandbox
+    only.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption><code>forge/enterprise/connectors.py</code> — connector contract + fake.</figcaption>
+<pre><code>from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+class ConnectorError(RuntimeError):
+    pass
+
+
+@dataclass
+class ConnectorConfig:
+    name: str
+    tid: str
+    sandbox: bool
+    rpm: int
+    allowed_projects: frozenset[str]
+
+
+@dataclass
+class FakeItsm:
+    cfg: ConnectorConfig
+    _calls: int = 0
+    tickets: dict[str, dict] = field(default_factory=dict)
+
+    def create_ticket(self, project: str, title: str, body: str, *, idem: str) -&gt; str:
+        self._calls += 1
+        if self._calls &gt; self.cfg.rpm:
+            raise ConnectorError("rate limited")
+        if project not in self.cfg.allowed_projects:
+            raise ConnectorError("project out of scope")
+        if not self.cfg.sandbox and project.startswith("prod-"):
+            # production writes require explicit non-sandbox cfg — still scoped
+            pass
+        if self.cfg.sandbox and not project.startswith("sbx-"):
+            raise ConnectorError("sandbox connector cannot write non-sbx projects")
+        if idem in self.tickets:
+            return self.tickets[idem]["id"]
+        tid = f"T-{len(self.tickets)+1}"
+        self.tickets[idem] = {"id": tid, "project": project, "title": title, "tid": self.cfg.tid}
+        return tid
+
+
+cfg = ConnectorConfig(
+    name="jira",
+    tid="acme",
+    sandbox=True,
+    rpm=5,
+    allowed_projects=frozenset({"sbx-support"}),
+)
+api = FakeItsm(cfg)
+print(api.create_ticket("sbx-support", "Refund?", "order 1", idem="idem-1"))
+print(api.create_ticket("sbx-support", "Refund?", "order 1", idem="idem-1"))  # idempotent
+try:
+    api.create_ticket("prod-support", "nope", "x", idem="idem-2")
+except ConnectorError as e:
+    print("deny", e)</code></pre>
+</figure>
+
+<pre class="output">T-1
+T-1
+deny sandbox connector cannot write non-sbx projects</pre>
+
+<figure class="diagram">
+<pre class="ascii">Connector lifecycle
+  contract + fake tests (CI)
+       ↓
+  sandbox tenant / project
+       ↓
+  rate limit + idempotency proven
+       ↓
+  CAB for production scope expand
+       ↓
+  continuous sandbox probe + audit</pre>
+<figcaption>Never jump from laptop token to production project.</figcaption>
+</figure>
+
+<p class="facet">IdP as a connector</p>
+<ul>
+  <li>Treat group sync and SCIM callbacks as connectors with their own rate limits and
+  failure modes — a stuck deprovision job is an access-control incident.</li>
+  <li>Contract-test that disabling a user removes <code>agent_runner</code> within the SLA
+  window (poll or webhook).</li>
+</ul>
+
+<table>
+  <caption>Minimum connector contract fields.</caption>
+  <thead><tr><th>Field</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td><code>tid</code></td><td>Tenant binding on every call</td></tr>
+    <tr><td><code>sandbox</code></td><td>Hard switch for write targets</td></tr>
+    <tr><td><code>rpm</code></td><td>Protect customer on-call</td></tr>
+    <tr><td><code>allowed_projects</code></td><td>Least privilege surface</td></tr>
+    <tr><td>idempotency key</td><td>Safe agent retries</td></tr>
+  </tbody>
+</table>
+
+<div class="frame exercise" data-title="Exercise · CRM fake">
+  <p>Add a <code>FakeCrm</code> that refuses cross-tenant account ids and enforces
+  <code>rpm</code>. Write two contract tests that must stay green in CI.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 10 -->
+<section class="chapter">
+<h2 id="change-management">Change Management for Regulated Deploys</h2>
+<p class="chapter-lede">CAB habits, model and prompt change tickets and rollback evidence
+turn "we edited the system prompt on Friday" into a controlled, reversible release.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>An FDE hotfixes the system prompt in production to unblock a demo. Eval gates are
+  skipped. Harmful rate climbs over the weekend. Nobody can roll back to a known digest
+  because the prompt lived only in a cloud console text box.</p>
+</div>
+
+<table>
+  <caption>Change classes for AI systems.</caption>
+  <thead><tr><th>Class</th><th>Examples</th><th>Evidence before promote</th></tr></thead>
+  <tbody>
+    <tr><td>Model</td><td>Registry digest, router weights</td><td>Eval suite + canary + ticket</td></tr>
+    <tr><td>Prompt / policy</td><td>System prompt, tool policy</td><td>Diff + golden set delta + ticket</td></tr>
+    <tr><td>Connector scope</td><td>New project allow-list</td><td>Security review + sandbox proof</td></tr>
+    <tr><td>Infra</td><td>Region, KMS, network</td><td>IaC plan + residency assert</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption><code>forge/enterprise/change.py</code> — change ticket and rollback stub.</figcaption>
+<pre><code>from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ChangeTicket:
+    id: str
+    klass: str
+    summary: str
+    before_digest: str
+    after_digest: str
+    eval_passed: bool
+    cab_approved: bool
+
+
+def may_promote(t: ChangeTicket) -&gt; bool:
+    if t.before_digest == t.after_digest:
+        return False
+    return t.eval_passed and t.cab_approved
+
+
+def rollback_plan(t: ChangeTicket) -&gt; dict:
+    return {
+        "restore_digest": t.before_digest,
+        "verify": ["forge.eval smoke", "acl regression", "audit append probe"],
+    }
+
+
+ticket = ChangeTicket(
+    id="CHG-42",
+    klass="prompt",
+    summary="Tighten refund tool policy",
+    before_digest="prompt@aaa",
+    after_digest="prompt@bbb",
+    eval_passed=True,
+    cab_approved=True,
+)
+print("promote", may_promote(ticket))
+print("rollback", rollback_plan(ticket))</code></pre>
+</figure>
+
+<pre class="output">promote True
+rollback {'restore_digest': 'prompt@aaa', 'verify': ['forge.eval smoke', 'acl regression', 'audit append probe']}</pre>
+
+<figure class="diagram">
+<pre class="ascii">Change flow
+  draft digest (git)
+    → offline eval (forge.eval)
+    → ACL + residency probes
+    → CAB / ticket approve
+    → canary / shadow
+    → promote
+    → rollback digest retained</pre>
+<figcaption>Same habit as image digests (Volume 22), applied to prompts and policies.</figcaption>
+</figure>
+
+<p class="facet">What belongs on the ticket</p>
+<ul>
+  <li>Before/after digests; link to diff.</li>
+  <li>Eval summary with Documented metrics (not "felt better").</li>
+  <li>Residency / subprocessor impact (usually none — say so explicitly).</li>
+  <li>Rollback command or runbook step.</li>
+  <li>Communications: who tells champions if behaviour changes.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Emergency change</span>
+  <ul>
+    <li>Break-glass edits still create a ticket within the SLA (e.g. 4 hours) and a
+    retrospective. Undocumented heroics are audit findings.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise" data-title="Exercise · CAB packet">
+  <p>Draft a one-page CAB packet for a model digest bump: risk, eval summary, residency
+  impact, rollback digest, communications plan.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 11 -->
+<section class="chapter">
+<h2 id="security-testing">Security Testing for Enterprise Deploys</h2>
+<p class="chapter-lede">Tenancy fuzzing, ACL regression and red-team probes against
+connectors prove the controls in Chapters 2–9. Hope is not a test plan.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Unit tests check the happy path for tenant A. Nobody ever asks for tenant B's id with
+  A's token, or swaps <code>tid</code> in a tool argument, or fuzzes Unicode tenant strings.
+  The first cross-tenant read is discovered by a customer.</p>
+</div>
+
+<figure class="listing">
+<figcaption><code>forge/enterprise/acl.py</code> — ACL regression suite.</figcaption>
+<pre><code>from __future__ import annotations
+
+from dataclasses import dataclass
+
+from forge.enterprise.tenancy import TenancyError, filter_rows, reset_tenant, set_tenant
+
+
+CORPUS = [
+    {"tid": "acme", "id": "a1", "text": "secret-acme"},
+    {"tid": "beta", "id": "b1", "text": "secret-beta"},
+]
+
+
+@dataclass
+class ProbeResult:
+    name: str
+    ok: bool
+    detail: str
+
+
+def probe_same_tenant() -&gt; ProbeResult:
+    tok = set_tenant("acme")
+    try:
+        rows = filter_rows(CORPUS)
+        ok = rows == [CORPUS[0]]
+        return ProbeResult("same_tenant", ok, str(rows))
+    finally:
+        reset_tenant(tok)
+
+
+def probe_cross_tenant_token() -&gt; ProbeResult:
+    """Authenticated as acme; corpus includes beta — must not see beta."""
+    tok = set_tenant("acme")
+    try:
+        texts = {r["text"] for r in filter_rows(CORPUS)}
+        ok = "secret-beta" not in texts and "secret-acme" in texts
+        return ProbeResult("cross_tenant_denied", ok, str(texts))
+    finally:
+        reset_tenant(tok)
+
+
+def probe_missing_context() -&gt; ProbeResult:
+    try:
+        filter_rows(CORPUS)
+        return ProbeResult("missing_context", False, "should have raised")
+    except TenancyError:
+        return ProbeResult("missing_context", True, "raised")
+
+
+def probe_argument_swap() -&gt; ProbeResult:
+    """Tool args claim tid=beta while context is acme — ignore args."""
+    tok = set_tenant("acme")
+    try:
+        malicious_tid = "beta"
+        rows = filter_rows(CORPUS, tid=None)  # force context
+        leaked = any(r["tid"] == malicious_tid for r in rows)
+        return ProbeResult("ignore_arg_tid", not leaked, f"leaked={leaked}")
+    finally:
+        reset_tenant(tok)
+
+
+def run_suite() -&gt; list[ProbeResult]:
+    return [
+        probe_same_tenant(),
+        probe_cross_tenant_token(),
+        probe_missing_context(),
+        probe_argument_swap(),
+    ]
+
+
+results = run_suite()
+for r in results:
+    print(f"{r.name}: {'PASS' if r.ok else 'FAIL'} ({r.detail})")
+print("all_pass", all(r.ok for r in results))</code></pre>
+</figure>
+
+<pre class="output">same_tenant: PASS ([{'tid': 'acme', 'id': 'a1', 'text': 'secret-acme'}])
+cross_tenant_denied: PASS ({'secret-acme'})
+missing_context: PASS (raised)
+ignore_arg_tid: PASS (leaked=False)
+all_pass True</pre>
+
+<aside class="callout security"><span class="title">Red-team connectors</span>
+  <ul>
+    <li>Attempt production project ids via sandbox credentials.</li>
+    <li>Replay idempotency keys across tenants.</li>
+    <li>Inject prompt text that asks the agent to "use admin token" — harness must still
+    use scoped credentials (Volumes 16–17).</li>
+  </ul>
+</aside>
+
+<p class="facet">Tenancy fuzzing ideas</p>
+<ul>
+  <li>Empty, whitespace, path traversal and very long <code>tid</code> strings.</li>
+  <li>Case folding and homoglyph tenants if your store is case-insensitive.</li>
+  <li>Concurrent requests alternating tenants on one worker — ContextVar must not leak.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Minimal fuzz seeds for tenant ids (extend in CI).</figcaption>
+<pre><code>FUZZ_TIDS = [
+    "",
+    " ",
+    "acme/../beta",
+    "acme" + "x" * 5000,
+    "ACME",
+]
+
+
+def accept_tid(s: str) -&gt; bool:
+    return bool(s) and s == s.strip() and "/" not in s and len(s) &lt;= 128
+
+
+def fuzz_set_tenant(samples=FUZZ_TIDS) -&gt; list[str]:
+    return [repr(s) for s in samples if not accept_tid(s)]
+
+
+print("rejected_count", len(fuzz_set_tenant()))
+print("ACME_accepted", accept_tid("ACME"))</code></pre>
+</figure>
+
+<pre class="output">rejected_count 4
+ACME_accepted True</pre>
+
+<aside class="callout warning"><span class="title">CI gate</span>
+  <ul>
+    <li>ACL regression is a release gate, not a quarterly pen-test slide. Fail the pipeline
+    on any probe miss.</li>
+    <li>Pair with Volume 17 red-team metrics: attack success versus false positives, plus
+    enterprise-specific cross-tenant success rate (target: zero).</li>
+  </ul>
+</aside>
+
+<div class="frame exercise" data-title="Exercise · Concurrent tenants">
+  <p>Using threads or asyncio, alternate <code>set_tenant</code> for acme/beta and assert
+  no cross-contamination in <code>filter_rows</code> results.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 12 -->
+<section class="chapter">
+<h2 id="reference-deploy-pack">Reference Deploy Pack</h2>
+<p class="chapter-lede">Compose and Kubernetes manifests plus runbooks for a private Forge
+tenant — documented so an FDE can discuss them, not applied blindly against a customer
+cluster.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Security asks for "the private deployment package". Engineering points at a README and
+  a laptop Docker Compose that still calls a public model. There is no residency pin, no
+  SSO sidecar story, no audit sink. The pack does not match the ADRs.</p>
+</div>
+
+<aside class="callout impl"><span class="title">Documented, not applied</span>
+  <ul>
+    <li>Manifests below are teaching sketches. Validate with schema tools and staging.
+    Do not apply to production from the book text.</li>
+    <li>Secrets are placeholders. Wire vault/CSI in real environments (Volume 22).</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption><code>deploy/enterprise/docker-compose.private-tenant.yml</code> (sketch).</figcaption>
+<pre><code># NOT APPLIED — private tenant pack sketch
+services:
+  edge:
+    image: forge-edge:DIGEST
+    environment:
+      FORGE_OIDC_ISSUER: https://oidc.idp.example.internal
+      FORGE_RESIDENCY_ALLOW: eu-west-1
+      FORGE_MODEL_URL: https://model.private.example/v1
+      FORGE_AUDIT_SINK: http://audit:8080/ingest
+    networks: [private]
+  rag:
+    image: forge-rag:DIGEST
+    environment:
+      FORGE_VECTOR_REGION: eu-west-1
+      FORGE_REQUIRE_TENANT: "true"
+    networks: [private]
+  audit:
+    image: forge-audit:DIGEST
+    networks: [private]
+networks:
+  private:
+    internal: true</code></pre>
+</figure>
+
+<figure class="listing">
+<figcaption>Runbook checklist for the private tenant pack.</figcaption>
+<pre><code>PRIVATE_TENANT_RUNBOOK = [
+    "1. Confirm region pin matches engagement brief",
+    "2. Register OIDC app; map groups to Forge roles",
+    "3. Load CMEK/BYOK material; deny provider-default keys if required",
+    "4. Wire private model endpoint; verify egress allow-list",
+    "5. Run ACL regression + connector sandbox probes",
+    "6. Enable audit chain verify job",
+    "7. CAB-approve first model/prompt digests",
+    "8. Hand off Volume 27 packet with evidence paths",
+]
+
+for line in PRIVATE_TENANT_RUNBOOK:
+    print(line)</code></pre>
+</figure>
+
+<pre class="output">1. Confirm region pin matches engagement brief
+2. Register OIDC app; map groups to Forge roles
+3. Load CMEK/BYOK material; deny provider-default keys if required
+4. Wire private model endpoint; verify egress allow-list
+5. Run ACL regression + connector sandbox probes
+6. Enable audit chain verify job
+7. CAB-approve first model/prompt digests
+8. Hand off Volume 27 packet with evidence paths</pre>
+
+<figure class="listing">
+<figcaption><code>deploy/enterprise/k8s/forge-private-tenant.yaml</code> (sketch, not applied).</figcaption>
+<pre><code># NOT APPLIED — validate with kubeconform / staging before any apply
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forge-edge
+  labels: {app: forge-edge, tenancy: private}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: forge-edge}}
+  template:
+    metadata: {labels: {app: forge-edge}}
+    spec:
+      serviceAccountName: forge-edge
+      containers:
+        - name: edge
+          image: registry.example.internal/forge-edge:DIGEST
+          env:
+            - {name: FORGE_REQUIRE_TENANT, value: "true"}
+            - {name: FORGE_RESIDENCY_ALLOW, value: eu-west-1}
+            - {name: FORGE_MODEL_URL, value: https://model.private.example/v1}
+          # secrets via CSI / vault agent — never plaintext in git</code></pre>
+</figure>
+
+<aside class="callout core"><span class="title">Pack completeness</span>
+  <ul>
+    <li>Manifests without runbooks and tests are theatre.</li>
+    <li>Runbooks without ACL suite output are hopes.</li>
+    <li>Attach Volume 27 handoff fields: on-call, change control, cost ledger hooks
+    (Volume 22).</li>
+  </ul>
+</aside>
+
+<p class="facet">What success looks like</p>
+<ul>
+  <li>A security reviewer can open the evidence pack and find deny tests without a meeting.</li>
+  <li>Cross-tenant probes are green in CI on every prompt/model digest change.</li>
+  <li>Private networking and residency pins match the engagement brief region.</li>
+  <li>Nobody claims certification based solely on this chapter.</li>
+</ul>
+
+<div class="frame exercise" data-title="Practical project · Private tenant pack">
+  <p>Configure a Forge RAG+agent stack (fakes acceptable at Tier L) with:</p>
+  <ol>
+    <li>SSO claims validated by <code>forge.enterprise.oidc</code>.</li>
+    <li>Tenant ACLs via tenancy middleware.</li>
+    <li>Residency pins denying cross-region planes.</li>
+    <li>Append-only audit trail for prompt and tool events.</li>
+    <li>Prove cross-tenant denial with <code>forge.enterprise.acl</code> suite.</li>
+  </ol>
+  <p>Deliverable: a short evidence pack (test output + ADR stubs + subprocessor register)
+  an FDE could attach to a Volume 27 handoff.</p>
+</div>
+</section>
+
+<!-- ================================================================ REVIEW -->
+<section class="review">
+<h1>Review and Next Steps</h1>
+
+<p>Volume 28 closes the enterprise-integration gap left by guardrails (17), ops (22) and
+forward-deployed delivery (27): identity, tenancy, residency, private networking, secrets
+and audit, compliance <em>artefacts</em>, procurement reality, connectors, change control
+and security tests — without pretending engineering checklists are legal advice.</p>
+
+<h2>What You Learned</h2>
+<ul>
+  <li>Enterprise constraints are requirements with evidence (Chapter 1).</li>
+  <li>OIDC claims, SCIM and least-privilege tools (Chapter 2).</li>
+  <li>Tenancy models and fail-closed middleware (Chapter 3).</li>
+  <li>Residency pins, retention, BYOK/CMEK patterns (Chapter 4).</li>
+  <li>Private networking and egress allow-lists (Chapter 5).</li>
+  <li>Vault posture and immutable audit schemas (Chapter 6).</li>
+  <li>Compliance as engineering artefacts; DPIA-style checklists (Chapter 7).</li>
+  <li>DPAs, subprocessors and hosted vs open-weight trade-offs (Chapter 8).</li>
+  <li>Connector contracts, sandboxes and rate limits (Chapter 9).</li>
+  <li>CAB, prompt/model tickets and rollback digests (Chapter 10).</li>
+  <li>ACL regression and connector red-team probes (Chapter 11).</li>
+  <li>Private tenant deploy pack — documented, not applied (Chapter 12).</li>
+</ul>
+
+<h2>What You Built</h2>
+<ul>
+  <li><code>forge.enterprise.oidc</code> — toy claim validator and tool role gate.</li>
+  <li><code>forge.enterprise.tenancy</code> — ContextVar middleware and row filter.</li>
+  <li><code>forge.enterprise.residency</code> — region assert and retention helpers.</li>
+  <li><code>forge.enterprise.audit</code> — hash-chained audit events.</li>
+  <li><code>forge.enterprise.acl</code> — cross-tenant denial regression suite.</li>
+  <li><code>forge.enterprise.connectors</code> — sandbox ITSM fake with idempotency.</li>
+  <li><code>forge.enterprise.change</code> — promote/rollback ticket helpers.</li>
+</ul>
+
+<h2>Important Code</h2>
+<table>
+  <caption>Listings that define the enterprise control plane.</caption>
+  <thead><tr><th>Listing</th><th>Module</th><th>Invariant</th></tr></thead>
+  <tbody>
+    <tr><td>validate_claims</td><td><code>forge.enterprise.oidc</code></td><td>Fail closed on missing tid/roles</td></tr>
+    <tr><td>TenancyMiddleware</td><td><code>forge.enterprise.tenancy</code></td><td>No ambient tenant; reset after request</td></tr>
+    <tr><td>assert_region</td><td><code>forge.enterprise.residency</code></td><td>Cross-region write denied</td></tr>
+    <tr><td>AuditLog.verify_chain</td><td><code>forge.enterprise.audit</code></td><td>Tamper breaks the chain</td></tr>
+    <tr><td>run_suite</td><td><code>forge.enterprise.acl</code></td><td>Cross-tenant texts never returned</td></tr>
+    <tr><td>FakeItsm.create_ticket</td><td><code>forge.enterprise.connectors</code></td><td>Sandbox cannot write prod projects</td></tr>
+    <tr><td>may_promote</td><td><code>forge.enterprise.change</code></td><td>Eval + CAB required</td></tr>
+  </tbody>
+</table>
+
+<h2>Important Architecture</h2>
+<figure class="diagram">
+<pre class="ascii">IdP (OIDC/SCIM)
+    ↓ claims
+Edge · validate_claims · set_tenant
+    ↓
+guard (Vol 17) → router → rag/tools (tenant filter in data plane)
+    ↓
+private model endpoint · vault creds · audit append
+    ↓
+ACL regression + change tickets + evidence pack</pre>
+<figcaption>Enterprise controls wrap the Volume 24 platform — compose, do not fork.</figcaption>
+</figure>
+
+<figure class="diagram">
+<pre class="mermaid">flowchart TB
+  IdP[IdP OIDC] --&gt; Edge[Edge claims + tenancy]
+  Edge --&gt; Guard[forge.guard]
+  Guard --&gt; Plane[RAG / tools / model]
+  Plane --&gt; Audit[Audit chain]
+  Plane --&gt; Res[Residency policy]
+  Edge --&gt; ACL[ACL regression]
+  Change[Change tickets] --&gt; Plane</pre>
+<figcaption>Control flow for a private enterprise tenant.</figcaption>
+</figure>
+
+<h2>Failure Modes</h2>
+<ul class="failure-modes">
+  <li>SSO for humans, god-mode service account for agents.</li>
+  <li>Tenant id only in the prompt.</li>
+  <li>Residency claimed while logs export globally.</li>
+  <li>Public model endpoints behind a "private" app subnet.</li>
+  <li>Mutable prompt logs without redaction policy.</li>
+  <li>Certification claims without evidence artefacts.</li>
+  <li>Undocumented subprocessors and training-use clauses.</li>
+  <li>Production connectors without sandbox or rate limits.</li>
+  <li>Hotfix prompts without digests or rollback.</li>
+  <li>Happy-path tests only — no cross-tenant probes.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<ul>
+  <li>OIDC validator rejects unknown roles and missing <code>tid</code>.</li>
+  <li>Tenancy middleware raises without context; filters never leak.</li>
+  <li>Residency policy denies cross-region planes for pinned tenants.</li>
+  <li>Audit chain verifies; tampering fails verification.</li>
+  <li>ACL suite all PASS including argument-swap probe.</li>
+  <li>Connector sandbox refuses production projects; idempotency holds.</li>
+  <li>Change promotion requires eval + CAB; rollback cites prior digest.</li>
+</ul>
+
+<h2>Practical Project</h2>
+<div class="frame exercise" data-title="Private tenant pack">
+  <p>SSO claims, tenant ACLs, residency pins, audit trail and cross-tenant denial tests on
+  a Forge RAG+agent slice — Chapter 12 exercise as a single portfolio evidence pack.</p>
+</div>
+
+<h2>Exercises</h2>
+<ol>
+  <li>Map three enterprise constraints to ADRs with evidence paths.</li>
+  <li>Extend OIDC validation to require <code>scp</code> for refund tools.</li>
+  <li>Add a siloed-index mode that refuses shared corpus access across tids.</li>
+  <li>Implement export + delete stubs that remove vectors and audit detail payloads.</li>
+  <li>Expand the egress allow-list with a break-glass procedure document.</li>
+  <li>Store only prompt hashes in audit by default; feature-flag full text.</li>
+  <li>Complete a DPIA engineering checklist for a HR chatbot (label counsel items).</li>
+  <li>Build a subprocessor register for a hybrid router with two model backends.</li>
+  <li>Contract-test a CRM fake for cross-tenant denial.</li>
+  <li>Write a CAB packet for a prompt digest change including residual risk.</li>
+  <li>Fuzz tenant ids and add cases to the ACL suite.</li>
+  <li>Turn the Compose sketch into a kubeconform-valid Deployment (still not applied).</li>
+</ol>
+
+<h2>Research Papers and Sources</h2>
+<table>
+  <caption>Sources that discipline enterprise AI integration — cite carefully; not legal advice.</caption>
+  <thead><tr><th>Source</th><th>Why it is here</th></tr></thead>
+  <tbody>
+    <tr><td>NIST AI 100-1, 2023. AI Risk Management Framework 1.0</td><td>Govern/Map/Measure/Manage vocabulary (Ch 7).</td></tr>
+    <tr><td>OWASP Top 10 for LLM Applications</td><td>Application risks beside tenancy/network (Ch 7, 11; Vol 17).</td></tr>
+    <tr><td>OpenID Connect Core 1.0</td><td>Documented claim and ID Token model (Ch 2).</td></tr>
+    <tr><td>RFC 7644 SCIM 2.0</td><td>Provisioning/deprovision patterns (Ch 2).</td></tr>
+    <tr><td>Vendor Private Link / Private Endpoint docs</td><td>Documented private connectivity options (Ch 5).</td></tr>
+    <tr><td>Breck et al., 2017. The ML Test Score</td><td>Production-readiness mindset for change gates (Ch 10–11).</td></tr>
+    <tr><td>Amershi et al., 2019. Guidelines for Human-AI Interaction</td><td>Operational and UX discipline in enterprise rollouts (Ch 10).</td></tr>
+  </tbody>
+</table>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">FRAMEWORK</span>
+    <span class="paper-title">AI Risk Management Framework 1.0</span>
+    <span class="paper-meta">NIST AI 100-1 · 2023</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Organisations lacked a shared lifecycle language for AI risk.</dd>
+    <dt>Previous limitation</dt><dd>Ad hoc checklists and purely IT-security framings.</dd>
+    <dt>Approach</dt><dd>Govern, Map, Measure, Manage functions with suggested actions.</dd>
+    <dt>Contribution</dt><dd>Documented vocabulary reused in Chapter 7 evidence packs.</dd>
+    <dt>Practical impact</dt><dd>Pair each function with an engineering artefact (ADR, eval, audit).</dd>
+    <dt>Limitations</dt><dd>Not a certification; not legal advice; not LLM-specific controls.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">STANDARD</span>
+    <span class="paper-title">OpenID Connect Core 1.0</span>
+    <span class="paper-meta">OpenID Foundation</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Applications need interoperable identity on top of OAuth 2.0.</dd>
+    <dt>Previous limitation</dt><dd>Proprietary SSO silos and inconsistent claim semantics.</dd>
+    <dt>Approach</dt><dd>ID Tokens, standard claims, discovery and userinfo patterns.</dd>
+    <dt>Contribution</dt><dd>Baseline for Chapter 2's claim validator vocabulary.</dd>
+    <dt>Practical impact</dt><dd>Map IdP groups into Forge roles; never invent ambient admins.</dd>
+    <dt>Limitations</dt><dd>Toy validators in this volume omit real JWT crypto — production must verify signatures.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">The ML Test Score</span>
+    <span class="paper-meta">Breck et al., 2017</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Teams lack a shared bar for ML production readiness.</dd>
+    <dt>Previous limitation</dt><dd>Accuracy-only gates.</dd>
+    <dt>Approach</dt><dd>Rubric across data, model, infra and monitoring tests.</dd>
+    <dt>Contribution</dt><dd>Readiness as scored evidence — extended here with ACL and residency probes.</dd>
+    <dt>Practical impact</dt><dd>Chapters 10–11 change gates and regression suites.</dd>
+    <dt>Limitations</dt><dd>Pre-LLM; add injection, tool abuse and tenancy explicitly.</dd>
+  </dl>
+</section>
+
+<h2>Interview Questions</h2>
+<ol class="questions">
+  <li>Which enterprise constraints belong in ADRs before a PoC demo?</li>
+  <li>How do you prevent an agent service account from becoming a confused deputy?</li>
+  <li>Compare row-level shared tenancy with a siloed private pack — when is each justified?</li>
+  <li>What planes must a residency matrix cover beyond the primary database?</li>
+  <li>Why is TLS to a public model API insufficient for many private networking questionnaires?</li>
+  <li>Design an audit event for a denied tool call that is useful yet redacted.</li>
+  <li>How do you answer "are you GDPR compliant?" as an engineer without giving legal advice?</li>
+  <li>What goes in a subprocessor register for a hybrid model router?</li>
+  <li>Write two connector contract tests that must block production writes from sandbox creds.</li>
+  <li>What evidence does a CAB need before promoting a system-prompt digest?</li>
+  <li>List four ACL probes beyond the happy path.</li>
+  <li>What does "documented, not applied" mean for a reference K8s pack?</li>
+</ol>
+
+<h2>Glossary</h2>
+<table>
+  <caption>Terms used throughout Volume 28.</caption>
+  <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+  <tbody>
+    <tr><td>OIDC</td><td>OpenID Connect — identity layer on OAuth 2.0</td></tr>
+    <tr><td>SCIM</td><td>System for Cross-domain Identity Management (provisioning)</td></tr>
+    <tr><td>Tenancy isolation</td><td>Hard boundary preventing cross-tenant data/effects</td></tr>
+    <tr><td>Residency</td><td>Policy that data planes stay in approved regions</td></tr>
+    <tr><td>Private endpoint</td><td>Provider API consumed without public internet path</td></tr>
+    <tr><td>BYOK / CMEK</td><td>Customer-managed encryption keys</td></tr>
+    <tr><td>Control mapping</td><td>Linking framework language to engineering artefacts</td></tr>
+    <tr><td>Subprocessor</td><td>Downstream processor touching customer data</td></tr>
+    <tr><td>Connector contract</td><td>Auth, scope, rate limit, sandbox and test surface for an integration</td></tr>
+    <tr><td>CAB</td><td>Change advisory board — gated promotion habit</td></tr>
+  </tbody>
+</table>
+
+<h2>Continuous Project Checkpoint</h2>
+<aside class="callout core"><span class="title">Volume Contract</span>
+  <ul>
+    <li>Python listings seed <code>forge.enterprise</code> and were executed at Tier L with
+    in-process fakes — no live IdP, vault or cloud apply.</li>
+    <li>Compose/K8s sketches are <strong>documented, not applied</strong>.</li>
+    <li>Compliance mappings are engineering artefacts with Documented/Inferred labels —
+    not legal advice and not certification claims.</li>
+  </ul>
+</aside>
+<ul>
+  <li>Keep ACL regression and claim validation in <code>tests/</code> on every digest change.</li>
+  <li>Maintain a subprocessor register beside the residency matrix.</li>
+  <li>Volume 29 will assume session events can carry the same tenant and audit fields.</li>
+</ul>
+
+<p class="facet">What success looks like</p>
+<ul>
+  <li>Security review opens evidence paths without a guided tour.</li>
+  <li>Cross-tenant probes stay at zero in CI.</li>
+  <li>Procurement receives a subprocessor and training-use matrix that matches production traffic.</li>
+  <li>Hotfix prompts without tickets are culturally unacceptable.</li>
+</ul>
+
+<h2>Next Volume</h2>
+<p>Volume 29 · Realtime and Voice Agents leaves turn-based HTTP/SSE assumptions behind:
+full-duplex sessions, barge-in, telephony patterns and sub-second latency budgets. Enterprise
+controls from this volume still apply — identity, tenancy, residency and audit must wrap
+voice sessions too — but the media graph and turn-taking machinery are a new stack
+(<code>forge.realtime</code>).</p>
+<p class="facet">Prerequisites from this volume</p>
+<ul>
+  <li>Fail-closed tenant context and ACL regression as a habit (Chapters 3, 11).</li>
+  <li>Audit events for tool decisions reusable as call-event schemas (Chapter 6).</li>
+  <li>Private networking and egress discipline for realtime media gateways (Chapter 5).</li>
+  <li>Change tickets for prompt/policy digests when voice prompts evolve (Chapter 10).</li>
+</ul>
+</section>
+
+<!-- end of Volume 28 · Enterprise Integration and Compliance -->
+<p class="no-toc" hidden>Volume 28 complete.</p>
+
+</body>
+</html>

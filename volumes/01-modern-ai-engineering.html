@@ -1,0 +1,1938 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 1 · Modern AI Engineering</title>
+<meta name="volume" content="Volume 1 · Modern AI Engineering">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 1</p>
+  <h1 class="no-toc">Modern AI Engineering</h1>
+  <p class="tp-subtitle">Landscape, Lifecycles and Engineering Foundations</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Build a precise mental model of the modern AI stack and its vocabulary.</li>
+  <li>Learn the arithmetic that governs every later decision: parameters, FLOPs, memory, bandwidth and money.</li>
+  <li>Understand the model lifecycle and the product lifecycle as two different loops.</li>
+  <li>See the reference architecture of a production AI system at HLD and LLD level.</li>
+  <li>Set up the Forge repository and engineering habits (reproducibility, testing stochastic code, AI-assisted development) used for the rest of the book.</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>You have trained neural networks, deployed services and debugged production systems.</li>
+  <li>You do <strong>not</strong> need prior LLM experience. Everything LLM-specific is built from first principles in Volumes 2–4; this volume gives the map.</li>
+</ul>
+
+<p class="facet">How to read the code</p>
+<ul>
+  <li>Every listing was executed on an Apple M2 laptop (Python 3.12, PyTorch 2.10, NumPy 2.3). Printed output is real.</li>
+  <li>Listings are pedagogical and self-contained; the continuous package they seed is <code>forge</code> under <code>src/forge/</code>.</li>
+  <li>The only external download is the 135M-parameter open-weight model <code>HuggingFaceTB/SmolLM2-135M</code> (~270 MB) in Chapter 3.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1  Landscape          where modern AI came from, what changed
+Chapter 2  Terminology        precise words for every layer of the stack
+Chapter 3  How an LLM works   tokens -> logits -> sampling, on a real model
+Chapter 4  Arithmetic         FLOPs, memory, bandwidth, cost (forge.compute)
+Chapter 5  Model lifecycle    data -> training -> eval -> release -> monitor
+Chapter 6  Product lifecycle  problem -> baseline -> eval set -> pilot -> prod
+Chapter 7  System anatomy     HLD, LLD, request flow, failure classification
+Chapter 8  Environment        Forge repo, forge.core, testing, AI-assisted development</pre>
+<figcaption>Map of Volume 1.</figcaption>
+</figure>
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="landscape">The Modern AI Landscape</h2>
+<p class="chapter-lede">Modern AI engineering is not "machine learning with bigger models". The unit
+of work changed: instead of training one model per task, engineers adapt one general model and
+build systems around it. This chapter explains how that happened and what it changes for you.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Until roughly 2018, every language task needed its own labelled dataset, its own model and its
+  own training pipeline. A company with 40 text problems ran 40 ML projects. Each was expensive to
+  label, brittle outside its training distribution, and impossible to extend without retraining.</p>
+</div>
+
+<p class="facet">What changed</p>
+<ul>
+  <li><strong>Self-supervised pretraining</strong> on raw text removed the labelling bottleneck: the label is simply the next token.</li>
+  <li><strong>The Transformer</strong> made that pretraining parallelisable on GPUs at enormous scale.</li>
+  <li><strong>Scale</strong> (parameters, data, compute) produced models that perform many tasks from instructions alone.</li>
+  <li><strong>Post-training</strong> (instruction tuning, preference optimisation) turned raw text predictors into usable assistants.</li>
+  <li><strong>Tool use and agents</strong> let models act: call APIs, run code, retrieve documents.</li>
+</ul>
+
+<h3>A Short Technical History</h3>
+
+<p>The path to foundation models is a sequence of engineering shifts, not a single invention:</p>
+<ol>
+  <li><strong>Statistical NLP</strong> (pre-2013): n-grams, HMMs, feature-engineered classifiers. Strong on narrow tasks; brittle outside their feature set.</li>
+  <li><strong>Deep learning</strong>: end-to-end neural models replace hand-crafted features.</li>
+  <li><strong>Pretraining</strong>: learn representations (then full models) from raw text once; adapt per task.</li>
+  <li><strong>Foundation models → assistants → agents</strong>: one general model, then instruction-following, then tool-using loops.</li>
+</ol>
+
+<table>
+  <caption>Milestones that changed engineering practice (not an exhaustive history).</caption>
+  <thead><tr><th>Year</th><th>Milestone</th><th>Why it mattered to engineers</th></tr></thead>
+  <tbody>
+    <tr><td>pre-2013</td><td>Statistical NLP (n-grams, HMMs, CRFs)</td><td>Task-specific pipelines; every new domain needs new features and labels.</td></tr>
+    <tr><td>2013</td><td>word2vec</td><td>Dense learned representations replace sparse features.</td></tr>
+    <tr><td>2014</td><td>Seq2seq; Bahdanau attention</td><td>Neural models learn input–output mappings end to end; attention removes the fixed-size bottleneck.</td></tr>
+    <tr><td>2017</td><td>Transformer</td><td>Attention-only architecture; fully parallel training.</td></tr>
+    <tr><td>2018</td><td>GPT, BERT</td><td>Pretrain once, fine-tune per task. Transfer learning becomes the default in NLP.</td></tr>
+    <tr><td>2020</td><td>GPT-3; scaling laws</td><td>Few-shot prompting: tasks specified in text, no fine-tuning. Loss improves predictably with scale.</td></tr>
+    <tr><td>2021</td><td>CLIP; Codex</td><td>Shared image–text embeddings; code generation becomes practical.</td></tr>
+    <tr><td>2022</td><td>InstructGPT; Chinchilla; ChatGPT</td><td>RLHF makes models follow instructions; compute-optimal training; mass adoption.</td></tr>
+    <tr><td>2023</td><td>GPT-4; Llama and Llama 2; Mixtral</td><td>Strong multimodal frontier models; capable open-weight models; mixture of experts in the open.</td></tr>
+    <tr><td>2024</td><td>Tool use and agents at scale; reasoning models (o1); MCP</td><td>Models trained to "think" before answering; standard protocols for connecting tools.</td></tr>
+    <tr><td>2025</td><td>DeepSeek-R1; coding agents</td><td>Open reasoning recipes via RL with verifiable rewards; agents that edit whole repositories.</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>The paradigm shifted from <em>one model per task</em> to <em>one foundation model, many systems</em>.</li>
+    <li>Most engineering effort moved from model architecture to data, evaluation, inference cost and the system around the model.</li>
+    <li>Model capability keeps moving; the engineering disciplines in this book (evaluation, serving, retrieval, guardrails, routing) stay.</li>
+    <li><strong>The Bitter Lesson</strong> <cite>(Sutton, 2019)</cite>: methods that leverage computation and general learning consistently beat hand-crafted specialisation, given enough scale. Modern AI engineering is that lesson applied to systems around foundation models.</li>
+  </ul>
+</aside>
+
+<h3>What Changed in Engineering</h3>
+
+<table>
+  <caption>Classical ML engineering versus modern AI engineering.</caption>
+  <thead><tr><th>Dimension</th><th>Classical ML (pre-2020)</th><th>Modern AI engineering</th></tr></thead>
+  <tbody>
+    <tr><td>Starting point</td><td>Collect labels, train a model</td><td>Pick a pretrained model, prompt or adapt it</td></tr>
+    <tr><td>Task specification</td><td>Dataset and loss function</td><td>Instructions, examples, schemas, tools</td></tr>
+    <tr><td>Output</td><td>Class, score, number</td><td>Open-ended text, code, actions, media</td></tr>
+    <tr><td>Evaluation</td><td>Accuracy on a held-out split</td><td>Rubrics, judges, human review, task success, safety</td></tr>
+    <tr><td>Inference cost</td><td>Usually negligible</td><td>Often the dominant cost; scales with tokens</td></tr>
+    <tr><td>Failure mode</td><td>Wrong label</td><td>Fluent but wrong, unsafe or unauthorised output</td></tr>
+    <tr><td>Iteration loop</td><td>Retrain (days)</td><td>Change prompt, retrieval or routing (minutes); retrain rarely</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>Fast iteration without retraining is also the main risk: a one-line prompt change can silently regress quality. Evaluation must be as automated as unit testing (Volume 10).</li>
+  </ul>
+</aside>
+
+<h3>The Capability Frontier and How It Is Measured</h3>
+
+<ul>
+  <li><strong>Benchmarks</strong> measure narrow skills: knowledge (MMLU), graduate science (GPQA), code (HumanEval, SWE-bench), maths, instruction following.</li>
+  <li><strong>Saturation</strong>: a benchmark stops discriminating once top models reach its noise ceiling. The field then creates harder ones.</li>
+  <li><strong>Contamination</strong>: benchmark questions leak into web-scale training data, inflating scores (Volume 5).</li>
+  <li><strong>Human preference arenas</strong> rank models by pairwise votes; they measure what users prefer, which is not the same as correctness.</li>
+  <li><strong>"Emergent" abilities</strong>: some tasks appear to jump suddenly with scale. Part of this effect comes from discontinuous metrics such as exact match; smooth metrics often show gradual improvement <cite>(Wei et al., 2022; Schaeffer et al., 2023)</cite>.</li>
+</ul>
+
+<aside class="callout security"><span class="title">Engineering Rule</span>
+  <ul>
+    <li>Public benchmark scores tell you which models to <em>try</em>. Only your own evaluation set tells you which model to <em>ship</em>.</li>
+  </ul>
+</aside>
+
+<h3>Open-Weight Versus Closed Models</h3>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">Open-weight (Llama, Qwen, Mistral, DeepSeek, Gemma …)</p>
+    <ul>
+      <li>Run anywhere: laptop, on-premises, any cloud.</li>
+      <li>Full control: fine-tuning, quantisation, inspection of logits.</li>
+      <li>Data never leaves your infrastructure.</li>
+      <li>Predictable cost at high volume.</li>
+    </ul></div>
+  <div class="cons"><p class="facet">Closed / hosted API (GPT, Claude, Gemini …)</p>
+    <ul>
+      <li>Usually the strongest capability at any given time.</li>
+      <li>Zero infrastructure; pay per token.</li>
+      <li>Provider handles safety layers, scaling and upgrades.</li>
+      <li>Less control: model versions change or are retired; limited customisation.</li>
+    </ul></div>
+</div>
+
+<aside class="callout impl"><span class="title">Practical Default</span>
+  <ul>
+    <li>Prototype with the strongest hosted model to find out whether the task is solvable at all.</li>
+    <li>Build the evaluation set during the prototype.</li>
+    <li>Then use the evaluation set to test whether a cheaper or self-hosted model is good enough (Volume 18, routing).</li>
+  </ul>
+</aside>
+
+<h3>The Model Supply Chain</h3>
+
+<figure class="diagram">
+<pre class="ascii">Raw data (web, code, books, licensed, synthetic)
+    |
+    v
+Pretraining lab  ---- produces --->  Base model (next-token predictor)
+    |
+    v
+Post-training    ---- produces --->  Instruct / chat / reasoning model
+    |
+    +----------------------+------------------------+
+    |                      |                        |
+    v                      v                        v
+Hosted API           Open-weight release       Fine-tuned derivative
+    |                      |                        |
+    +----------------------+------------------------+
+                           |
+                           v
+            Your system: prompts, retrieval, tools, guardrails,
+                 routing, evaluation, serving, monitoring</pre>
+<figcaption>Where your work sits relative to the model producers.</figcaption>
+</figure>
+
+<ul>
+  <li>Most engineers work in the bottom box. This book also teaches the top boxes, because you cannot debug or optimise a system you do not understand.</li>
+  <li>Each arrow is a trust boundary: licences, data provenance, safety behaviour and known weaknesses propagate downwards.</li>
+</ul>
+
+<div class="frame exercise"><p>List three products you use daily that contain an LLM. For each, decide
+whether it is more likely built on a hosted API or a self-hosted model, and name the one piece of
+evidence that would confirm it. Keep what you know apart from what you are guessing.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="terminology">Precise Terminology</h2>
+<p class="chapter-lede">Teams waste weeks because "agent", "model" and "platform" mean different
+things to different people. This book uses each term exactly as defined here.</p>
+
+<h3>Why Precision Matters</h3>
+
+<div class="frame problem">
+  <p>A product manager asks for "an AI agent". One engineer builds a fixed three-step pipeline,
+  another builds an autonomous loop with tool access. The first is cheap and predictable; the second
+  needs permissions, budgets, sandboxing and trajectory evaluation. Same words, different system,
+  different risk.</p>
+</div>
+
+<h3>The Model Hierarchy</h3>
+
+<figure class="diagram">
+<pre class="ascii">+-------------------------------------------------------------+
+| AI  (systems that perform tasks requiring intelligence)     |
+|  +-------------------------------------------------------+  |
+|  | Machine Learning  (behaviour learned from data)       |  |
+|  |  +-------------------------------------------------+  |  |
+|  |  | Deep Learning  (multi-layer neural networks)    |  |  |
+|  |  |  +-------------------------------------------+  |  |  |
+|  |  |  | Generative AI  (produces new content)     |  |  |  |
+|  |  |  |  +-------------------------------------+  |  |  |  |
+|  |  |  |  | Foundation Models                   |  |  |  |  |
+|  |  |  |  |   LLMs / SLMs, multimodal models    |  |  |  |  |
+|  |  |  |  +-------------------------------------+  |  |  |  |
+|  |  |  +-------------------------------------------+  |  |  |
+|  |  +-------------------------------------------------+  |  |
+|  +-------------------------------------------------------+  |
++-------------------------------------------------------------+</pre>
+<figcaption>Nested model categories. Each inner set is a subset of the outer one.</figcaption>
+</figure>
+
+<table>
+  <caption>Model-level terms.</caption>
+  <thead><tr><th>Term</th><th>Definition used in this book</th><th>Counter-example (what it is not)</th></tr></thead>
+  <tbody>
+    <tr><td><strong>AI</strong></td><td>The field of building systems that perform tasks requiring intelligence.</td><td>Not a synonym for "LLM"; a chess engine or route planner is AI.</td></tr>
+    <tr><td><strong>Machine Learning</strong></td><td>Systems whose behaviour is learned from data rather than programmed.</td><td>A hand-written rules engine is AI but not ML.</td></tr>
+    <tr><td><strong>Deep Learning</strong></td><td>ML with multi-layer neural networks trained end to end.</td><td>Gradient-boosted trees are ML but not DL.</td></tr>
+    <tr><td><strong>Generative AI</strong></td><td>Models that produce new content: text, images, audio, code.</td><td>A fraud classifier is DL but not generative.</td></tr>
+    <tr><td><strong>Foundation Model</strong></td><td>A large model pretrained on broad data and adaptable to many downstream tasks.</td><td>A model trained only for sentiment analysis is not a foundation model.</td></tr>
+    <tr><td><strong>LLM</strong></td><td>A foundation model over text tokens, usually a decoder-only Transformer.</td><td>An embedding model is a language model but usually not called an LLM.</td></tr>
+    <tr><td><strong>SLM</strong></td><td>A small language model (roughly ≤ 10B parameters) optimised for cost, latency or on-device use.</td><td>"Small" is relative and moves over time; state the parameter count.</td></tr>
+    <tr><td><strong>Multimodal Model</strong></td><td>A model that consumes and/or produces more than one modality.</td><td>An LLM with a separate OCR step in front is a multimodal <em>system</em>, not a multimodal model.</td></tr>
+  </tbody>
+</table>
+
+<h3>The System Hierarchy</h3>
+
+<table>
+  <caption>System-level terms.</caption>
+  <thead><tr><th>Term</th><th>Definition used in this book</th><th>Who decides the control flow?</th></tr></thead>
+  <tbody>
+    <tr><td><strong>AI Application</strong></td><td>A product that uses models to deliver user value.</td><td>—</td></tr>
+    <tr><td><strong>AI Workflow</strong></td><td>A predefined sequence of model and tool calls whose control flow is written in code.</td><td>Your code</td></tr>
+    <tr><td><strong>AI Agent</strong></td><td>A system in which a model chooses actions in a loop to pursue a goal.</td><td>The model</td></tr>
+    <tr><td><strong>Agentic System</strong></td><td>Any system containing one or more agents, possibly mixed with workflows.</td><td>Mixed</td></tr>
+    <tr><td><strong>Agent Framework</strong></td><td>A library of abstractions for building agents (for example LangGraph).</td><td>—</td></tr>
+    <tr><td><strong>Agent Harness</strong></td><td>The runtime that executes agents safely: lifecycle, context, tools, permissions, budgets, sandbox, tracing.</td><td>—</td></tr>
+    <tr><td><strong>Orchestrator</strong></td><td>The component that coordinates steps, agents or services within a flow.</td><td>—</td></tr>
+    <tr><td><strong>Tool Runtime</strong></td><td>The subsystem that registers, validates, executes and returns the results of tool calls.</td><td>—</td></tr>
+    <tr><td><strong>Guardrail</strong></td><td>A control that validates or constrains inputs, outputs or actions against policy.</td><td>—</td></tr>
+    <tr><td><strong>Evaluation System</strong></td><td>Datasets, metrics, judges and pipelines that measure system quality.</td><td>—</td></tr>
+    <tr><td><strong>AI Platform</strong></td><td>Shared infrastructure and services on which many AI applications are built.</td><td>—</td></tr>
+  </tbody>
+</table>
+
+<h3>Workflow Versus Agent in Code</h3>
+
+<p>The clearest way to separate the two terms is to look at who owns the loop. Both examples use a
+<code>ScriptedModel</code>, a deterministic fake that returns pre-written replies. Fakes like this let
+us test system logic without network access or API keys (Chapter 8).</p>
+
+<figure class="listing">
+<figcaption>A workflow (code decides the steps) and an agent (the model decides the steps).</figcaption>
+<pre><code>from collections.abc import Callable
+
+
+class ScriptedModel:
+    """Deterministic stand-in for an LLM: returns pre-written replies in order."""
+
+    def __init__(self, replies: list[str]):
+        self.replies = list(replies)
+        self.calls: list[str] = []
+
+    def complete(self, prompt: str) -&gt; str:
+        self.calls.append(prompt)
+        return self.replies.pop(0)
+
+
+# AI WORKFLOW: code decides the steps; the model fills in each step.
+def support_workflow(model: ScriptedModel, ticket: str) -&gt; str:
+    category = model.complete(f"Classify this ticket as billing/technical: {ticket}")
+    return model.complete(f"Write a {category} reply to: {ticket}")
+
+
+# AI AGENT: the model decides the next action in a loop until it stops.
+def run_agent(model: ScriptedModel, goal: str, tools: dict[str, Callable[[str], str]],
+              max_steps: int = 5) -&gt; str:
+    transcript = f"Goal: {goal}"
+    for _ in range(max_steps):
+        decision = model.complete(transcript)  # e.g. "lookup_order: 42" or "FINAL: ..."
+        if decision.startswith("FINAL:"):
+            return decision.removeprefix("FINAL:").strip()
+        tool, _, arg = decision.partition(":")
+        observation = tools[tool.strip()](arg.strip())
+        transcript += f"\nAction: {decision}\nObservation: {observation}"
+    return "stopped: step budget exhausted"
+
+
+wf_model = ScriptedModel(["billing", "We have refunded the duplicate charge."])
+print("workflow:", support_workflow(wf_model, "I was charged twice"))
+
+tools = {"lookup_order": lambda oid: f"order {oid}: charged twice on 3 May"}
+agent_model = ScriptedModel(["lookup_order: 42",
+                             "FINAL: Order 42 was double-charged; refund issued."])
+print("agent:   ", run_agent(agent_model, "Resolve ticket about order 42", tools))</code></pre>
+</figure>
+
+<pre class="output">workflow: We have refunded the duplicate charge.
+agent:    Order 42 was double-charged; refund issued.</pre>
+
+<p class="facet">What the code shows</p>
+<ul>
+  <li>In the workflow the number of model calls is fixed (two). Cost and latency are predictable.</li>
+  <li>In the agent the number of calls depends on the model's choices. You need a <strong>step budget</strong> (<code>max_steps</code>), and in production also token, cost and time budgets.</li>
+  <li>The agent executes whatever tool name the model emits. A production system needs a <strong>tool runtime</strong> that validates arguments and a <strong>permission</strong> policy. That is the job of the <strong>harness</strong> (Volume 16).</li>
+</ul>
+
+<aside class="callout core"><span class="title">Decision Rule</span>
+  <ul>
+    <li>Use a <strong>workflow</strong> when you can write the steps down in advance. This covers most production use cases.</li>
+    <li>Use an <strong>agent</strong> only when the steps depend on information discovered during execution and cannot be enumerated.</li>
+    <li>Agency costs you predictability, latency, money and safety surface. Spend it deliberately.</li>
+  </ul>
+</aside>
+
+<h3>A Layered Reference Model</h3>
+
+<figure class="diagram">
+  <div class="arch">
+    <div class="arch-layer" data-label="Product">
+      <div class="node client">AI Application</div>
+    </div>
+    <div class="arch-layer" data-label="Logic">
+      <div class="node service">AI Workflow</div>
+      <div class="node service">AI Agent</div>
+      <div class="node service">Orchestrator</div>
+    </div>
+    <div class="arch-layer" data-label="Runtime">
+      <div class="node service">Agent Harness<small>built with or without a framework</small></div>
+      <div class="node service">Tool Runtime</div>
+      <div class="node guard">Guardrails</div>
+    </div>
+    <div class="arch-layer" data-label="Models">
+      <div class="node model">LLM / SLM</div>
+      <div class="node model">Multimodal model</div>
+      <div class="node model">Embedding model</div>
+    </div>
+    <div class="arch-layer" data-label="Platform">
+      <div class="node gpu">Serving · GPUs</div>
+      <div class="node store">Data · Retrieval</div>
+      <div class="node eval">Evaluation System</div>
+      <div class="node obs">Observability</div>
+    </div>
+  </div>
+  <figcaption>Where each term lives. The AI Platform is the bottom two layers, shared by many applications.</figcaption>
+</figure>
+
+<aside class="callout warning"><span class="title">Common Misuse</span>
+  <ul>
+    <li>"We use an agent framework, so we have an agent." A framework can build plain workflows too.</li>
+    <li>"The model is hallucinating." Often the <em>system</em> gave it the wrong context. Classify the failure first (Chapter 7).</li>
+    <li>"Guardrails make it safe." Guardrails reduce risk; they do not prove its absence (Volume 17).</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Take a system you know, such as a support bot or a code assistant. Draw it on the
+layered reference model. For every model call, state whether code or the model decides what happens next.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="how-llm-works">How an LLM Works: an Engineer's Overview</h2>
+<p class="chapter-lede">An LLM is a function from a sequence of token IDs to a probability distribution
+over the next token, applied repeatedly. Everything else (chat, tools, reasoning) is built on that
+loop. This chapter walks through the loop on a real model and implements sampling from scratch.</p>
+
+<h3>The End-to-End Pipeline</h3>
+
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  A["Text: 'The capital of France is'"] --> B[Tokeniser]
+  B --> C["Token IDs: 504 3575 282 4649 314"]
+  C --> D[Embedding lookup]
+  D --> E["Transformer blocks x L"]
+  E --> F["Logits over vocabulary (V scores)"]
+  F --> G[Softmax + sampling]
+  G --> H["Next token: ' Paris'"]
+  H -->|append and repeat| C</pre>
+<figcaption>Autoregressive generation: one forward pass produces one new token.</figcaption>
+</figure>
+
+<ol>
+  <li><strong>Tokeniser</strong> splits text into sub-word units and maps each to an integer ID (Volume 3).</li>
+  <li><strong>Embedding</strong> turns each ID into a vector of size <span class="math">d_{\text{model}}</span>.</li>
+  <li><strong>Transformer blocks</strong> mix information across positions (attention) and transform each position (MLP), <span class="math">L</span> times (Volume 2).</li>
+  <li><strong>LM head</strong> projects the last position's vector to <span class="math">V</span> scores, one per vocabulary entry (the logits).</li>
+  <li><strong>Sampling</strong> converts logits to a probability distribution and picks one token.</li>
+  <li>The token is appended to the input and the loop repeats until a stop token or a length limit.</li>
+</ol>
+
+<h3>The Mathematics in Four Equations</h3>
+
+<p class="facet">1. Language modelling factorises the probability of a sequence</p>
+<div class="math">p(x_1, \dots, x_T) = \prod_{t=1}^{T} p_\theta(x_t \mid x_{&lt;t})</div>
+<ul>
+  <li>The model <span class="math">p_\theta</span> only ever predicts the next token given all previous ones. A "causal" or "autoregressive" model is one that factorises this way.</li>
+</ul>
+
+<p class="facet">2. Softmax turns logits into probabilities</p>
+<div class="math">p_\theta(x_t = i \mid x_{&lt;t}) = \frac{\exp(z_i / \tau)}{\sum_{j=1}^{V} \exp(z_j / \tau)}</div>
+<ul>
+  <li><span class="math">z \in \mathbb{R}^V</span> are the logits and <span class="math">\tau</span> is the sampling temperature (<span class="math">\tau = 1</span> in training).</li>
+</ul>
+
+<p class="facet">3. Training minimises cross-entropy (negative log-likelihood)</p>
+<div class="math">\mathcal{L}(\theta) = -\frac{1}{T} \sum_{t=1}^{T} \log p_\theta(x_t \mid x_{&lt;t})</div>
+<ul>
+  <li>Measured in nats per token. Every position in every training sequence is a training example, which is why pretraining needs no labels.</li>
+</ul>
+
+<p class="facet">4. Perplexity is the exponentiated loss</p>
+<div class="math">\text{PPL} = \exp(\mathcal{L})</div>
+<ul>
+  <li>Intuition: a perplexity of 10 means the model is, on average, as uncertain as a uniform choice among 10 tokens.</li>
+  <li>Perplexity is only comparable between models that use the <strong>same tokeniser</strong>. Different tokenisers split text differently, so loss per token is not comparable. Use bits per byte instead (Volume 3).</li>
+</ul>
+
+<h3>Inspecting a Real Model</h3>
+
+<figure class="listing">
+<figcaption>Tokens, logits and the next-token distribution of a 135M-parameter open model.</figcaption>
+<pre><code>import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+name = "HuggingFaceTB/SmolLM2-135M"  # 135M-parameter open-weight decoder
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).eval()
+
+text = "The capital of France is"
+ids = tok(text, return_tensors="pt").input_ids  # (1, T)
+print("token ids:", ids[0].tolist())
+print("tokens:   ", tok.convert_ids_to_tokens(ids[0]))
+
+with torch.no_grad():
+    logits = model(ids).logits  # (1, T, V)
+print("logits shape:", tuple(logits.shape))
+
+probs = torch.softmax(logits[0, -1], dim=-1)  # next-token distribution
+top = torch.topk(probs, 5)
+for p, i in zip(top.values, top.indices):
+    print(f"{tok.decode(i)!r:&gt;12}  p={p.item():.3f}")</code></pre>
+</figure>
+
+<pre class="output">token ids: [504, 3575, 282, 4649, 314]
+tokens:    ['The', 'Ġcapital', 'Ġof', 'ĠFrance', 'Ġis']
+logits shape: (1, 5, 49152)
+      ' the'  p=0.262
+    ' Paris'  p=0.094
+  ' located'  p=0.073
+   ' called'  p=0.044
+        ' a'  p=0.039</pre>
+
+<p class="facet">What the output teaches</p>
+<ul>
+  <li><strong>Tokens are not words.</strong> <code>Ġ</code> marks a leading space in byte-level BPE, so <code>" France"</code> and <code>"France"</code> are different tokens.</li>
+  <li><strong>The model outputs logits for every position</strong> (shape <code>(1, 5, 49152)</code>). Training uses all 5 positions; generation uses only the last.</li>
+  <li><strong>The most likely continuation is " the", not " Paris".</strong> A base model predicts plausible <em>text</em> ("…is the city of Paris"), not the answer to a question. Answering questions directly is taught by post-training (Volume 8).</li>
+  <li>" Paris" gets only 9.4%. Small models spread probability widely; that is why sampling settings matter.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>An LLM is a <strong>conditional probability distribution</strong> over the next token. It is not a database lookup, not a program interpreter and not a reasoning engine with guaranteed correctness.</li>
+    <li>Facts, reasoning and style all emerge from next-token prediction, and so do hallucinations, when the most plausible text is not the true text.</li>
+  </ul>
+</aside>
+
+<h3>Sampling from Scratch</h3>
+
+<p>The model gives a distribution; the <em>decoding strategy</em> picks a token from it. Decoding has no
+learned parameters, yet it changes output quality dramatically.</p>
+
+<table>
+  <caption>Common decoding controls.</caption>
+  <thead><tr><th>Control</th><th>What it does</th><th>Typical use</th></tr></thead>
+  <tbody>
+    <tr><td>Greedy (<span class="math">\tau = 0</span>)</td><td>Always pick the argmax</td><td>Extraction, classification, deterministic tests</td></tr>
+    <tr><td>Temperature <span class="math">\tau</span></td><td>Divide logits by <span class="math">\tau</span>: &lt; 1 sharpens, &gt; 1 flattens</td><td>0.0–0.3 factual; 0.7–1.0 creative</td></tr>
+    <tr><td>Top-k</td><td>Keep only the <span class="math">k</span> most likely tokens</td><td>Crude tail truncation</td></tr>
+    <tr><td>Top-p (nucleus)</td><td>Keep the smallest set whose probability mass ≥ <span class="math">p</span></td><td>Adaptive truncation; the common default</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>Temperature, top-k and top-p sampling implemented in NumPy.</figcaption>
+<pre><code>import numpy as np
+
+
+def softmax(logits: np.ndarray) -&gt; np.ndarray:
+    z = logits - logits.max()  # shift for numerical stability
+    e = np.exp(z)
+    return e / e.sum()
+
+
+def sample_next(
+    logits: np.ndarray,  # (V,) raw scores for the next token
+    temperature: float = 1.0,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    rng: np.random.Generator | None = None,
+) -&gt; int:
+    rng = rng or np.random.default_rng()
+    if temperature == 0.0:  # greedy decoding
+        return int(np.argmax(logits))
+    logits = logits / temperature  # &lt;1 sharpens, &gt;1 flattens
+    if top_k is not None:  # keep the k highest-scoring tokens
+        kth = np.sort(logits)[-top_k]
+        logits = np.where(logits &lt; kth, -np.inf, logits)
+    probs = softmax(logits)
+    if top_p is not None:  # nucleus: smallest set with mass &gt;= top_p
+        order = np.argsort(probs)[::-1]
+        cumulative = np.cumsum(probs[order])
+        keep = order[: np.searchsorted(cumulative, top_p) + 1]
+        mask = np.zeros_like(probs, dtype=bool)
+        mask[keep] = True
+        probs = np.where(mask, probs, 0.0)
+        probs /= probs.sum()
+    return int(rng.choice(len(probs), p=probs))
+
+
+logits = np.array([2.0, 1.0, 0.5, 0.1, -1.0])
+rng = np.random.default_rng(0)
+for t in (0.0, 0.5, 1.0, 2.0):
+    draws = [sample_next(logits, temperature=t, rng=rng) for _ in range(10_000)]
+    print(f"T={t:&lt;4} {np.round(np.bincount(draws, minlength=5) / 10_000, 3)}")</code></pre>
+</figure>
+
+<pre class="output">T=0.0  [1.    0.    0.    0.    0.   ]
+T=0.5  [0.828 0.11  0.041 0.018 0.002]
+T=1.0  [0.552 0.211 0.127 0.083 0.028]
+T=2.0  [0.371 0.231 0.174 0.145 0.079]
+top_p=0.8 [0.625 0.239 0.136 0.    0.   ]    (softmax is [0.559 0.205 0.125 0.084 0.028])
+top_k=2   [0.73  0.27  0.    0.    0.   ]</pre>
+
+<ul>
+  <li>At <span class="math">\tau = 0.5</span> the top token takes 83% of samples; at <span class="math">\tau = 2</span> the distribution flattens and the worst token rises from 3% to 8%.</li>
+  <li>Top-p = 0.8 keeps three tokens because 0.559 + 0.205 = 0.764 &lt; 0.8, so a third token is needed to cross the threshold.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>Greedy decoding is deterministic but can loop and repeat itself on long outputs.</li>
+    <li>High temperature increases diversity <em>and</em> error rate. For factual tasks, lower temperature is usually better; for brainstorming or sampling many candidates (Volume 9), higher is better.</li>
+    <li><span class="math">\tau = 0</span> on a hosted API is usually <em>not</em> perfectly deterministic: batched GPU arithmetic and serving changes introduce small differences.</li>
+  </ul>
+</aside>
+
+<h3>Three Phases: Pretraining, Post-Training, Inference</h3>
+
+<table>
+  <caption>The three phases of an LLM's life.</caption>
+  <thead><tr><th>Phase</th><th>Input</th><th>Output</th><th>Cost profile</th><th>Volume</th></tr></thead>
+  <tbody>
+    <tr><td>Pretraining</td><td>Trillions of tokens of raw text</td><td>Base model: predicts plausible text</td><td>Enormous one-off compute (~6ND FLOPs)</td><td>4–7</td></tr>
+    <tr><td>Post-training</td><td>Instructions, preferences, verifiable tasks</td><td>Assistant / reasoning model</td><td>Small fraction of pretraining compute; data-intensive</td><td>8–9</td></tr>
+    <tr><td>Inference</td><td>Prompt</td><td>Generated tokens</td><td>Per request, forever; ~2N FLOPs per token plus memory traffic</td><td>11–12</td></tr>
+  </tbody>
+</table>
+
+<h3>Chat Is a Text Format</h3>
+
+<p>An assistant has no separate "chat mode". A <em>chat template</em> serialises roles into a single token
+sequence using special tokens, and the model continues it.</p>
+
+<figure class="listing">
+<figcaption>A chat conversation after template formatting (ChatML-style; exact tokens vary by model).</figcaption>
+<pre><code class="language-text">&lt;|im_start|&gt;system
+You are a concise assistant.&lt;|im_end|&gt;
+&lt;|im_start|&gt;user
+What is the capital of France?&lt;|im_end|&gt;
+&lt;|im_start|&gt;assistant
+</code></pre>
+</figure>
+
+<ul>
+  <li>The model generates until it emits <code>&lt;|im_end|&gt;</code>, the stop token.</li>
+  <li>System prompts, tool definitions, tool results and retrieved documents are all just text inside this sequence. That is why <strong>prompt injection</strong> is possible: data and instructions share one channel (Volume 17).</li>
+  <li>Using the wrong template for a model silently degrades quality. Always use the tokenizer's own <code>apply_chat_template</code>.</li>
+</ul>
+
+<h3>Prefill and Decode: Why Output Tokens Cost More</h3>
+
+<ul>
+  <li><strong>Prefill</strong>: the whole prompt is processed in one parallel forward pass. This phase is compute-bound and fast per token.</li>
+  <li><strong>Decode</strong>: output tokens are generated one at a time, and each step reads all model weights from GPU memory. This phase is memory-bandwidth-bound and slow per token.</li>
+  <li>The <strong>KV cache</strong> stores each layer's keys and values for previous tokens so decode does not recompute them (Chapter 4, Volume 11).</li>
+  <li>This is why hosted APIs price output tokens several times higher than input tokens, and why latency is reported as <strong>time to first token</strong> (prefill) plus <strong>time per output token</strong> (decode).</li>
+</ul>
+
+<h3>What an LLM Is Not</h3>
+
+<ul class="failure-modes">
+  <li><strong>Not a database</strong>: knowledge is compressed and lossy, frozen at the training cut-off, and cannot be updated by editing a row. Use retrieval (Volume 14).</li>
+  <li><strong>Not a calculator</strong>: arithmetic is pattern-matched over tokens. Use tools (Volume 15).</li>
+  <li><strong>Not deterministic by default</strong>: sampling is stochastic, and serving introduces numeric noise.</li>
+  <li><strong>Not self-aware of its errors</strong>: confidence in the text is not calibrated probability of correctness (Volume 18).</li>
+  <li><strong>Not a security boundary</strong>: instructions in the prompt can be overridden by other text in the prompt.</li>
+</ul>
+
+<div class="frame exercise"><p>Run the real-model listing with the prompts <code>"Q: What is the capital of France?\nA:"</code>
+and <code>"The capital of France is the city of"</code>. Record the probability of " Paris" for each.
+Explain the difference in terms of what a base model is trained to do.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="arithmetic">Compute, Memory and Cost Arithmetic</h2>
+<p class="chapter-lede">Almost every AI engineering decision reduces to four numbers: parameters,
+FLOPs, bytes and bandwidth. An engineer who can estimate them on paper can check vendor claims,
+size hardware, predict latency and price a feature before writing any serving code.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Your team wants to self-host an 8B-parameter model for a chat feature with 8k-token
+  conversations. Questions arrive immediately. Will it fit on one GPU? How many users can it serve
+  at once? What is the latency per token? Is it cheaper than a hosted API? Could we fine-tune it on
+  the same GPU? All of these can be answered in five minutes with the formulas in this chapter.</p>
+</div>
+
+<h3>Counting Parameters</h3>
+
+<p>A modern decoder-only Transformer (Llama-style: RMSNorm, grouped-query attention, SwiGLU MLP)
+with vocabulary <span class="math">V</span>, width <span class="math">d</span>, <span class="math">L</span> layers,
+<span class="math">h_{kv}</span> key/value heads of size <span class="math">d_h</span> and MLP width <span class="math">d_{ff}</span> has:</p>
+
+<div class="math">N \approx \underbrace{V d}_{\text{embedding}} + L\Big(\underbrace{2d^2 + 2\,d\,h_{kv} d_h}_{\text{attention}} + \underbrace{3\,d\,d_{ff}}_{\text{SwiGLU MLP}}\Big) + \underbrace{V d}_{\text{LM head (if untied)}}</div>
+
+<ul>
+  <li>Attention: <span class="math">W_Q, W_O</span> are <span class="math">d \times d</span>; <span class="math">W_K, W_V</span> are <span class="math">d \times h_{kv} d_h</span>, which is smaller than <span class="math">d \times d</span> under GQA.</li>
+  <li>SwiGLU has three matrices (gate, up, down) instead of two.</li>
+  <li>Norm weights and biases are negligible (&lt; 0.01% of parameters).</li>
+  <li>For large models, the MLP holds roughly two-thirds of the non-embedding parameters.</li>
+</ul>
+
+<h3>Counting FLOPs</h3>
+
+<ul>
+  <li>A matrix–vector product with an <span class="math">m \times n</span> matrix costs <span class="math">2mn</span> FLOPs (one multiply and one add per weight).</li>
+  <li>Therefore a <strong>forward pass costs about 2N FLOPs per token</strong>, plus attention over the context, which is small unless the context is very long.</li>
+  <li>The backward pass costs about twice the forward pass, so <strong>training costs about 6N FLOPs per token</strong>.</li>
+</ul>
+
+<div class="math">C_{\text{train}} \approx 6 N D \qquad C_{\text{infer}} \approx 2 N \text{ per generated token}</div>
+
+<p>Here <span class="math">D</span> is the number of training tokens. This one formula underpins the scaling laws in Volume 6.</p>
+
+<h3>Memory: Where the Bytes Go</h3>
+
+<table>
+  <caption>Bytes per parameter by numeric format.</caption>
+  <thead><tr><th>Format</th><th class="num">Bytes</th><th>Where used</th></tr></thead>
+  <tbody>
+    <tr><td>FP32</td><td class="num">4</td><td>Optimiser states, master weights</td></tr>
+    <tr><td>BF16 / FP16</td><td class="num">2</td><td>Training compute, standard inference</td></tr>
+    <tr><td>FP8 / INT8</td><td class="num">1</td><td>Quantised inference, FP8 training</td></tr>
+    <tr><td>INT4 / FP4</td><td class="num">0.5</td><td>Aggressive quantised inference</td></tr>
+  </tbody>
+</table>
+
+<h4>Inference memory</h4>
+<div class="math">M_{\text{infer}} \approx \underbrace{N \cdot b_w}_{\text{weights}} + \underbrace{B \cdot S \cdot 2 L\, h_{kv}\, d_h\, b_{kv}}_{\text{KV cache}} + \text{activations and overhead}</div>
+<ul>
+  <li><span class="math">B</span> is the number of concurrent sequences, <span class="math">S</span> the tokens per sequence, and <span class="math">b</span> the bytes per value.</li>
+  <li>The factor 2 counts keys <em>and</em> values. The KV cache grows linearly with both batch size and context length, and it is what limits concurrency on a GPU.</li>
+</ul>
+
+<h4>Training memory</h4>
+<p>Mixed-precision training with Adam keeps, per parameter <cite>(Rajbhandari et al., 2019)</cite>:</p>
+<ul>
+  <li>BF16 weights (2 bytes) and BF16 gradients (2 bytes).</li>
+  <li>An FP32 master copy of the weights (4 bytes).</li>
+  <li>Adam first and second moments in FP32 (4 + 4 bytes).</li>
+  <li>That totals <strong>16 bytes per parameter before activations</strong>. Activations depend on batch size and sequence length and are reduced by activation checkpointing (Volume 6).</li>
+</ul>
+
+<h3>Bandwidth and the Roofline</h3>
+
+<p>A GPU can be limited either by arithmetic (FLOP/s) or by moving data from memory (bytes/s).
+The <strong>arithmetic intensity</strong> of a workload decides which:</p>
+
+<div class="math">I = \frac{\text{FLOPs performed}}{\text{bytes moved}} \qquad \text{attainable FLOP/s} = \min\big(\text{peak FLOP/s},\; I \times \text{bandwidth}\big)</div>
+
+<ul>
+  <li>An H100 SXM offers about 989 TFLOP/s of dense BF16 compute and 3.35 TB/s of HBM bandwidth <span class="evidence documented">Documented</span> (NVIDIA datasheet). The <strong>ridge point</strong> is therefore 989e12 / 3.35e12 ≈ <strong>295 FLOPs per byte</strong>.</li>
+  <li><strong>Decode at batch size 1</strong>: each 2-byte weight is read once to do 2 FLOPs, so <span class="math">I \approx 1</span>. This is far below 295, which makes decode <strong>memory-bound</strong>: the GPU's compute sits mostly idle.</li>
+  <li><strong>Batching <span class="math">B</span> sequences</strong> reuses each weight read <span class="math">B</span> times, so <span class="math">I \approx B</span>. That is why batching raises throughput almost for free until the workload becomes compute-bound or the KV cache fills memory.</li>
+  <li><strong>Prefill</strong> processes many tokens per weight read and is usually <strong>compute-bound</strong>.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">attainable
+TFLOP/s
+  989 |                         +------------------------  compute roof
+      |                       /
+      |                     /
+      |                   /     prefill, large-batch decode
+      |                 /       (compute-bound)
+      |               /
+      |             /  &lt;- bandwidth roof: slope = 3.35 TB/s
+      |           /
+      |   decode /
+      | (batch 1)
+      +------+-------------------+-------------------------->
+             1                  295          arithmetic intensity (FLOP/byte)</pre>
+<figcaption>Roofline for an H100: decode at small batch sizes lives on the bandwidth slope.</figcaption>
+</figure>
+
+<h3>Implementation: <code>forge.compute</code></h3>
+
+<p>These estimators are the first piece of the continuous project package <strong>Forge</strong>. Later volumes
+add modules under <code>forge.*</code>; this chapter starts <code>forge.compute</code>.</p>
+
+<figure class="listing">
+<figcaption><code>forge.compute</code>: parameter, memory, FLOP, throughput and cost estimates for a decoder-only model.</figcaption>
+<pre><code># forge/compute.py — capacity and cost arithmetic used throughout the book
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class DecoderConfig:
+    vocab: int
+    d_model: int
+    n_layers: int
+    n_heads: int
+    n_kv_heads: int  # &lt; n_heads means grouped-query attention (GQA)
+    d_ff: int  # hidden size of the gated (SwiGLU) MLP
+    tied_embeddings: bool = False
+
+    @property
+    def head_dim(self) -&gt; int:
+        return self.d_model // self.n_heads
+
+
+def param_count(c: DecoderConfig) -&gt; dict[str, int]:
+    kv_dim = c.n_kv_heads * c.head_dim
+    attn = c.d_model * c.d_model * 2 + c.d_model * kv_dim * 2  # Wq, Wo, Wk, Wv
+    mlp = 3 * c.d_model * c.d_ff  # gate, up, down projections
+    norms = 2 * c.d_model  # two RMSNorm weight vectors per block
+    per_layer = attn + mlp + norms
+    embed = c.vocab * c.d_model
+    head = 0 if c.tied_embeddings else c.vocab * c.d_model
+    total = embed + c.n_layers * per_layer + c.d_model + head
+    return {"embedding": embed, "per_layer": per_layer, "lm_head": head, "total": total}
+
+
+def kv_cache_bytes_per_token(c: DecoderConfig, bytes_per_value: int = 2) -&gt; int:
+    return 2 * c.n_layers * c.n_kv_heads * c.head_dim * bytes_per_value  # K and V
+
+
+def training_flops(n_params: float, n_tokens: float) -&gt; float:
+    return 6 * n_params * n_tokens  # forward ~2N, backward ~4N per token
+
+
+def training_state_bytes(n_params: float) -&gt; float:
+    # BF16 weights (2) + BF16 grads (2) + FP32 master weights (4) + Adam m, v (8)
+    return 16 * n_params
+
+
+def decode_tokens_per_s_upper_bound(weight_bytes: float, hbm_bytes_per_s: float) -&gt; float:
+    # Batch size 1: every generated token must stream all weights from HBM once.
+    return hbm_bytes_per_s / weight_bytes
+
+
+def cost_per_million_tokens(gpu_dollars_per_hour: float, tokens_per_s: float) -&gt; float:
+    return gpu_dollars_per_hour / (tokens_per_s * 3600) * 1e6
+
+
+llama3_8b = DecoderConfig(
+    vocab=128_256, d_model=4096, n_layers=32, n_heads=32, n_kv_heads=8, d_ff=14_336
+)
+N = param_count(llama3_8b)["total"]
+kv = kv_cache_bytes_per_token(llama3_8b)
+print(f"parameters        {N / 1e9:.2f} B")
+print(f"KV cache / token  {kv / 1024:.0f} KiB; 8k-token sequence = {kv * 8192 / 2**30:.2f} GiB")
+print(f"weights (BF16)    {2 * N / 1e9:.1f} GB")
+print(f"training state    {training_state_bytes(N) / 1e9:.0f} GB (before activations)")
+flops = training_flops(N, 15e12)
+print(f"training FLOPs    {flops:.2e} for 15T tokens")
+gpu_hours = flops / (989e12 * 0.40) / 3600  # H100 BF16 peak, 40% utilisation
+print(f"GPU-hours @40%MFU {gpu_hours / 1e3:.0f} k H100-hours")
+tps = decode_tokens_per_s_upper_bound(2 * N, 3.35e12)
+print(f"batch-1 decode    &lt;= {tps:.0f} tokens/s on one H100 (3.35 TB/s)")
+print(f"$/1M tokens       {cost_per_million_tokens(3.0, tps):.2f} at batch 1, $3/GPU-hour")
+print(f"$/1M tokens       {cost_per_million_tokens(3.0, 2500):.2f} at 2,500 tokens/s batched")</code></pre>
+</figure>
+
+<pre class="output">parameters        8.03 B
+KV cache / token  128 KiB; 8k-token sequence = 1.00 GiB
+weights (BF16)    16.1 GB
+training state    128 GB (before activations)
+training FLOPs    7.23e+23 for 15T tokens
+GPU-hours @40%MFU 507 k H100-hours
+batch-1 decode    &lt;= 209 tokens/s on one H100 (3.35 TB/s)
+$/1M tokens       4.00 at batch 1, $3/GPU-hour
+$/1M tokens       0.33 at 2,500 tokens/s batched</pre>
+
+<h3>Reading the Numbers: The 8B Model Problem Answered</h3>
+
+<ul>
+  <li><strong>Correctness check.</strong> The calculator gives 8.03B parameters, matching Meta's published size for Llama 3 8B <span class="evidence documented">Documented</span>. Always validate an estimator against a known model before trusting it.</li>
+  <li><strong>Does it fit?</strong> Weights take 16 GB. On an 80 GB GPU that leaves about 60 GB for KV cache, which is about 60 sequences of 8k tokens at 1 GiB each. That KV budget is the real concurrency limit.</li>
+  <li><strong>Can we fully fine-tune it on one GPU?</strong> No: the 128 GB of training state exceeds 80 GB before activations are counted. Options are sharding across GPUs (Volume 6) or LoRA and QLoRA (Volume 8).</li>
+  <li><strong>Latency.</strong> Decode is capped at about 209 tokens/s per sequence even at batch 1. Real systems reach perhaps 60–80% of that bound.</li>
+  <li><strong>Cost.</strong> The same GPU costs $4.00 or $0.33 per million tokens depending on batching. <strong>Utilisation is the cost lever</strong> (Volumes 11–12).</li>
+  <li><strong>Training estimate versus reality.</strong> Meta's model card reports about 1.3M H100 GPU-hours for Llama 3 8B <span class="evidence documented">Documented</span>, 2.6× our 40%-MFU estimate. The gap plausibly comes from lower sustained utilisation, failures and restarts, evaluation runs and experiments <span class="evidence inferred">Inferred</span>. Treat 6ND as a <strong>lower bound</strong>.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Assumptions to State Every Time</span>
+  <ul>
+    <li>GPU price ($3/hour here) varies by several times across providers, commitment levels and regions.</li>
+    <li>Utilisation (MFU) for large training runs is typically 30–50%; for naive code it can be under 10%.</li>
+    <li>Throughput under batching depends on prompt and output lengths. Always measure (Volume 11).</li>
+  </ul>
+</aside>
+
+<aside class="callout advanced"><span class="title">Beyond This Chapter</span>
+  <ul>
+    <li>Attention FLOPs grow as <span class="math">O(S^2)</span>, so for very long contexts the 2N rule underestimates prefill cost.</li>
+    <li>Mixture-of-experts models activate only part of <span class="math">N</span> per token. Compute follows the <em>active</em> parameters, but memory must hold <em>all</em> of them (Volume 7).</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Configure the calculator for a model with 70B parameters
+(<code>d_model=8192, n_layers=80, n_heads=64, n_kv_heads=8, d_ff=28672, vocab=128256</code>).
+How many 80 GB GPUs do the BF16 weights need? How many 8k-token sequences fit in a node of 8 GPUs?
+What is the batch-1 decode bound if the weights are split across 8 GPUs with tensor parallelism?</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="model-lifecycle">The AI Model Lifecycle</h2>
+<p class="chapter-lede">A model is not a file. It is the output of a pipeline of data, code,
+configuration and compute, and it must be reproducible, comparable, auditable and replaceable.
+This chapter defines the lifecycle and the artefacts each stage must produce.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Six months after release, users report that the model has become worse at invoices. Nobody can
+  say which dataset version trained the production model, which evaluation it passed, or what changed
+  since. Rolling back is impossible because the previous checkpoint was overwritten. Every one of these
+  failures is a missing lifecycle artefact.</p>
+</div>
+
+<h3>The Lifecycle Loop</h3>
+
+<figure class="diagram">
+<pre class="ascii">+--&gt; Data collection and curation
+|            |
+|            v
+|    Pretraining  /  base model selection
+|            |
+|            v
+|    Post-training  /  fine-tuning
+|            |
+|            v
+|    Offline evaluation gate  ---- fail ----+
+|            | pass                         |
+|            v                              |
+|    Registry: versioned release            |
+|            |                              |
+|            v                              |
+|    Serving: shadow -&gt; canary -&gt; full      |
+|            |                              |
+|            v                              |
+|    Monitoring: quality, drift, cost       |
+|            |                              |
+|            v                              |
++--- Feedback and failure analysis &lt;--------+</pre>
+<figcaption>The model lifecycle is a loop. Production feedback becomes the next training or evaluation data.</figcaption>
+</figure>
+
+<table>
+  <caption>Stages, artefacts and the question each artefact answers.</caption>
+  <thead><tr><th>Stage</th><th>Artefact</th><th>Question it answers</th></tr></thead>
+  <tbody>
+    <tr><td>Data</td><td>Versioned dataset, hash, datasheet</td><td>Exactly what was the model trained on?</td></tr>
+    <tr><td>Training</td><td>Config, code revision, seed, logs, checkpoints</td><td>Can we reproduce or resume this run?</td></tr>
+    <tr><td>Evaluation</td><td>Eval report with dataset versions and CIs</td><td>Is it better than the current model, and is the difference real?</td></tr>
+    <tr><td>Release</td><td>Registry entry, model card, approval</td><td>Who approved what, for which use?</td></tr>
+    <tr><td>Serving</td><td>Deployment manifest, traffic split</td><td>Which version served this request?</td></tr>
+    <tr><td>Monitoring</td><td>Dashboards, alerts, sampled traces</td><td>Is it still working, and what does it cost?</td></tr>
+  </tbody>
+</table>
+
+<h3>Lineage in Practice: An Artefact Manifest</h3>
+
+<p>The smallest useful unit of model governance is a manifest written next to every checkpoint. It
+links the weights to the exact data, code and configuration that produced them.</p>
+
+<figure class="listing">
+<figcaption><code>forge.core</code>: a reproducibility manifest with content hashes for datasets.</figcaption>
+<pre><code># forge/core.py — ArtefactManifest (same module as TrainConfig / seed_everything)
+import hashlib
+import json
+import platform
+import sys
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+
+def sha256_file(path: Path, chunk: int = 1 &lt;&lt; 20) -&gt; str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while block := f.read(chunk):
+            h.update(block)
+    return h.hexdigest()
+
+
+@dataclass
+class ArtefactManifest:
+    """Everything needed to reproduce, audit or roll back one model artefact."""
+
+    name: str
+    version: str
+    parent: str | None  # base model this was derived from
+    dataset_hashes: dict[str, str]
+    config: dict
+    code_revision: str  # git commit of the training code
+    metrics: dict[str, float]
+    environment: dict[str, str] = field(default_factory=lambda: {
+        "python": sys.version.split()[0], "platform": platform.platform()})
+
+    def save(self, path: Path) -&gt; None:
+        path.write_text(json.dumps(asdict(self), indent=2, sort_keys=True))
+
+
+data = Path("train.jsonl")
+data.write_text('{"text": "hello"}\n')
+manifest = ArtefactManifest(
+    name="support-classifier", version="1.3.0", parent="SmolLM2-135M",
+    dataset_hashes={"train.jsonl": sha256_file(data)},
+    config={"lr": 3e-4, "epochs": 2, "seed": 1234}, code_revision="a1b2c3d",
+    metrics={"val_accuracy": 0.912, "p95_latency_ms": 41.0},
+)
+manifest.save(Path("manifest.json"))
+print(json.loads(Path("manifest.json").read_text())["dataset_hashes"])</code></pre>
+</figure>
+
+<pre class="output">{'train.jsonl': '7cda9ec1f0842184c2f10f1b056ef625e75a4749c94b594d0a70c9eda7553262'}</pre>
+
+<ul>
+  <li><strong>Content hashes, not file names.</strong> <code>train_final_v2.jsonl</code> says nothing; a SHA-256 hash changes whenever a single byte changes.</li>
+  <li><strong>Parent pointer.</strong> Fine-tuned models form a tree. When a base model is found to have a problem, you can find every descendant.</li>
+  <li><strong>Production version.</strong> Registries such as MLflow and Weights &amp; Biases store the same information with UI, permissions and APIs (Volumes 12 and 23). Understand the manifest first; the tool is just storage.</li>
+</ul>
+
+<h3>Model Cards</h3>
+
+<ul>
+  <li><strong>Intended use and out-of-scope use.</strong> For example: "English invoice fields, not legal advice".</li>
+  <li><strong>Training data summary</strong> and known gaps (languages, domains).</li>
+  <li><strong>Evaluation results</strong> with dataset versions, confidence intervals, and slices by segment.</li>
+  <li><strong>Known failure modes</strong> and safety evaluation.</li>
+  <li><strong>Operational characteristics</strong>: size, memory, latency, cost per 1k requests.</li>
+</ul>
+
+<h3>What Makes the LLM Lifecycle Different</h3>
+
+<table>
+  <caption>Classical ML lifecycle versus LLM lifecycle.</caption>
+  <thead><tr><th>Aspect</th><th>Classical ML</th><th>LLM systems</th></tr></thead>
+  <tbody>
+    <tr><td>Who trains the model</td><td>You</td><td>Usually a lab; you adapt it or only prompt it</td></tr>
+    <tr><td>What gets versioned</td><td>Weights</td><td>Weights <em>and</em> prompts, retrieval index, tools, routing rules</td></tr>
+    <tr><td>Upstream change</td><td>Rare</td><td>Hosted models are updated or retired by the provider</td></tr>
+    <tr><td>Drift</td><td>Input distribution drift</td><td>Input drift <em>plus</em> model version drift <em>plus</em> knowledge staleness</td></tr>
+    <tr><td>Evaluation</td><td>Fixed metric</td><td>Multi-dimensional: quality, safety, cost, latency</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>A hosted model alias such as "latest" can change behaviour under you. Pin explicit model versions in production and re-run your evaluation suite before upgrading.</li>
+    <li>Training data is a security asset. Poisoned or leaked data propagates into every descendant model (Volumes 5 and 17).</li>
+  </ul>
+</aside>
+
+<h3>Retraining Triggers</h3>
+<ul>
+  <li><strong>Scheduled</strong>: knowledge freshness, for example a monthly continued-pretraining or re-indexing job.</li>
+  <li><strong>Metric-triggered</strong>: quality on a monitored slice drops below a threshold.</li>
+  <li><strong>Data-triggered</strong>: enough new labelled production failures have accumulated.</li>
+  <li><strong>Upstream-triggered</strong>: a better or cheaper base model is released and passes your evaluation.</li>
+</ul>
+
+<ul class="failure-modes">
+  <li>Evaluation data leaks into training data, so offline scores rise while production quality does not.</li>
+  <li>Checkpoints are overwritten, so rollback is impossible.</li>
+  <li>The serving stack uses a different tokeniser version or chat template than training, a silent quality drop.</li>
+</ul>
+
+<div class="frame exercise"><p>Extend <code>ArtefactManifest</code> with a <code>tokenizer_hash</code> and a
+<code>chat_template_hash</code>. Write a check that refuses to deploy a model if the serving configuration's
+hashes do not match the manifest.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="product-lifecycle">The AI Product Lifecycle</h2>
+<p class="chapter-lede">The model lifecycle asks "is the model good?". The product lifecycle asks
+"does this solve the user's problem at an acceptable cost and risk?". Most failed AI projects
+failed on the second question.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A team spends three months building an LLM-based document router. It reaches 81% accuracy.
+  Then someone notices that a keyword rules engine written in an afternoon reaches 71%, and the
+  business needed 95% to remove the human reviewer. The project never had a baseline, a target or an
+  evaluation set, so nobody could say whether it was succeeding.</p>
+</div>
+
+<h3>The Lifecycle</h3>
+
+<figure class="diagram">
+<pre class="ascii">1. Frame the problem       user, task, value, risk, success metric, target
+        |
+        v
+2. Deterministic baseline  rules, search, templates, classical ML
+        |
+        v
+3. Evaluation set          50-500 real, labelled examples incl. edge cases
+        |
+        v
+4. Prototype               strongest available model, simplest system
+        |
+        v
+5. Decide                  gap to target? cost? latency? risk?
+        |
+   +----+-----------------------------+
+   |                                  |
+   v                                  v
+ Stop / rescope                 6. Pilot (limited users, human review)
+                                      |
+                                      v
+                                7. Production (guardrails, monitoring, SLOs)
+                                      |
+                                      v
+                                8. Continuous improvement (failures -> eval set)</pre>
+<figcaption>The AI product lifecycle. The evaluation set exists before the prototype.</figcaption>
+</figure>
+
+<h3>Is AI the Right Tool?</h3>
+
+<table>
+  <caption>When to use an LLM, and when not to.</caption>
+  <thead><tr><th>Use an LLM when…</th><th>Avoid an LLM when…</th></tr></thead>
+  <tbody>
+    <tr><td>Inputs are unstructured language, images or code</td><td>Inputs are already structured and rules are known</td></tr>
+    <tr><td>Many variations make rules unmaintainable</td><td>An exact, auditable answer is legally required</td></tr>
+    <tr><td>Occasional errors are tolerable or reviewable</td><td>A single error is catastrophic and cannot be caught</td></tr>
+    <tr><td>Value per request exceeds cost per request</td><td>Volume is huge and value per request tiny</td></tr>
+    <tr><td>Latency of seconds is acceptable</td><td>Hard real-time constraints (single milliseconds)</td></tr>
+  </tbody>
+</table>
+
+<h3>Build, Buy, Prompt or Fine-Tune</h3>
+
+<p>Two decisions are often conflated. Separate them: <em>where does the model run?</em> and
+<em>how do you adapt it to the task?</em></p>
+
+<table>
+  <caption>Model supply decision (build / buy / adapt).</caption>
+  <thead><tr><th>Choice</th><th>Means</th><th>Choose when</th><th>Main costs</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Buy (hosted API)</strong></td><td>Call a provider endpoint</td><td>Capability ceiling matters; traffic is low or bursty; you want zero GPU ops</td><td>$/token; vendor lock-in; data leaves your network</td></tr>
+    <tr><td><strong>Build (self-host)</strong></td><td>Serve open-weight (or your own) models</td><td>Steady high volume; data residency; custom inference stack</td><td>GPU capacity, utilisation, ops</td></tr>
+    <tr><td><strong>Adapt</strong></td><td>Fine-tune or continue-pretrain a base model you control</td><td>Hosted quality is enough but format, domain or cost needs tightening</td><td>Training data, eval gates, re-releases</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout impl"><span class="title">Practical Default</span>
+  <ul>
+    <li>Start on a hosted frontier model to prove the task. Build the evaluation set there. Self-host or fine-tune only when the evaluation set shows a cheaper path still hits the target (Chapter 1, Volume 18).</li>
+  </ul>
+</aside>
+
+<h3>Choosing a Technique: Prompt, Retrieve, Tool or Fine-Tune</h3>
+
+<table>
+  <caption>What each adaptation technique solves and what it does not.</caption>
+  <thead><tr><th>Technique</th><th>Solves</th><th>Does not solve</th><th>Cost / effort</th></tr></thead>
+  <tbody>
+    <tr><td>Prompting</td><td>Task specification, format, tone</td><td>Missing knowledge; capability limits</td><td>Lowest; minutes to change</td></tr>
+    <tr><td>RAG</td><td>Private or fresh knowledge; citations</td><td>Reasoning skill; style; retrieval misses</td><td>Medium; index and pipelines</td></tr>
+    <tr><td>Tools</td><td>Exact computation, live data, actions</td><td>Choosing the right tool reliably</td><td>Medium; security surface</td></tr>
+    <tr><td>Fine-tuning</td><td>Consistent format/style, narrow skills, smaller cheaper models</td><td>Fresh knowledge; hallucination in general</td><td>High; data, training, re-evaluation</td></tr>
+    <tr><td>Routing</td><td>Cost and latency across mixed workloads</td><td>Quality ceiling of the best model</td><td>Medium; needs eval data</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Default Order</span>
+  <ul>
+    <li>Decide build versus buy with cost and residency constraints, then adapt: prompt → add retrieval or tools → route → fine-tune. Move to the next adaptation step only when the evaluation set shows the current step has plateaued.</li>
+  </ul>
+</aside>
+
+<h3>Defining Success</h3>
+
+<ul>
+  <li><strong>Task metric</strong>: accuracy, exact match, task completion, pass rate.</li>
+  <li><strong>Quality metric</strong>: faithfulness, helpfulness rubric, human preference.</li>
+  <li><strong>Operational</strong>: p50/p95 latency, time to first token, availability.</li>
+  <li><strong>Cost</strong>: dollars per request and per successful task. A cheap model that fails often is expensive per success.</li>
+  <li><strong>Safety</strong>: policy violation rate, PII leakage, unauthorised actions.</li>
+  <li><strong>Business</strong>: deflection rate, time saved, conversion. This is what the product is for.</li>
+</ul>
+
+<h3>Implementation: Comparing Against a Baseline Properly</h3>
+
+<p>Two systems evaluated on the same 200 examples. The question is not "which number is higher" but
+"is the difference larger than the noise from our limited sample?". The bootstrap resamples the
+evaluation set to estimate that noise.</p>
+
+<figure class="listing">
+<figcaption>Confidence intervals and a paired bootstrap test for comparing two systems.</figcaption>
+<pre><code>import numpy as np
+
+
+def bootstrap_ci(scores: np.ndarray, n_resamples: int = 10_000, alpha: float = 0.05,
+                 seed: int = 0) -&gt; tuple[float, float, float]:
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(scores), size=(n_resamples, len(scores)))
+    means = scores[idx].mean(axis=1)
+    lo, hi = np.quantile(means, [alpha / 2, 1 - alpha / 2])
+    return float(scores.mean()), float(lo), float(hi)
+
+
+def paired_bootstrap_p(a: np.ndarray, b: np.ndarray, n_resamples: int = 10_000,
+                       seed: int = 0) -&gt; float:
+    """P(system B is not better than A) under resampling of the same examples."""
+    rng = np.random.default_rng(seed)
+    diff = b - a
+    idx = rng.integers(0, len(diff), size=(n_resamples, len(diff)))
+    return float((diff[idx].mean(axis=1) &lt;= 0).mean())
+
+
+rng = np.random.default_rng(42)
+n = 200  # golden-set size
+baseline = (rng.random(n) &lt; 0.70).astype(float)  # rules baseline: ~70% correct
+candidate = np.where(rng.random(n) &lt; 0.35, 1.0, baseline)  # fixes ~35% of failures
+for name, s in [("baseline", baseline), ("candidate", candidate)]:
+    m, lo, hi = bootstrap_ci(s)
+    print(f"{name:9} accuracy {m:.3f}  95% CI [{lo:.3f}, {hi:.3f}]")
+print(f"p(candidate not better) = {paired_bootstrap_p(baseline, candidate):.4f}")</code></pre>
+</figure>
+
+<pre class="output">baseline  accuracy 0.710  95% CI [0.645, 0.770]
+candidate accuracy 0.815  95% CI [0.760, 0.870]
+p(candidate not better) = 0.0000</pre>
+
+<ul>
+  <li>The two confidence intervals <strong>overlap</strong>, yet the paired test is decisive. Pairing removes per-example difficulty, which is the dominant source of variance. Always compare systems on the <em>same</em> examples with a paired test.</li>
+  <li>With 200 examples, a 95% interval is about ±6 points wide. To detect a 2-point improvement you need thousands of examples, or a paired design (Volume 10).</li>
+  <li>The candidate is 10 points better, but still 13 points short of a 95% business target. The decision is "rescope or keep human review", not "ship".</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>A small, carefully labelled evaluation set is worth more than a large noisy one, but it has wide confidence intervals. Grow it continuously from production failures.</li>
+  </ul>
+</aside>
+
+<ul class="failure-modes">
+  <li>Demo-driven development: five impressive examples, no evaluation set.</li>
+  <li>Measuring model quality but not cost per successful task.</li>
+  <li>Evaluating on synthetic examples that do not resemble real traffic.</li>
+  <li>No human fallback for the error rate that remains.</li>
+</ul>
+
+<div class="frame exercise"><p>Pick a real task from your work. Write the problem frame (user, task, success metric,
+target, cost ceiling, worst-case failure). Build a deterministic baseline in under two hours and
+label 50 examples. You now have the start of every AI project in this book.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="system-anatomy">Anatomy of a Production AI System</h2>
+<p class="chapter-lede">The model is typically a small part of the code in a production AI system.
+This chapter presents the reference architecture used throughout the book, first as a high-level
+design (HLD), then as a low-level design (LLD) with runnable code.</p>
+
+<h3>Simple Version Versus Production Version</h3>
+
+<div class="frame simple">
+  <pre><code class="language-python">answer = client.chat(model="some-model", messages=[{"role": "user", "content": question}])</code></pre>
+  <p>One call to a model API. Correct for a prototype.</p>
+</div>
+
+<div class="frame production">
+  <p>The same question passes through authentication, rate limiting, input guardrails, context
+  assembly (conversation history, retrieved documents, tool definitions), a router, a model adapter
+  with retries and timeouts, tool execution, output guardrails, logging, tracing, cost accounting and
+  evaluation sampling.</p>
+</div>
+
+<div class="frame why-complex">
+  <ul>
+    <li><strong>Models fail</strong>: rate limits, timeouts and overloads are routine, not exceptional.</li>
+    <li><strong>Models are wrong</strong>: outputs need validation, and some need human approval.</li>
+    <li><strong>Models are attackable</strong>: every piece of text in the context is a potential instruction.</li>
+    <li><strong>Models are expensive</strong>: every token must be attributed, budgeted and optimised.</li>
+    <li><strong>Models are opaque</strong>: without traces you cannot debug why an answer was produced.</li>
+  </ul>
+</div>
+
+<h3>High-Level Design</h3>
+
+<figure class="diagram">
+  <div class="arch">
+    <div class="arch-layer" data-label="Edge">
+      <div class="node client">Web · Mobile · API clients</div>
+      <div class="node gateway">API Gateway<small>auth · quotas · rate limits</small></div>
+    </div>
+    <div class="arch-layer" data-label="Orchestration">
+      <div class="node guard">Input guardrails</div>
+      <div class="node service">Orchestrator<small>workflow or agent</small></div>
+      <div class="node service">Context builder</div>
+      <div class="node service">Router</div>
+      <div class="node guard">Output guardrails</div>
+    </div>
+    <div class="arch-layer" data-label="Capabilities">
+      <div class="node service">Retrieval service</div>
+      <div class="node service">Tool runtime</div>
+      <div class="node service">Memory service</div>
+    </div>
+    <div class="arch-layer" data-label="Models">
+      <div class="node model">Model adapters</div>
+      <div class="node gpu">Self-hosted serving<small>vLLM on GPUs</small></div>
+      <div class="node external">Hosted model APIs</div>
+    </div>
+    <div class="arch-layer" data-label="Data">
+      <div class="node store">Conversation store</div>
+      <div class="node store">Vector / search index</div>
+      <div class="node store">Cache</div>
+      <div class="node queue">Event stream</div>
+    </div>
+    <div class="arch-layer" data-label="Operations">
+      <div class="node obs">Tracing · metrics · logs</div>
+      <div class="node eval">Evaluation pipeline</div>
+      <div class="node obs">Cost ledger</div>
+    </div>
+  </div>
+  <figcaption>Reference HLD. Each box is taught in depth in a later volume.</figcaption>
+</figure>
+
+<table>
+  <caption>Component responsibilities and where they are taught.</caption>
+  <thead><tr><th>Component</th><th>Responsibility</th><th>Volume</th></tr></thead>
+  <tbody>
+    <tr><td>API Gateway</td><td>Identity, quotas, rate limiting, request IDs</td><td>12</td></tr>
+    <tr><td>Guardrails</td><td>Validate inputs, outputs and actions against policy</td><td>17</td></tr>
+    <tr><td>Orchestrator</td><td>Run the workflow or agent loop; manage state</td><td>15–16</td></tr>
+    <tr><td>Context builder</td><td>Select and order instructions, history, documents and tools within a token budget</td><td>13</td></tr>
+    <tr><td>Router</td><td>Choose a model by capability, cost, latency and confidence</td><td>18</td></tr>
+    <tr><td>Retrieval</td><td>Hybrid search, reranking, access control</td><td>14</td></tr>
+    <tr><td>Tool runtime</td><td>Validate and execute tool calls with permissions</td><td>16</td></tr>
+    <tr><td>Model adapters and serving</td><td>One interface over local and hosted models; batching, KV cache</td><td>11–12</td></tr>
+    <tr><td>Evaluation</td><td>Offline gates, online sampling, judges</td><td>10</td></tr>
+    <tr><td>Observability and cost</td><td>Traces, metrics, token and dollar attribution</td><td>22</td></tr>
+  </tbody>
+</table>
+
+<h3>Request Lifecycle</h3>
+
+<figure class="diagram">
+<pre class="mermaid">sequenceDiagram
+  participant U as User
+  participant G as Gateway
+  participant O as Orchestrator
+  participant R as Retrieval
+  participant M as Model adapter
+  participant T as Tool runtime
+  U->>G: request (auth token)
+  G->>O: request + tenant + request_id
+  O->>O: input guardrails
+  O->>R: search(query, tenant ACL)
+  R-->>O: top-k passages
+  O->>M: chat(context, tools)
+  M-->>O: tool call: get_order(42)
+  O->>T: execute (permission check)
+  T-->>O: result
+  O->>M: chat(context + result)
+  M-->>O: final answer
+  O->>O: output guardrails, log trace and cost
+  O-->>U: streamed answer</pre>
+<figcaption>One request through the reference architecture, with one tool call.</figcaption>
+</figure>
+
+<h3>Low-Level Design: The Model Boundary</h3>
+
+<p>The most important LLD decision is a single, narrow interface between your system and any model.
+Everything above it (routing, caching, retries, evaluation) works for local, open-weight and hosted
+models alike, and tests can substitute a deterministic fake. In Forge this lives as
+<code>forge.models</code>.</p>
+
+<figure class="listing">
+<figcaption><code>forge.models</code>: a vendor-neutral model interface with retries, backoff with jitter, and a response cache.</figcaption>
+<pre><code># forge/models.py — ChatModel protocol and resilience wrappers
+import hashlib
+import json
+import random
+import time
+from dataclasses import dataclass, field
+from typing import Protocol
+
+
+@dataclass(frozen=True)
+class ChatRequest:
+    messages: tuple[tuple[str, str], ...]  # (role, content) pairs
+    model: str
+    max_tokens: int = 512
+    temperature: float = 0.0
+
+
+@dataclass(frozen=True)
+class ChatResponse:
+    text: str
+    input_tokens: int
+    output_tokens: int
+    model: str
+
+
+class ChatModel(Protocol):
+    """The one interface every model adapter implements (local, open-weight or hosted)."""
+
+    def chat(self, request: ChatRequest, timeout_s: float) -&gt; ChatResponse: ...
+
+
+class TransientError(Exception):
+    """Retryable: rate limit (429), overload (503), timeout."""
+
+
+class ScriptedModel:
+    def __init__(self, outcomes: list):  # each outcome is a str reply or an Exception
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    def chat(self, request: ChatRequest, timeout_s: float) -&gt; ChatResponse:
+        self.calls += 1
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return ChatResponse(outcome, input_tokens=12, output_tokens=len(outcome.split()),
+                            model=request.model)
+
+
+@dataclass
+class ResilientClient:
+    """Wraps any ChatModel with retries, exponential backoff with jitter and a cache."""
+
+    model: ChatModel
+    max_attempts: int = 4
+    base_delay_s: float = 0.05
+    timeout_s: float = 30.0
+    cache: dict[str, ChatResponse] = field(default_factory=dict)
+
+    @staticmethod
+    def cache_key(req: ChatRequest) -&gt; str:
+        return hashlib.sha256(json.dumps(req.__dict__, sort_keys=True).encode()).hexdigest()
+
+    def chat(self, req: ChatRequest) -&gt; ChatResponse:
+        key = self.cache_key(req)
+        if req.temperature == 0.0 and key in self.cache:  # only cache deterministic calls
+            return self.cache[key]
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                resp = self.model.chat(req, timeout_s=self.timeout_s)
+                break
+            except TransientError:
+                if attempt == self.max_attempts:
+                    raise
+                delay = self.base_delay_s * 2 ** (attempt - 1)
+                time.sleep(delay * random.uniform(0.5, 1.5))  # jitter avoids retry storms
+        if req.temperature == 0.0:
+            self.cache[key] = resp
+        return resp
+
+
+model = ScriptedModel([TransientError("429"), TransientError("503"), "Paris."])
+client = ResilientClient(model)
+req = ChatRequest(messages=(("user", "Capital of France?"),), model="small")
+print(client.chat(req).text, "| upstream calls:", model.calls)
+print(client.chat(req).text, "| upstream calls:", model.calls, "(served from cache)")</code></pre>
+</figure>
+
+<pre class="output">Paris. | upstream calls: 3
+Paris. | upstream calls: 3 (served from cache)</pre>
+
+<p class="facet">Design decisions in this code</p>
+<ul>
+  <li><strong>Frozen request and response types</strong> are hashable and loggable, and they give you an exact record of what was sent.</li>
+  <li><strong>Only transient errors are retried.</strong> Retrying a 400 (bad request) or a content-policy refusal wastes money and time.</li>
+  <li><strong>Exponential backoff with jitter</strong> prevents thousands of clients retrying in lock-step after an outage.</li>
+  <li><strong>Only deterministic requests are cached.</strong> Caching a sampled answer would silently remove diversity the caller asked for.</li>
+  <li><strong>Token counts in the response</strong> feed cost accounting from day one.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">What Production Adds</span>
+  <ul>
+    <li>Idempotency keys for requests that trigger actions, so a retry never double-charges a customer.</li>
+    <li>An overall deadline across all attempts, not only a per-attempt timeout.</li>
+    <li>Circuit breakers and fallback models when a provider is down (Volume 18).</li>
+    <li>Streaming responses, and cancellation when the user disconnects (Volume 12).</li>
+  </ul>
+</aside>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>Cache keys must include the tenant and user permissions whenever the context contains private data. Otherwise one user's answer can be served to another.</li>
+  </ul>
+</aside>
+
+<h3>Systematic Improvement: Classify Before You Fix</h3>
+
+<p>When an output is wrong, "use a bigger model" is the most expensive and least informative fix.
+First classify the failure.</p>
+
+<figure class="diagram">
+<pre class="ascii">                     Poor Output
+                          |
+                          v
+                   Classify Failure
+                          |
+          +---------------+----------------+
+          |                                |
+          v                                v
+    Model Problem                    System Problem
+ (right context, wrong answer)   (answer impossible from context)
+          |                                |
+          v                                v
+   Training data                    Retrieval
+   Fine-tuning                      Prompt / instructions
+   Distillation                     Context selection
+   Architecture / size              Tools
+   Decoding settings                Routing
+          |                                |
+          +---------------+----------------+
+                          |
+                          v
+                 Evaluate on golden set
+                          |
+                          v
+                   Compare results
+            (paired test, cost, latency)</pre>
+<figcaption>The failure-classification loop used throughout the book.</figcaption>
+</figure>
+
+<table>
+  <caption>Diagnostic questions for classifying a failure.</caption>
+  <thead><tr><th>Question</th><th>If yes</th></tr></thead>
+  <tbody>
+    <tr><td>Was the information needed for the answer present in the context?</td><td>No → retrieval or context problem</td></tr>
+    <tr><td>Would a careful human give the right answer from this exact context?</td><td>No → instructions or context are ambiguous</td></tr>
+    <tr><td>Does a stronger model answer correctly with the same context?</td><td>Yes → capability problem: route, fine-tune or distil</td></tr>
+    <tr><td>Did the model call the wrong tool or wrong arguments?</td><td>Tool description, schema or examples problem</td></tr>
+    <tr><td>Is the answer right but in the wrong format?</td><td>Structured output or schema-validation problem</td></tr>
+  </tbody>
+</table>
+
+<div class="frame exercise"><p>Add a <code>deadline_s</code> to <code>ResilientClient</code> so that the sum of all
+attempts and back-off sleeps never exceeds it. Write a test with a <code>ScriptedModel</code> that fails
+five times, and assert that the call raises within the deadline.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="environment">Engineering Environment and the Forge Repository</h2>
+<p class="chapter-lede">AI code fails in ways ordinary code does not: results change between runs,
+bugs show up as slightly worse numbers rather than exceptions, and generated code looks right while
+being subtly wrong. This chapter sets the habits—and the Forge package layout—the rest of the book
+relies on.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A training change improves validation loss from 2.31 to 2.28. Is the change real, or noise from
+  a different random seed? The run cannot be repeated because the environment drifted: a library
+  upgraded and a data file was edited in place. Without reproducibility, every experiment result is
+  an anecdote.</p>
+</div>
+
+<h3>Project Layout: the Forge Repository</h3>
+
+<figure class="diagram">
+<pre class="ascii">project/
+  pyproject.toml        dependencies, tool config (ruff, pytest)
+  uv.lock               exact resolved versions  (commit this)
+  configs/              experiment configs (YAML/TOML), one file per run family
+  src/forge/            the continuous package (grows every volume)
+    core/               config, logging, seeding          &lt;- this chapter
+    compute/            FLOPs, memory, cost               &lt;- Chapter 4
+    models/             ChatModel protocol, ScriptedModel &lt;- Chapter 7
+  scripts/              thin entry points: train.py, eval.py, serve.py
+  tests/                unit tests (fast) + integration tests (marked slow)
+  data/                 never committed; referenced by hash in manifests
+  runs/                 outputs: logs, checkpoints, manifests (never committed)
+  AGENTS.md / CLAUDE.md instructions for AI coding assistants</pre>
+<figcaption>Forge layout. Chapter listings are self-contained; the integrated package lives under <code>src/forge/</code>.</figcaption>
+</figure>
+
+<ul>
+  <li><strong>Configuration is data</strong>: hyperparameters live in versioned config files, not in code edits.</li>
+  <li><strong>Scripts are thin</strong>: logic lives in the importable <code>forge</code> package, so tests can reach it.</li>
+  <li><strong>Lock files</strong>: <code>uv lock</code> (or pip-tools) pins every transitive dependency. Numerical results can change between library versions.</li>
+</ul>
+
+<h3>Seeds, Typed Config and Structured Logging (<code>forge.core</code>)</h3>
+
+<figure class="listing">
+<figcaption><code>forge.core</code>: typed experiment config, seeding, and an append-only structured log.</figcaption>
+<pre><code># forge/core.py — reproducibility primitives used by every later volume
+import json
+import os
+import random
+import time
+from dataclasses import asdict, dataclass, fields
+from pathlib import Path
+
+import numpy as np
+import torch
+
+
+@dataclass(frozen=True)
+class TrainConfig:
+    """Typed experiment config: load from a dict or YAML, never from scattered globals."""
+
+    lr: float = 3e-4
+    seed: int = 1234
+    epochs: int = 2
+    batch_size: int = 32
+
+    @classmethod
+    def from_mapping(cls, raw: dict) -&gt; "TrainConfig":
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in raw.items() if k in known})
+
+
+def seed_everything(seed: int, deterministic: bool = False) -&gt; None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)  # also seeds CUDA and MPS generators
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    if deterministic:  # slower; raises if an op has no deterministic kernel
+        torch.use_deterministic_algorithms(True)
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+
+class RunLogger:
+    """Append-only JSONL experiment log: one structured event per line."""
+
+    def __init__(self, path: Path, config: TrainConfig):
+        self.path = path
+        self.write({"event": "start", "config": asdict(config)})
+
+    def write(self, record: dict) -&gt; None:
+        record = {"t": round(time.time(), 3), **record}
+        with self.path.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+
+
+cfg = TrainConfig.from_mapping({"lr": 3e-4, "seed": 1234, "epochs": 2})
+seed_everything(cfg.seed)
+a = torch.randn(3)
+seed_everything(cfg.seed)
+b = torch.randn(3)
+print("same seed, same tensor:", torch.equal(a, b))
+log = RunLogger(Path("run.jsonl"), cfg)
+for step in range(3):
+    log.write({"event": "step", "step": step, "loss": round(2.0 / (step + 1), 3)})
+print(Path("run.jsonl").read_text().count("\n"), "log lines")</code></pre>
+</figure>
+
+<pre class="output">same seed, same tensor: True
+4 log lines</pre>
+
+<aside class="callout impl"><span class="title">Why Typed Config</span>
+  <ul>
+    <li>A plain <code>dict</code> silently accepts typos (<code>"lrr"</code>). A frozen dataclass rejects unknown fields at the boundary and documents every knob the run used.</li>
+    <li>Load YAML/TOML into a mapping, then <code>TrainConfig.from_mapping</code>. The file is versioned; the type is enforced in code.</li>
+  </ul>
+</aside>
+
+<aside class="callout warning"><span class="title">Limits of Determinism</span>
+  <ul>
+    <li>Seeds make runs repeatable on the <em>same</em> hardware, software and batch composition, not across GPU models or library versions.</li>
+    <li>Hosted model APIs are generally not bit-reproducible even at temperature 0.</li>
+    <li>The right response is statistical: run several seeds and report the mean and spread. A 0.03 improvement in loss is meaningless if the seed-to-seed spread is 0.05.</li>
+  </ul>
+</aside>
+
+<h3>Testing Stochastic Systems</h3>
+
+<table>
+  <caption>Testing techniques for AI code.</caption>
+  <thead><tr><th>Technique</th><th>Use it for</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr><td>Numerical tolerance</td><td>From-scratch maths against a reference</td><td><code>np.testing.assert_allclose(ours, torch_ref, atol=1e-6)</code></td></tr>
+    <tr><td>Invariants</td><td>Properties that must always hold</td><td>Probabilities sum to 1; masked attention weights are 0</td></tr>
+    <tr><td>Fakes</td><td>System logic around models</td><td><code>ScriptedModel</code> for retries, agents, routing</td></tr>
+    <tr><td>Golden files</td><td>Deterministic pipelines (tokenisers, templates)</td><td>Compare output to a stored, reviewed file</td></tr>
+    <tr><td>Overfit one batch</td><td>Training code correctness</td><td>Loss must approach 0 on a single repeated batch</td></tr>
+    <tr><td>Statistical tests</td><td>Sampling and model quality</td><td>Sampled frequencies match the softmax; paired bootstrap for evaluation</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Unit tests prove the <em>code</em> is correct. Evaluation proves the <em>system</em> is good. You need both, and they run at different cadences: tests on every commit, evaluations on every model, prompt or retrieval change.</li>
+  </ul>
+</aside>
+
+<h3>Experiment Tracking</h3>
+<ul>
+  <li><strong>Log</strong>: config, code revision, data hashes, environment, metrics per step, final evaluation and hardware.</li>
+  <li><strong>Start simple</strong>: the JSONL logger above is enough for a single engineer and is easy to diff and plot.</li>
+  <li><strong>Scale up</strong> to MLflow or Weights &amp; Biases once many people and runs are involved, for dashboards, comparison and artefact storage (Volume 23).</li>
+</ul>
+
+<h3>Hardware in Development</h3>
+<table>
+  <caption>Device selection in PyTorch.</caption>
+  <thead><tr><th>Device</th><th>When</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>cpu</code></td><td>Tests, from-scratch code, tiny models</td><td>Always available; deterministic</td></tr>
+    <tr><td><code>mps</code></td><td>Apple Silicon laptops</td><td>Good for small training; some ops unsupported or slower</td></tr>
+    <tr><td><code>cuda</code></td><td>NVIDIA GPUs</td><td>The production target; needed for FlashAttention, vLLM and multi-GPU work</td></tr>
+  </tbody>
+</table>
+
+<h3>AI-Assisted Development: First Principles</h3>
+
+<p>You will use AI coding assistants throughout this book. The goal is to become a <em>better</em>
+engineer with them, not to accept code you have not verified. Volume 23 covers this in depth; these
+are the rules from day one.</p>
+
+<figure class="diagram">
+<pre class="ascii">Specify         write the goal, constraints and acceptance tests first
+   |
+   v
+Provide context agent instructions file, relevant files, conventions
+   |
+   v
+Generate        let the assistant propose code
+   |
+   v
+Verify          run tests, lint, type-check; read every line you keep
+   |
+   v
+Review          correctness, security, dependencies, licences, performance
+   |
+   v
+Commit          only what you understand and could have written yourself</pre>
+<figcaption>The verification loop for AI-assisted development.</figcaption>
+</figure>
+
+<p class="facet">What an agent instructions file (AGENTS.md / CLAUDE.md) should contain</p>
+<ul>
+  <li>How to install, run, test and lint the project: exact commands.</li>
+  <li>Architecture overview and where things live.</li>
+  <li>Conventions: naming, typing, shape comments, error handling.</li>
+  <li>Hard rules: never commit secrets, never disable tests, never add dependencies without asking.</li>
+</ul>
+
+<aside class="callout security"><span class="title">Verify Generated Code</span>
+  <ul>
+    <li><strong>Dependencies</strong>: assistants can suggest packages that do not exist. Attackers register such names ("slopsquatting"). Check every new dependency on the package index before installing it.</li>
+    <li><strong>Numerics</strong>: a plausible-looking attention function with a wrong transpose still runs. Only a reference comparison test catches it.</li>
+    <li><strong>Security</strong>: check for injection, unsafe deserialisation (<code>pickle</code>, <code>torch.load</code> on untrusted files), hard-coded secrets and overly broad permissions.</li>
+  </ul>
+</aside>
+
+<ul class="failure-modes">
+  <li>Results that cannot be reproduced because data was edited in place.</li>
+  <li>Comparing two runs with different seeds and calling the difference an improvement.</li>
+  <li>Tests that call a live model API: slow, flaky, costly and non-deterministic.</li>
+  <li>Accepting generated code that passes the tests it wrote for itself.</li>
+</ul>
+
+<div class="frame exercise"><p>Train any small model (for example logistic regression on synthetic data) with five
+seeds. Report the mean and standard deviation of the final metric. Then change one hyperparameter and
+decide, with a paired comparison across seeds, whether the change is real.</p></div>
+</section>
+
+<!-- ================================================================ REVIEW -->
+<section class="review">
+<h1>Volume Review</h1>
+
+<h2>What You Learned</h2>
+<ul>
+  <li>Modern AI engineering adapts one foundation model and builds a system around it, instead of training one model per task.</li>
+  <li>Precise meanings of AI, ML, DL, generative AI, foundation model, LLM, SLM, multimodal model, workflow, agent, agentic system, framework, harness, orchestrator, tool runtime, guardrail, evaluation system and platform.</li>
+  <li>An LLM is a next-token probability distribution: tokens → embeddings → Transformer → logits → sampling, repeated autoregressively.</li>
+  <li>Training minimises cross-entropy; perplexity is exp(loss) and is comparable only with the same tokeniser.</li>
+  <li>Decoding controls (temperature, top-k, top-p) trade diversity against error rate.</li>
+  <li>Prefill is compute-bound; decode is memory-bandwidth-bound; batching is the main cost lever.</li>
+  <li>Estimation formulas: parameters, 2N/6N FLOPs, 16 bytes per parameter for Adam training, KV cache per token, the roofline and cost per million tokens.</li>
+  <li>The model lifecycle is a loop that needs versioned artefacts; the product lifecycle starts from a problem frame, a baseline and an evaluation set.</li>
+  <li>Build versus buy (hosted vs self-host) is separate from how you adapt (prompt, RAG, tools, fine-tune, route).</li>
+  <li>Failures must be classified as model problems or system problems before they are fixed.</li>
+  <li>Forge starts here: <code>forge.compute</code>, <code>forge.core</code> and <code>forge.models</code> seed the continuous package.</li>
+</ul>
+
+<h2>What You Built</h2>
+<ul>
+  <li>A real-model logit inspector (SmolLM2-135M).</li>
+  <li>A from-scratch sampler with temperature, top-k and top-p.</li>
+  <li><code>forge.compute</code>: capacity and cost calculator validated against Llama 3 8B (8.03B parameters).</li>
+  <li>A workflow and an agent over a deterministic fake model.</li>
+  <li>An artefact manifest with dataset content hashes.</li>
+  <li>A bootstrap confidence-interval and paired-comparison evaluator.</li>
+  <li><code>forge.models</code>: vendor-neutral <code>ChatModel</code> with retries, jittered backoff and caching.</li>
+  <li><code>forge.core</code>: typed <code>TrainConfig</code>, seeding utilities and an append-only experiment logger.</li>
+</ul>
+
+<h2>Important Code</h2>
+<table>
+  <caption>Listings to keep; later volumes extend them inside <code>src/forge/</code>.</caption>
+  <thead><tr><th>Listing</th><th>Forge module</th><th>Concept</th><th>Extended in</th></tr></thead>
+  <tbody>
+    <tr><td><code>sample_next</code></td><td><code>forge.generate</code> (later)</td><td>Decoding strategies</td><td>Volume 4, Volume 11</td></tr>
+    <tr><td><code>param_count</code>, <code>kv_cache_bytes_per_token</code></td><td><code>forge.compute</code></td><td>Capacity planning</td><td>Volumes 6, 7, 11</td></tr>
+    <tr><td><code>ChatModel</code>, <code>ResilientClient</code></td><td><code>forge.models</code></td><td>Model boundary, reliability</td><td>Volumes 12, 18</td></tr>
+    <tr><td><code>run_agent</code></td><td><code>forge.agents</code> (later)</td><td>Agent loop</td><td>Volumes 15, 16</td></tr>
+    <tr><td><code>bootstrap_ci</code>, <code>paired_bootstrap_p</code></td><td><code>forge.eval</code> (later)</td><td>Evaluation statistics</td><td>Volume 10</td></tr>
+    <tr><td><code>TrainConfig</code>, <code>seed_everything</code>, <code>RunLogger</code></td><td><code>forge.core</code></td><td>Reproducibility</td><td>Volumes 4, 12</td></tr>
+    <tr><td><code>ArtefactManifest</code></td><td><code>forge.core</code></td><td>Lineage</td><td>Volumes 4, 12</td></tr>
+  </tbody>
+</table>
+
+<h2>Important Architecture</h2>
+<figure class="diagram">
+<pre class="ascii">User -> Gateway -> Input guardrails -> Orchestrator (workflow | agent)
+                                            |
+               +----------------------------+------------------------+
+               |                            |                        |
+               v                            v                        v
+        Context builder               Tool runtime              Retrieval
+               |                            |                        |
+               +----------------------------+------------------------+
+                                            |
+                                            v
+                               Router -> Model adapters -> Models
+                                            |
+                                            v
+                                   Output guardrails -> User
+                                            |
+                                            v
+                        Traces · metrics · cost ledger · evaluation</pre>
+<figcaption>The reference architecture that Volumes 10–24 implement piece by piece.</figcaption>
+</figure>
+
+<h2>Failure Modes</h2>
+<ul class="failure-modes">
+  <li>Treating the model as a database, a calculator or a security boundary.</li>
+  <li>Choosing a model from public benchmarks instead of your own evaluation set.</li>
+  <li>Building an agent where a workflow would do.</li>
+  <li>Ignoring the KV cache when sizing hardware; ignoring utilisation when estimating cost.</li>
+  <li>Unpinned model versions, overwritten checkpoints, unversioned prompts.</li>
+  <li>Comparing systems without paired tests or confidence intervals.</li>
+  <li>Fixing system failures by upgrading the model.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<ul>
+  <li>Define success before building: task, quality, latency, cost, safety and business metrics.</li>
+  <li>Start with a deterministic baseline and 50–500 labelled real examples.</li>
+  <li>Report confidence intervals; compare systems with paired tests on identical examples.</li>
+  <li>Measure cost per <em>successful</em> task, not cost per request.</li>
+  <li>Grow the evaluation set continuously from production failures.</li>
+</ul>
+
+<h2>Practical Project</h2>
+<div class="frame exercise" data-title="Capacity planner and decision memo">
+  <p>Choose a real feature, for example "answer questions over our internal documentation" with 2,000
+  daily users. Deliver:</p>
+  <ol>
+    <li>A problem frame with success metrics and targets.</li>
+    <li>Capacity estimates with the calculator for two candidate open-weight models: memory, concurrency, tokens per second.</li>
+    <li>A cost comparison of self-hosting versus a hosted API at your expected token volume, with every assumption stated.</li>
+    <li>An HLD diagram marking which components you need on day one and which can wait.</li>
+    <li>An evaluation plan: dataset, metrics, baseline, and the paired test you will use.</li>
+  </ol>
+</div>
+
+<h2>Exercises</h2>
+<ol>
+  <li>Prove that softmax is invariant to adding a constant to all logits, and explain why implementations subtract the maximum.</li>
+  <li>Show that <span class="math">\tau \to 0</span> recovers greedy decoding and <span class="math">\tau \to \infty</span> gives a uniform distribution.</li>
+  <li>Derive the KV-cache size for MHA versus GQA with 8 KV heads for the Llama 3 8B shape. What concurrency does GQA buy on an 80 GB GPU at 8k tokens?</li>
+  <li>Compute the arithmetic intensity of batched decode at batch sizes 1, 16 and 256. At which batch size does an H100 become compute-bound, ignoring KV-cache reads?</li>
+  <li>Decide build versus buy for a documentation Q&amp;A feature at 2,000 daily users. State residency, cost and ops constraints that flip the choice.</li>
+  <li>Extend <code>ResilientClient</code> with a circuit breaker that stops calling a model after 5 consecutive failures for 30 seconds.</li>
+  <li>Using <code>paired_bootstrap_p</code>, find the smallest evaluation-set size at which a true 3-point improvement is detected 80% of the time.</li>
+</ol>
+
+<h2>Research Papers</h2>
+<table>
+  <caption>Papers referenced in this volume.</caption>
+  <thead><tr><th>Paper</th><th>Why it matters here</th></tr></thead>
+  <tbody>
+    <tr><td>Vaswani et al., 2017. <em>Attention Is All You Need</em>. arXiv:1706.03762</td><td>The architecture behind every model in this book (Volume 2).</td></tr>
+    <tr><td>Brown et al., 2020. <em>Language Models are Few-Shot Learners</em>. arXiv:2005.14165</td><td>Tasks specified in the prompt; the start of the prompting paradigm.</td></tr>
+    <tr><td>Kaplan et al., 2020. <em>Scaling Laws for Neural Language Models</em>. arXiv:2001.08361</td><td>Loss improves predictably with scale; motivates the 6ND arithmetic.</td></tr>
+    <tr><td>Hoffmann et al., 2022. <em>Training Compute-Optimal Large Language Models</em>. arXiv:2203.15556</td><td>Chinchilla: balance parameters and tokens (Volume 6).</td></tr>
+    <tr><td>Bommasani et al., 2021. <em>On the Opportunities and Risks of Foundation Models</em>. arXiv:2108.07258</td><td>Defines "foundation model".</td></tr>
+    <tr><td>Ouyang et al., 2022. <em>Training Language Models to Follow Instructions with Human Feedback</em>. arXiv:2203.02155</td><td>InstructGPT: why base models are not assistants (Volume 8).</td></tr>
+    <tr><td>Wei et al., 2022. <em>Emergent Abilities of Large Language Models</em>. arXiv:2206.07682</td><td>Claims of abrupt capability gains with scale.</td></tr>
+    <tr><td>Schaeffer et al., 2023. <em>Are Emergent Abilities of Large Language Models a Mirage?</em> arXiv:2304.15004</td><td>Shows metric choice can create apparent emergence.</td></tr>
+    <tr><td>Holtzman et al., 2019. <em>The Curious Case of Neural Text Degeneration</em>. arXiv:1904.09751</td><td>Nucleus (top-p) sampling.</td></tr>
+    <tr><td>Rajbhandari et al., 2019. <em>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</em>. arXiv:1910.02054</td><td>The 16-bytes-per-parameter accounting.</td></tr>
+    <tr><td>Williams, Waterman &amp; Patterson, 2009. <em>Roofline: An Insightful Visual Performance Model</em>. CACM 52(4)</td><td>Compute-bound versus memory-bound reasoning.</td></tr>
+    <tr><td>Sculley et al., 2015. <em>Hidden Technical Debt in Machine Learning Systems</em>. NeurIPS</td><td>The model is a small part of the system.</td></tr>
+    <tr><td>Sutton, 2019. <em>The Bitter Lesson</em>. incompleteideas.net</td><td>General methods that leverage computation beat hand-crafted specialisation at scale.</td></tr>
+    <tr><td>Mitchell et al., 2019. <em>Model Cards for Model Reporting</em>. arXiv:1810.03993</td><td>Model documentation standard.</td></tr>
+    <tr><td>Gebru et al., 2018. <em>Datasheets for Datasets</em>. arXiv:1803.09010</td><td>Dataset documentation standard.</td></tr>
+  </tbody>
+</table>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">On the Opportunities and Risks of Foundation Models</span>
+    <span class="paper-meta">Bommasani et al., 2021 · arXiv:2108.07258 · Stanford CRFM</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Homogeneous large models were emerging as a new unit of AI, without a shared vocabulary or risk analysis.</dd>
+    <dt>Previous limitation</dt><dd>Task-specific models and transfer-learning surveys did not capture the systemic effects of one model adapted many ways.</dd>
+    <dt>Approach</dt><dd>Define "foundation model", survey capabilities, adaptation modes, and societal risks across modalities.</dd>
+    <dt>Contribution</dt><dd>The term and framing used throughout this book: one pretrained model, many downstream systems.</dd>
+    <dt>Practical impact</dt><dd>Shaped how labs and products talk about general models, adaptation and shared infrastructure.</dd>
+    <dt>Limitations</dt><dd>Report, not a method paper; predictions about emergence and homogenisation needed later empirical checks.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Language Models are Few-Shot Learners</span>
+    <span class="paper-meta">Brown et al., 2020 · NeurIPS · arXiv:2005.14165</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Fine-tuning for every task needs labelled data and a separate training run.</dd>
+    <dt>Previous limitation</dt><dd>Pretrained LMs still required task-specific training heads or fine-tuning for usable performance.</dd>
+    <dt>Approach</dt><dd>Scale a decoder-only LM (GPT-3) and specify tasks in the prompt with zero-, one- or few-shot examples.</dd>
+    <dt>Contribution</dt><dd>In-context learning as an engineering interface: change behaviour without changing weights.</dd>
+    <dt>Practical impact</dt><dd>Prompting, evaluation sets and API-first products became the default prototype path.</dd>
+    <dt>Limitations</dt><dd>Prompt sensitivity; contamination risk; cost; base models are not instruction-following until post-training.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Hidden Technical Debt in Machine Learning Systems</span>
+    <span class="paper-meta">Sculley et al., 2015 · NeurIPS</span></div>
+  <dl>
+    <dt>Problem</dt><dd>ML systems were easy to build but expensive to maintain.</dd>
+    <dt>Previous limitation</dt><dd>Software engineering debt concepts ignored data dependencies, feedback loops and configuration.</dd>
+    <dt>Approach</dt><dd>Catalogue ML-specific debt: entanglement, hidden feedback loops, undeclared consumers, data dependencies, glue code, configuration debt.</dd>
+    <dt>Contribution</dt><dd>The widely reproduced diagram showing ML code as a small box inside a large system.</dd>
+    <dt>Practical impact</dt><dd>Shaped MLOps. For LLM systems, prompts, retrieval indexes and tool definitions are the new sources of hidden debt.</dd>
+    <dt>Limitations</dt><dd>Qualitative; predates foundation models, so it does not cover upstream model drift.</dd>
+  </dl>
+</section>
+
+<h2>Interview Questions</h2>
+<ol class="questions">
+  <li>Why is LLM decode memory-bandwidth-bound, and what does batching change? Quantify with the roofline.</li>
+  <li>Estimate the GPU memory needed to serve an 8B model to 50 concurrent users with 8k-token contexts. What dominates?</li>
+  <li>Why can you not compare perplexity between two models with different tokenisers? What would you use instead?</li>
+  <li>Explain the difference between an AI workflow, an AI agent and an agent harness. When would you refuse to build an agent?</li>
+  <li>Explain the difference between build, buy and adapt for a support bot. When would you refuse to self-host?</li>
+  <li>A new model scores 3 points higher on your 300-example evaluation set. How do you decide whether to ship it?</li>
+  <li>Why does full fine-tuning of an 8B model not fit on one 80 GB GPU with Adam? List three ways to make it fit.</li>
+  <li>Your RAG assistant gives a wrong answer. Walk through how you decide whether it is a model problem or a system problem.</li>
+  <li>Which errors should a model client retry, and why must retries use jitter and idempotency keys?</li>
+  <li>Why does temperature 0 on a hosted API not guarantee identical outputs?</li>
+  <li>The estimate 6ND gave 0.5M GPU-hours but the published figure is 1.3M. Explain the gap.</li>
+</ol>
+
+<h2>Next Volume</h2>
+<p>Volume 2 opens the black box from Chapter 3. You will implement a Transformer from scratch in NumPy:
+Q/K/V projections, scaled dot-product attention, causal masking, multi-head attention, RoPE, RMSNorm,
+SwiGLU, residual connections and the full block. You will verify it against PyTorch, then train a tiny
+model end to end.</p>
+<p class="facet">Prerequisites from this volume</p>
+<ul>
+  <li>The next-token objective, cross-entropy and perplexity (Chapter 3).</li>
+  <li>Parameter and FLOP counting (Chapter 4). You will check your implementation against these formulas.</li>
+  <li>Testing against a numerical reference with tolerances (Chapter 8).</li>
+</ul>
+</section>
+
+</body>
+</html>

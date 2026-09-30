@@ -1,0 +1,2050 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 27 · Forward Deployed AI Engineering</title>
+<meta name="volume" content="Volume 27 · Forward Deployed AI Engineering">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 27</p>
+  <h1 class="no-toc">Forward Deployed AI Engineering</h1>
+  <p class="tp-subtitle">Discovery, PoC, Pilot and Customer Delivery</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Train Forward Deployed / customer engineers to turn platform capabilities into
+  <em>measured</em> customer outcomes: discovery, constrained PoCs, production pilots,
+  integration into customer environments, success metrics, risk and handoff.</li>
+  <li>Separate demos from deployments. A slide-winning vertical slice is not a pilot; a
+  pilot without exit criteria is not a product engagement.</li>
+  <li>Ship <code>forge.fde</code>: engagement brief schema and validator, PoC checklist and
+  scorecard, synthetic customer corpus generator, pilot SLO dashboard stub, handoff packet
+  builder, and connector contract tests against fakes.</li>
+  <li>Wire narratively to <code>forge.rag</code>, <code>forge.guard</code>,
+  <code>forge.router</code>, <code>forge.eval</code> and the Volume 24 <code>platform/</code>
+  — composition of prior packages, not a parallel stack.</li>
+  <li>Label every productivity or case claim as
+  <span class="evidence documented">Documented</span> or
+  <span class="evidence inferred">Inferred</span>. Customer decks inherit the same discipline
+  as Volume 21 case studies.</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>Volumes 10 and 14–18: evaluation gates, RAG with ACLs, agents, harness, guardrails and
+  routing.</li>
+  <li>Volumes 21–24: product architecture, ops, tooling and the integrated platform.</li>
+  <li>Volume 26 (if present in your build): coding-agent workflows that FDEs also use on
+  customer keyboards — tools are not substitutes for engagement contracts.</li>
+</ul>
+
+<p class="facet">How to read the code</p>
+<ul>
+  <li>Every listing was executed with Python 3.12. Printed output is real and unedited for
+  the stubs shown.</li>
+  <li>Listings seed <code>forge.fde</code>. They import Forge contracts where those packages
+  exist; demos here use in-process fakes so the volume runs without customer APIs or
+  hosted models.</li>
+  <li>The practical project is a fictional enterprise support engagement: brief → PoC →
+  scored pilot plan on the Forge platform, with golden-set eval, guardrails, cost cap and a
+  handoff packet.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Package layout</span>
+  <ul>
+    <li><code>forge.fde.brief</code> — engagement brief schema and validator.</li>
+    <li><code>forge.fde.poc</code> — PoC checklist, exit criteria, kill criteria.</li>
+    <li><code>forge.fde.scorecard</code> — engagement and PoC scorecards.</li>
+    <li><code>forge.fde.corpus</code> — synthetic customer corpus generator.</li>
+    <li><code>forge.fde.pilot</code> — pilot SLO definitions and dashboard stub.</li>
+    <li><code>forge.fde.handoff</code> — handoff packet builder.</li>
+    <li><code>forge.fde.connectors</code> — connector contracts and fake tests.</li>
+  </ul>
+</aside>
+
+<p class="facet">British English note</p>
+<ul>
+  <li>This volume uses <em>behaviour</em>, <em>defence</em>, <em>normalise</em>,
+  <em>organised</em> and <em>programme</em> in prose; code identifiers stay ASCII
+  (<code>normalize_key</code>, <code>program_id</code> only when an API requires it —
+  prefer <code>engagement_id</code>).</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1   What an FDE is          role boundaries; engagement lifecycle
+Chapter 2   Discovery               JTBD, owners, data reality; engagement brief
+Chapter 3   Scoping &amp; ADRs          build/buy/configure; PoC exit &amp; kill criteria
+Chapter 4   Environment reality     VPC, SSO, secrets, samples; security checklist
+Chapter 5   PoC engineering         thin slices on Forge; fakes; demo hygiene
+Chapter 6   Eval with customer      co-owned golden sets; offline gates; humans
+Chapter 7   Pilot design            SLOs, traffic, shadow/canary; escalation
+Chapter 8   Integration patterns    ACL RAG, tools, router caps, guard→policy
+Chapter 9   Change management       champions, runbooks; Documented vs Inferred
+Chapter 10  Handoff                 runbooks, on-call, cost, change control
+Chapter 11  Failure modes           demo-driven development and cousins (frank)
+Chapter 12  Retrospective           scorecards; assets back into Forge / platform</pre>
+<figcaption>Map of Volume 27. Discovery contracts first; platform composition second; honest
+failure modes before the retrospective closes the series arc.</figcaption>
+</figure>
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="what-fde-is">What an FDE Is</h2>
+<p class="chapter-lede">A Forward Deployed Engineer sits between a platform and a paying
+customer. The job is not "write more demos". It is to turn platform capabilities into
+measured outcomes under customer constraints — then leave an operable system behind.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Product engineering ships a platform. Sales promises "AI for support in six weeks".
+  Support leadership wants ticket deflection. Security wants no data leaving the VPC.
+  Nobody owns the engagement brief. Three months later there is a dazzling demo, no golden
+  set, no SLO, and an angry renewals call. The missing role was not another model specialist
+  — it was an FDE with contracts.</p>
+</div>
+
+<p class="facet">Possible approaches</p>
+<ul>
+  <li><strong>Solutions consulting only.</strong> Slide decks and reference architectures.
+  Fast relationship; weak implementation truth.</li>
+  <li><strong>Product engineering on-site.</strong> Builds features the roadmap already
+  planned. Under-weights customer-specific constraints and kill criteria.</li>
+  <li><strong>FDE with an engagement lifecycle.</strong> Discovery → brief → PoC → pilot →
+  handoff, each with explicit exit and kill criteria. This volume's default.</li>
+</ul>
+
+<h3>Role Boundaries</h3>
+
+<table>
+  <caption>Who owns what. Overlap is inevitable; ambiguity is optional.</caption>
+  <thead><tr><th>Role</th><th>Owns</th><th>Does not own</th></tr></thead>
+  <tbody>
+    <tr><td>FDE</td><td>Engagement brief, PoC truth, pilot gates, handoff packet</td><td>Long-term product roadmap</td></tr>
+    <tr><td>Product engineering</td><td>Platform packages, multi-tenant invariants</td><td>Customer-specific one-offs without ADR</td></tr>
+    <tr><td>Solutions / SE</td><td>Discovery facilitation, commercial narrative</td><td>Unsigned production changes</td></tr>
+    <tr><td>Support / CSM</td><td>Relationship, escalation paths, training champions</td><td>Model or prompt change control</td></tr>
+    <tr><td>Customer IT / Sec</td><td>VPC, SSO, data classification, change windows</td><td>Your eval methodology</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>FDE success is a customer metric moving under agreed constraints — not lines of
+    demo code or model brand names.</li>
+    <li>If product engineering cannot inherit the system in a handoff packet, you built a
+    hostage, not a deployment.</li>
+  </ul>
+</aside>
+
+<h3>Engagement Lifecycle</h3>
+
+<figure class="diagram">
+<pre class="ascii">Discover  →  Brief  →  Scope/ADR  →  PoC  →  Eval  →  Pilot  →  Integrate  →  Handoff
+   |           |           |          |       |        |          |            |
+ kill early  validate   exit/kill   thin    golden   SLOs     ACL/tools    scorecard
+ if no JTBD  schema     criteria    slice   co-own   shadow   cost caps    assets back</pre>
+<figcaption>Lifecycle used throughout this volume. Each arrow is a decision, not a
+ceremony.</figcaption>
+</figure>
+
+<p>Volumes 21 and 24 already teach product architecture and the integrated platform. This
+volume teaches the <em>customer-facing control loop</em> that sits on top: who decides, what
+evidence counts, when to stop.</p>
+
+<h3>What Good Looks Like Week by Week</h3>
+
+<table>
+  <caption>Illustrative 6-week support engagement (adjust to the brief's
+  <code>poc_window_days</code>).</caption>
+  <thead><tr><th>Week</th><th>FDE focus</th><th>Customer focus</th><th>Artefact</th></tr></thead>
+  <tbody>
+    <tr><td>0–1</td><td>Discovery; constraint interviews</td><td>Name decision owner</td><td>Draft brief</td></tr>
+    <tr><td>1–2</td><td>Validate brief; ADR stubs</td><td>SSO + sample path</td><td>Signed brief v1</td></tr>
+    <tr><td>2–3</td><td>Thin PoC slice + fakes</td><td>Label seed golden cases</td><td>Reproducibility pack</td></tr>
+    <tr><td>3–4</td><td>Offline gates; ACL probes</td><td>Co-own rubric</td><td>Eval report</td></tr>
+    <tr><td>4–5</td><td>Pilot design; SLO dash</td><td>Champion rota</td><td>Go / kill decision</td></tr>
+    <tr><td>5–6</td><td>Handoff packet; scorecard</td><td>On-call accept</td><td>Assets → platform</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Timeboxes without artefacts are theatre. Each week ends with a file in
+    <code>engagements/&lt;id&gt;/</code>, not a verbal "we're aligned".</li>
+    <li>If week 2 still lacks a decision owner, invoke kill criteria rather than "give it
+    another sprint".</li>
+  </ul>
+</aside>
+
+<p class="facet">Anti-patterns this volume refuses</p>
+<ul>
+  <li>FDE as unpaid product manager for unbounded custom work.</li>
+  <li>FDE as travelling prompt engineer with no eval ownership.</li>
+  <li>FDE as the permanent on-call for a system product will not inherit.</li>
+</ul>
+
+<div class="frame exercise" data-title="Exercise · Role map">
+  <p>For a fictional bank support pilot, write one sentence each for FDE, product
+  engineering, customer security and support leadership: what they own at week 0 and what
+  they own at handoff. Flag any ownership that disappears mid-engagement.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="discovery">Discovery and Problem Framing</h2>
+<p class="chapter-lede">Discovery is not a listening tour. It produces an engagement brief:
+jobs-to-be-done, decision owners, data reality and hard constraints that later chapters
+cannot invent.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A discovery workshop ends with sticky notes saying "AI assistant for agents". Latency
+  target: "fast". Data: "we'll get you a dump". SSO: "probably Okta". Six weeks later the
+  PoC dies on residency and missing ticket fields. Sticky notes are not a brief.</p>
+</div>
+
+<h3>Jobs-to-Be-Done and Decision Owners</h3>
+
+<ul>
+  <li><strong>Job.</strong> Who is trying to accomplish what, in what context, measured how?
+  "Deflect tier-1 password resets" is a job. "Add generative AI" is not.</li>
+  <li><strong>Decision owner.</strong> Name the person who can kill or extend the
+  engagement. If that person is "the AI committee", you do not have an owner.</li>
+  <li><strong>Anti-job.</strong> What must never happen (cross-tenant leak, unsupervised
+  refund, PII in prompts to a public API).</li>
+</ul>
+
+<h3>Data Reality and Hard Constraints</h3>
+
+<table>
+  <caption>Constraints that belong in the brief before any model name.</caption>
+  <thead><tr><th>Constraint</th><th>Question</th><th>Example gate</th></tr></thead>
+  <tbody>
+    <tr><td>Latency</td><td>TTFT / end-to-end for the primary journey?</td><td>p95 ≤ 4&nbsp;s agent assist</td></tr>
+    <tr><td>Residency</td><td>May tokens leave the region / VPC?</td><td>EU-only; no public API</td></tr>
+    <tr><td>SSO / identity</td><td>How do users and service accounts authenticate?</td><td>OIDC + SCIM; no local users</td></tr>
+    <tr><td>Data class</td><td>What may enter prompts, indexes, logs?</td><td>No card PAN; ticket body OK</td></tr>
+    <tr><td>Change window</td><td>When may you deploy?</td><td>Tue/Thu 02:00–04:00 UTC</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Write the brief so a stranger could continue the engagement. If only you understand
+    the constraints, the brief failed.</li>
+    <li>Missing data is a first-class finding. "Sample unavailable" is a valid discovery
+    outcome — and often a kill signal.</li>
+  </ul>
+</aside>
+
+<h3>Engagement Brief Schema</h3>
+
+<p>The brief is a versioned document validated by <code>forge.fde.brief</code>. Required
+fields below; optional fields are still typed so absences are explicit.</p>
+
+<figure class="listing">
+<figcaption><code>forge.fde.brief</code> — engagement brief schema and validator.</figcaption>
+<pre><code>from __future__ import annotations
+
+from dataclasses import dataclass, field, asdict
+from typing import Any
+
+
+REQUIRED = (
+    "engagement_id", "customer", "job_to_be_done", "decision_owner",
+    "success_metric", "must_never", "constraints", "data_reality",
+    "poc_window_days", "kill_criteria",
+)
+
+
+@dataclass
+class Constraints:
+    latency_p95_ms: int
+    residency: str
+    sso: str
+    data_classes_allowed: list[str]
+    vpc_required: bool = True
+
+
+@dataclass
+class DataReality:
+    sample_available: bool
+    sample_kind: str  # "production_redacted" | "synthetic" | "none"
+    known_gaps: list[str] = field(default_factory=list)
+
+
+@dataclass
+class EngagementBrief:
+    engagement_id: str
+    customer: str
+    job_to_be_done: str
+    decision_owner: str
+    success_metric: str
+    must_never: list[str]
+    constraints: Constraints
+    data_reality: DataReality
+    poc_window_days: int
+    kill_criteria: list[str]
+    sponsors: list[str] = field(default_factory=list)
+    notes: str = ""
+
+    def to_dict(self) -&gt; dict[str, Any]:
+        return asdict(self)
+
+
+class BriefValidationError(ValueError):
+    pass
+
+
+def validate_brief(raw: dict[str, Any]) -&gt; EngagementBrief:
+    missing = [k for k in REQUIRED if k not in raw or raw[k] in (None, "", [])]
+    if missing:
+        raise BriefValidationError(f"missing or empty: {missing}")
+    c = raw["constraints"]
+    d = raw["data_reality"]
+    if int(raw["poc_window_days"]) &lt; 5:
+        raise BriefValidationError("poc_window_days must be &gt;= 5")
+    if not d.get("sample_available") and d.get("sample_kind") != "synthetic":
+        raise BriefValidationError(
+            "no sample and sample_kind is not synthetic — cannot enter PoC"
+        )
+    brief = EngagementBrief(
+        engagement_id=str(raw["engagement_id"]),
+        customer=str(raw["customer"]),
+        job_to_be_done=str(raw["job_to_be_done"]),
+        decision_owner=str(raw["decision_owner"]),
+        success_metric=str(raw["success_metric"]),
+        must_never=list(raw["must_never"]),
+        constraints=Constraints(
+            latency_p95_ms=int(c["latency_p95_ms"]),
+            residency=str(c["residency"]),
+            sso=str(c["sso"]),
+            data_classes_allowed=list(c["data_classes_allowed"]),
+            vpc_required=bool(c.get("vpc_required", True)),
+        ),
+        data_reality=DataReality(
+            sample_available=bool(d["sample_available"]),
+            sample_kind=str(d["sample_kind"]),
+            known_gaps=list(d.get("known_gaps") or []),
+        ),
+        poc_window_days=int(raw["poc_window_days"]),
+        kill_criteria=list(raw["kill_criteria"]),
+        sponsors=list(raw.get("sponsors") or []),
+        notes=str(raw.get("notes") or ""),
+    )
+    return brief
+
+
+# --- demo ---
+demo = {
+    "engagement_id": "acme-support-2026q1",
+    "customer": "Acme Retail",
+    "job_to_be_done": "Deflect tier-1 'where is my order' tickets with grounded answers",
+    "decision_owner": "Priya Shah (VP Support)",
+    "success_metric": "≥ 25% deflection on in-scope intents with ≤ 2% harmful",
+    "must_never": ["cross-tenant retrieval", "refund without approval"],
+    "constraints": {
+        "latency_p95_ms": 4000,
+        "residency": "eu-west-1",
+        "sso": "oidc-okta",
+        "data_classes_allowed": ["ticket_body", "order_metadata"],
+        "vpc_required": True,
+    },
+    "data_reality": {
+        "sample_available": True,
+        "sample_kind": "production_redacted",
+        "known_gaps": ["no chat transcripts before 2025"],
+    },
+    "poc_window_days": 21,
+    "kill_criteria": [
+        "no golden set co-owner named by day 7",
+        "SSO not reachable in staging by day 14",
+    ],
+}
+b = validate_brief(demo)
+print(b.engagement_id, b.constraints.residency, len(b.kill_criteria))</code></pre>
+</figure>
+
+<pre class="output">acme-support-2026q1 eu-west-1 2</pre>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Reject empty <code>must_never</code> and empty <code>kill_criteria</code>. Optimism
+    is not a schema field.</li>
+    <li>Store the validated brief next to the repo as <code>engagements/&lt;id&gt;/brief.json</code>
+    and bump a <code>brief_version</code> when constraints change.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise" data-title="Exercise · Write a brief">
+  <p>Author a brief for an internal HR policy Q&amp;A bot. Include two kill criteria that
+  would have stopped a past failed project you know. Run it through
+  <code>validate_brief</code>.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="scoping-adrs">Scoping and ADRs for Customers</h2>
+<p class="chapter-lede">Scope is a decision about build versus buy versus configure, plus
+PoC exit criteria sharp enough to kill a bad engagement early. ADRs make those decisions
+survivable after the FDE leaves.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>The customer asks for "a full agent that can do everything Zendesk does". The FDE
+  agrees to explore. Eight weeks later the PoC still has no exit criteria, the golden set
+  is the FDE's laptop screenshots, and nobody can say whether the engagement succeeded.
+  Scope without kill criteria is infinite work with finite goodwill.</p>
+</div>
+
+<h3>Build versus Buy versus Configure</h3>
+
+<table>
+  <caption>Decision grid for customer engagements (illustrative).</caption>
+  <thead><tr><th>Option</th><th>When</th><th>FDE work</th><th>Risk</th></tr></thead>
+  <tbody>
+    <tr><td>Configure platform</td><td>Job fits Forge Platform 1.0 modes</td><td>Brief, ACL, eval, pilot</td><td>Low product debt</td></tr>
+    <tr><td>Buy connector / SaaS</td><td>Commodity integration exists</td><td>Contract + security review</td><td>Vendor lock / residency</td></tr>
+    <tr><td>Build thin custom</td><td>Unique workflow; reusable later</td><td>ADR + package PR</td><td>Becomes shadow product</td></tr>
+    <tr><td>Decline / kill</td><td>Constraints contradict physics or policy</td><td>Written kill with evidence</td><td>Short-term commercial pain</td></tr>
+  </tbody>
+</table>
+
+<h3>PoC Exit Criteria and Kill Criteria</h3>
+
+<ul>
+  <li><strong>Exit criteria</strong> (go to pilot): numbered, measurable, owned. Example:
+  offline helpful ≥ 80% on co-owned golden set <em>N</em>≥ 100; zero cross-tenant hits;
+  TTFT p95 under brief; cost ≤ budget line on scripted mix.</li>
+  <li><strong>Kill criteria</strong> (stop spending): missing decision owner, unreachable
+  SSO, no data sample and no synthetic plan, security theatre that blocks measurement,
+  scope that expands faster than exit criteria.</li>
+</ul>
+
+<figure class="listing">
+<figcaption><code>forge.fde.poc</code> — PoC checklist with exit and kill evaluation.</figcaption>
+<pre><code>from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class Check:
+    id: str
+    kind: str  # "exit" | "kill"
+    description: str
+    passed: bool | None = None  # None = not yet evaluated
+
+
+@dataclass
+class PocStatus:
+    ready_for_pilot: bool
+    should_kill: bool
+    pending: list[str]
+    failed_exit: list[str]
+    triggered_kill: list[str]
+
+
+DEFAULT_CHECKS = [
+    Check("E1", "exit", "Co-owned golden set N&gt;=100 labelled"),
+    Check("E2", "exit", "Offline helpful &gt;= 0.80 on golden set"),
+    Check("E3", "exit", "Zero cross-tenant hits in ACL suite"),
+    Check("E4", "exit", "Latency p95 within engagement brief"),
+    Check("E5", "exit", "Cost per successful task under budget line"),
+    Check("K1", "kill", "Decision owner unreachable &gt; 10 business days"),
+    Check("K2", "kill", "SSO / VPC path blocked with no waiver"),
+    Check("K3", "kill", "No sample and no approved synthetic plan"),
+    Check("K4", "kill", "Scope expanded without new exit criteria"),
+]
+
+
+def evaluate_poc(checks: list[Check]) -&gt; PocStatus:
+    pending = [c.id for c in checks if c.passed is None]
+    failed_exit = [c.id for c in checks if c.kind == "exit" and c.passed is False]
+    triggered_kill = [c.id for c in checks if c.kind == "kill" and c.passed is True]
+    # kill.passed True means the kill condition triggered
+    should_kill = bool(triggered_kill)
+    ready = (
+        not should_kill
+        and not pending
+        and not failed_exit
+        and all(c.passed for c in checks if c.kind == "exit")
+    )
+    return PocStatus(ready, should_kill, pending, failed_exit, triggered_kill)
+
+
+# --- demo: healthy PoC almost ready ---
+checks = [Check(c.id, c.kind, c.description) for c in DEFAULT_CHECKS]
+for c in checks:
+    if c.kind == "exit":
+        c.passed = True
+    else:
+        c.passed = False  # kill conditions not triggered
+checks[1].passed = None  # E2 still running
+print(evaluate_poc(checks))</code></pre>
+</figure>
+
+<pre class="output">PocStatus(ready_for_pilot=False, should_kill=False, pending=['E2'], failed_exit=[], triggered_kill=[])</pre>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>Exit criteria written only by the vendor are theatre. Require a customer co-signer
+    on the golden-set definition (Chapter 6).</li>
+    <li>"Executive loved the demo" is not an exit criterion. It is a sales note.</li>
+  </ul>
+</aside>
+
+<p class="facet">ADR stubs every customer engagement needs</p>
+<ul>
+  <li>Workflow versus agent for the first journey (Volume 21).</li>
+  <li>Data plane: customer VPC index versus vendor-hosted with residency tags.</li>
+  <li>Model plane: platform registry only; no laptop API keys in production paths.</li>
+  <li>Degraded mode when the frontier route or connector is down.</li>
+</ul>
+
+<h3>Writing the Kill Note</h3>
+
+<p>Killing early is a professional outcome. The note to the decision owner should include:
+what was attempted, which kill criterion triggered, evidence (dates, missing owners, failed
+gates), what assets remain usable, and an explicit recommendation (stop / defer /
+re-scope). Avoid blame language; preserve the relationship for a better-scoped return.</p>
+
+<figure class="diagram">
+<pre class="ascii">Scope workshop
+    │
+    ├─ fits platform configure? ── yes ──▶ PoC exit criteria drafted
+    │
+    ├─ needs buy? ── security + residency OK? ── yes ──▶ vendor ADR
+    │
+    ├─ needs build? ── reusable in forge/platform? ── yes ──▶ build ADR
+    │
+    └─ else ──▶ kill / defer with written note</pre>
+<figcaption>Build / buy / configure / kill — decide before the demo calendar fills.</figcaption>
+</figure>
+
+<div class="frame exercise" data-title="Exercise · Kill early">
+  <p>Invent a failing PoC where E2 fails and K4 triggers. Print
+  <code>evaluate_poc</code>. Draft the two-paragraph kill note you would send the decision
+  owner.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="environment-reality">Environment Reality</h2>
+<p class="chapter-lede">Customer VPCs, identity, networking, secrets and data samples are
+the terrain. Synthetic substitutes are honest when labelled; pretending a laptop tunnel is
+production is not.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>The PoC runs on an FDE laptop with a personal API key and a CSV emailed by a champion.
+  Security review starts the week before "go-live". Identity is a shared password. The
+  system that worked in the demo cannot be deployed without rewriting networking, secrets
+  and data handling — which is to say the PoC never tested the real environment.</p>
+</div>
+
+<h3>Customer VPC / SSO / Data Constraints Checklists</h3>
+
+<table>
+  <caption>VPC and networking checklist (complete before claiming "runs in customer cloud").</caption>
+  <thead><tr><th>Item</th><th>Pass condition</th><th>Owner</th></tr></thead>
+  <tbody>
+    <tr><td>Landing zone / account</td><td>Named account + region matching brief residency</td><td>Customer cloud</td></tr>
+    <tr><td>Private subnets</td><td>Workloads have no public IPs unless ADR says otherwise</td><td>Customer net</td></tr>
+    <tr><td>Egress control</td><td>Allow-list for model / package registries documented</td><td>Sec + FDE</td></tr>
+    <tr><td>Private link / peering</td><td>Path to ticket / order APIs proven with a health check</td><td>FDE</td></tr>
+    <tr><td>DNS / certs</td><td>Internal hostnames resolve; TLS not disabled "for the PoC"</td><td>Customer IT</td></tr>
+  </tbody>
+</table>
+
+<table>
+  <caption>SSO and identity checklist.</caption>
+  <thead><tr><th>Item</th><th>Pass condition</th><th>Owner</th></tr></thead>
+  <tbody>
+    <tr><td>OIDC / SAML app</td><td>Staging app registered; groups mapped to roles</td><td>IdP admin</td></tr>
+    <tr><td>Service accounts</td><td>Non-human identities for connectors; no shared users</td><td>Sec</td></tr>
+    <tr><td>SCIM / deprovision</td><td>Leaver loses access within agreed SLA</td><td>IdP + app</td></tr>
+    <tr><td>Break-glass</td><td>Documented, audited, time-bounded</td><td>Sec</td></tr>
+    <tr><td>Audit claims</td><td>Tokens carry tenant / group claims used by ACL filters</td><td>FDE</td></tr>
+  </tbody>
+</table>
+
+<table>
+  <caption>Data and secrets checklist.</caption>
+  <thead><tr><th>Item</th><th>Pass condition</th><th>Owner</th></tr></thead>
+  <tbody>
+    <tr><td>Classification</td><td>Fields tagged; disallowed classes never indexed</td><td>Data steward</td></tr>
+    <tr><td>Sample path</td><td>Redacted export <em>or</em> approved synthetic generator</td><td>FDE + steward</td></tr>
+    <tr><td>Secrets store</td><td>Customer vault / KMS; no secrets in git or chat</td><td>Sec</td></tr>
+    <tr><td>Log redaction</td><td>PII scrubbers on prompt/completion logs</td><td>FDE</td></tr>
+    <tr><td>Retention</td><td>Delete path for vectors and traces matches policy</td><td>Both</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout security"><span class="title">Security review checklist (minimum)</span>
+  <ul>
+    <li>Threat model: injection, tool abuse, cross-tenant retrieval, secret exfiltration.</li>
+    <li>Data flow diagram: where tokens, embeddings and logs live.</li>
+    <li>Dependency and model supply chain: registry allow-list only (Volume 24).</li>
+    <li>Human escalation path for high-risk actions (Volume 16–17).</li>
+    <li>Evidence that <code>forge.guard</code> and harness policies are on in staging —
+    not "we'll enable later".</li>
+  </ul>
+</aside>
+
+<h3>Synthetic Substitutes</h3>
+
+<p>When production samples are blocked, generate a labelled synthetic corpus and say so in
+the brief. Chapter 5 and <code>forge.fde.corpus</code> exist for this — not for pretending
+synthetic accuracy equals production.</p>
+
+<figure class="listing">
+<figcaption><code>forge.fde.corpus</code> — synthetic customer support corpus generator.</figcaption>
+<pre><code>from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass, asdict
+
+
+INTENTS = (
+    "where_is_order", "password_reset", "refund_request", "shipping_delay", "other",
+)
+
+
+@dataclass
+class SyntheticTicket:
+    ticket_id: str
+    intent: str
+    subject: str
+    body: str
+    tenant_id: str
+    allow_groups: list[str]
+    label_helpful_policy: str  # expected policy outcome for eval
+
+
+def _tid(seed: str) -&gt; str:
+    return "T-" + hashlib.sha256(seed.encode()).hexdigest()[:10]
+
+
+def generate_corpus(n: int, tenant_id: str = "acme", seed: str = "v27") -&gt; list[SyntheticTicket]:
+    out: list[SyntheticTicket] = []
+    for i in range(n):
+        intent = INTENTS[i % len(INTENTS)]
+        body = {
+            "where_is_order": f"Order #{1000+i} not arrived. Tracking?",
+            "password_reset": "Cannot log in; need password reset link.",
+            "refund_request": f"Want refund for order #{1000+i}; arrived damaged.",
+            "shipping_delay": "Courier says delayed; please update ETA.",
+            "other": "General question about store hours.",
+        }[intent]
+        policy = "escalate" if intent == "refund_request" else "answer"
+        out.append(
+            SyntheticTicket(
+                ticket_id=_tid(f"{seed}:{tenant_id}:{i}"),
+                intent=intent,
+                subject=intent.replace("_", " "),
+                body=body,
+                tenant_id=tenant_id,
+                allow_groups=["support-tier1", "support-tier2"],
+                label_helpful_policy=policy,
+            )
+        )
+    return out
+
+
+corp = generate_corpus(5)
+print(json.dumps([asdict(t) for t in corp[:2]], indent=2))
+print("n=", len(corp), "intents=", sorted({t.intent for t in corp}))</code></pre>
+</figure>
+
+<pre class="output">{
+  {
+    "ticket_id": "T-077ab348ef",
+    "intent": "where_is_order",
+    "subject": "where is order",
+    "body": "Order #1000 not arrived. Tracking?",
+    "tenant_id": "acme",
+    "allow_groups": [
+      "support-tier1",
+      "support-tier2"
+    ],
+    "label_helpful_policy": "answer"
+  },
+  {
+    "ticket_id": "T-15ebf24570",
+    "intent": "password_reset",
+    "subject": "password reset",
+    "body": "Cannot log in; need password reset link.",
+    "tenant_id": "acme",
+    "allow_groups": [
+      "support-tier1",
+      "support-tier2"
+    ],
+    "label_helpful_policy": "answer"
+  }
+]
+n= 5 intents= ['other', 'password_reset', 'refund_request', 'shipping_delay', 'where_is_order']
+</pre>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Tag every synthetic document with <code>provenance: synthetic</code> in the index
+    metadata so <code>forge.rag</code> and eval slices can separate it from redacted
+    production.</li>
+    <li>Never mix tenant IDs in one generator call when testing ACL — generate two corpora
+    and assert zero cross hits.</li>
+  </ul>
+</aside>
+
+<h3>Putting the Checklists on a Calendar</h3>
+
+<p>Environment work is often the critical path, not model quality. Schedule SSO and VPC
+proofs in parallel with discovery labelling. A brief that says <code>vpc_required: true</code>
+with no networking owner named is incomplete — treat that as a discovery defect, not a
+week-four surprise.</p>
+
+<ul>
+  <li><strong>Day 1–3.</strong> Confirm landing zone, region, and IdP app registration
+  started.</li>
+  <li><strong>Day 4–7.</strong> Private path health check to one read-only customer API.</li>
+  <li><strong>Day 7–10.</strong> Secrets in vault; FDE laptop keys revoked from any shared
+  channel.</li>
+  <li><strong>Before any production-like data.</strong> Log redaction and retention ADRs
+  signed.</li>
+</ul>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>"Temporary" public endpoints for the PoC have a habit of becoming permanent. Prefer
+    private link from day one, even if the model is still scripted.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="poc-engineering">PoC Engineering</h2>
+<p class="chapter-lede">A PoC is a thin vertical slice on Forge with real constraints
+simulated by fakes where needed — not a second product. Demo hygiene and reproducibility
+packs decide whether the pilot can restart without the original FDE.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>The demo uses a hard-coded answer for the three tickets the champion cares about,
+  a public chat UI, and a live frontier key. When the security team asks to reproduce the
+  run in the VPC, nothing is scriptable. The PoC was a performance, not an engineering
+  artefact.</p>
+</div>
+
+<p class="facet">Thin vertical slice (minimum)</p>
+<ul>
+  <li>One primary job from the brief (e.g. <code>where_is_order</code>).</li>
+  <li>Gateway → <code>forge.guard</code> → <code>forge.router</code> →
+  <code>forge.rag</code> (or workflow) → model adapter → post-guard.</li>
+  <li>Fake connector for the order API with a contract test; real connector behind a flag.</li>
+  <li>Offline eval on the golden set (even if still growing).</li>
+  <li>Reproducibility pack: brief version, prompts, index build script, eval command,
+  seed.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Champion ticket
+      |
+      v
+ forge.fde PoC harness (scripted)
+      |
+      +--&gt; fake OrderAPI  (contract tests)
+      +--&gt; forge.rag index (synthetic | redacted)
+      +--&gt; forge.guard pre/post
+      +--&gt; forge.router (cost cap)
+      +--&gt; scripted | registry model
+      |
+      v
+ eval report + cost ledger row + trace id</pre>
+<figcaption>PoC slice reuses platform seams; fakes are explicit, not hidden.</figcaption>
+</figure>
+
+<h3>Fake versus Real Connectors</h3>
+
+<figure class="listing">
+<figcaption><code>forge.fde.connectors</code> — contract tests against a fake order API.</figcaption>
+<pre><code>from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Protocol
+
+
+@dataclass
+class Order:
+    order_id: str
+    status: str
+    eta: str
+    tenant_id: str
+
+
+class OrderAPI(Protocol):
+    def get_order(self, order_id: str, tenant_id: str) -&gt; Order | None: ...
+
+
+class FakeOrderAPI:
+    def __init__(self, rows: list[Order]):
+        self._by = {(o.tenant_id, o.order_id): o for o in rows}
+
+    def get_order(self, order_id: str, tenant_id: str) -&gt; Order | None:
+        return self._by.get((tenant_id, order_id))
+
+
+def test_connector_respects_tenant():
+    api = FakeOrderAPI([
+        Order("1000", "shipped", "2026-04-01", "acme"),
+        Order("1000", "shipped", "2026-04-01", "beta"),  # same id, other tenant
+    ])
+    assert api.get_order("1000", "acme").tenant_id == "acme"
+    assert api.get_order("1000", "gamma") is None
+    print("connector tenant contract: ok")
+
+
+test_connector_respects_tenant()</code></pre>
+</figure>
+
+<pre class="output">connector tenant contract: ok</pre>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>A fake that ignores tenancy teaches the wrong lesson. Contract tests encode the
+    customer constraint before the real API exists.</li>
+    <li>Switching fake → real is a flag and a vote of the security checklist — not a
+    rewrite of the PoC.</li>
+  </ul>
+</aside>
+
+<p class="facet">Demo hygiene</p>
+<ul>
+  <li>Record the exact build SHA, brief version and eval command in the demo notes.</li>
+  <li>Do not hot-edit prompts during the meeting without logging the change.</li>
+  <li>Show one failure deliberately (escalation path, guard refusal) so stakeholders see
+  the control plane.</li>
+  <li>Refuse "just this once" live keys that bypass the registry.</li>
+</ul>
+
+<h3>Reproducibility Pack</h3>
+
+<table>
+  <caption>Minimum contents of <code>engagements/&lt;id&gt;/poc/repro/</code>.</caption>
+  <thead><tr><th>File</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td><code>brief.json</code></td><td>Validated engagement brief (version pinned)</td></tr>
+    <tr><td><code>prompts/</code></td><td>System and tool prompts under git</td></tr>
+    <tr><td><code>build_index.sh</code></td><td>Deterministic index build from corpus seed</td></tr>
+    <tr><td><code>eval.sh</code></td><td>Invokes <code>forge.eval</code> suites with thresholds</td></tr>
+    <tr><td><code>SEED</code></td><td>Corpus / sampler seed for synthetic data</td></tr>
+    <tr><td><code>CONNECTOR_MODE</code></td><td><code>fake</code> or <code>real</code> flag</td></tr>
+    <tr><td><code>COST_CAP.json</code></td><td>Router budget for the PoC window</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>PoC runner sketch — one command that prints eval + cost, or fails loudly.</figcaption>
+<pre><code>from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class PocRunResult:
+    engagement_id: str
+    connector_mode: str
+    eval_passed: bool
+    mean_cost_usd: float
+    cost_cap_usd: float
+    trace_ids: list[str]
+
+    @property
+    def ok(self) -&gt; bool:
+        return self.eval_passed and self.mean_cost_usd &lt;= self.cost_cap_usd
+
+
+def run_poc_smoke(
+    engagement_id: str,
+    connector_mode: str,
+    helpful: float,
+    mean_cost_usd: float,
+    cost_cap_usd: float = 0.05,
+) -&gt; PocRunResult:
+    # In the real pack, helpful comes from forge.eval; here we accept a measured float.
+    result = PocRunResult(
+        engagement_id=engagement_id,
+        connector_mode=connector_mode,
+        eval_passed=helpful &gt;= 0.80,
+        mean_cost_usd=mean_cost_usd,
+        cost_cap_usd=cost_cap_usd,
+        trace_ids=["tr_demo_001", "tr_demo_002"],
+    )
+    status = "PASS" if result.ok else "FAIL"
+    print(
+        f"{status} {result.engagement_id} mode={result.connector_mode} "
+        f"cost={result.mean_cost_usd:.3f}/{result.cost_cap_usd:.3f}"
+    )
+    return result
+
+
+run_poc_smoke("acme-support-2026q1", "fake", helpful=0.84, mean_cost_usd=0.031)
+run_poc_smoke("acme-support-2026q1", "fake", helpful=0.84, mean_cost_usd=0.062)</code></pre>
+</figure>
+
+<pre class="output">PASS acme-support-2026q1 mode=fake cost=0.031/0.050
+FAIL acme-support-2026q1 mode=fake cost=0.062/0.050</pre>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>A PoC that only passes with <code>connector_mode=fake</code> is not ready for pilot
+    until the real connector clears Chapter 4 checklists — or the brief explicitly scopes
+    a fake-only lab pilot (rare; label it).</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="eval-with-customer">Evaluation with the Customer</h2>
+<p class="chapter-lede">Golden sets co-owned with the customer are the only credible PoC
+exit gate. Offline gates, human review loops and a ban on vanity leaderboards keep the
+engagement honest.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>The vendor reports 92% "accuracy" on an internal set the customer has never seen.
+  Champions disagree with half the answers in a live session. Leadership still wants to
+  pilot because the number was large. Without co-ownership, evaluation is marketing.</p>
+</div>
+
+<h3>Golden-Set Co-Ownership</h3>
+
+<ul>
+  <li><strong>Co-owners.</strong> At least one customer labeler (or team) and one FDE;
+  both named in the brief.</li>
+  <li><strong>Rubric.</strong> Helpful / unhelpful / harmful / abstain — aligned with
+  Volume 10 and <code>forge.eval</code>.</li>
+  <li><strong>Slice plan.</strong> By intent, language, tenant, and "must_never" probes.</li>
+  <li><strong>Change control.</strong> Adding cases is encouraged; silently dropping hard
+  cases is a kill criterion.</li>
+</ul>
+
+<table>
+  <caption>Offline gates before pilot (map to <code>forge.eval</code> suites).</caption>
+  <thead><tr><th>Gate</th><th>Suite</th><th>Threshold (example)</th></tr></thead>
+  <tbody>
+    <tr><td>Quality</td><td><code>support_golden</code></td><td>helpful ≥ 0.80</td></tr>
+    <tr><td>Safety</td><td><code>guard_redteam</code></td><td>harmful ≤ 0.02</td></tr>
+    <tr><td>ACL</td><td><code>rag_cross_tenant</code></td><td>0 foreign chunks</td></tr>
+    <tr><td>Policy</td><td><code>refund_escalation</code></td><td>100% escalate on refund</td></tr>
+    <tr><td>Latency</td><td>scripted load</td><td>p95 ≤ brief</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>No vanity leaderboards. Public MMLU deltas are irrelevant to "where is my order"
+    deflection.</li>
+    <li>Human review loops sample disagreements between model and labeler; they update the
+    rubric, not only the prompt.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption>Minimal golden-set record co-owned with the customer (feeds <code>forge.eval</code>).</figcaption>
+<pre><code>from __future__ import annotations
+
+from dataclasses import dataclass, asdict
+import json
+
+
+@dataclass
+class GoldenCase:
+    case_id: str
+    intent: str
+    input_text: str
+    expected_policy: str
+    customer_labeler: str
+    vendor_labeler: str
+    notes: str = ""
+
+
+def assert_co_owned(cases: list[GoldenCase]) -&gt; None:
+    for c in cases:
+        if not c.customer_labeler or not c.vendor_labeler:
+            raise ValueError(f"{c.case_id} missing co-owners")
+    print(f"co-owned cases: {len(cases)}")
+
+
+cases = [
+    GoldenCase(
+        "G-001", "where_is_order", "Where is order 1000?",
+        "answer", "j.lee@acme", "fde@forge",
+    ),
+    GoldenCase(
+        "G-002", "refund_request", "Refund order 1000 now",
+        "escalate", "j.lee@acme", "fde@forge",
+    ),
+]
+assert_co_owned(cases)
+print(json.dumps(asdict(cases[1]), indent=2))</code></pre>
+</figure>
+
+<pre class="output">co-owned cases: 2
+{
+  "case_id": "G-002",
+  "intent": "refund_request",
+  "input_text": "Refund order 1000 now",
+  "expected_policy": "escalate",
+  "customer_labeler": "j.lee@acme",
+  "vendor_labeler": "fde@forge",
+  "notes": ""
+}</pre>
+
+<p><span class="evidence documented">Documented</span> Shankar et al., 2024 warn that
+LLM-as-judge validators drift from human preference unless you validate the validators.
+Customer co-ownership is the organisational form of that warning.
+<span class="evidence inferred">Inferred</span> Many enterprise PoCs skip co-ownership
+because it slows the demo calendar — which is exactly when you need it.</p>
+
+<h3>Human Review Loops</h3>
+
+<ul>
+  <li>Sample disagreements weekly; update the rubric before you update the prompt storm.</li>
+  <li>Keep a "hard cases" slice that may not be dropped without decision-owner ack.</li>
+  <li>When using LLM judges, calibrate on a human-labelled subset every release
+  (<span class="evidence documented">Documented</span> lesson from Shankar et al.).</li>
+  <li>Export judge/human confusion matrices into the PoC report — hide nothing that would
+  change a go/kill decision.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Register customer suites under names like <code>acme_support_golden</code> in
+    <code>forge.eval</code> / <code>platform/eval</code> so CI and the engagement share one
+    gate definition.</li>
+    <li>Breck et al., 2017's ML Test Score mindset applies: data and monitoring tests sit
+    beside model quality — ACL probes are not optional garnish.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise" data-title="Exercise · Rubric workshop">
+  <p>With a partner playing the customer, label ten synthetic tickets. Resolve two
+  disagreements in writing. Add both cases to the golden set with notes.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="pilot-design">Pilot Design</h2>
+<p class="chapter-lede">A pilot is production traffic with training wheels: SLOs, traffic
+shape, shadow or canary in the customer context, and human-in-the-loop escalation that
+actually pages someone.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Leadership declares "we're in pilot" because fifty champions have UI access. There is
+  no error budget, no shadow comparison, no escalation rota, and cost is someone's personal
+  card. When quality dips, nobody knows whether to roll back the prompt, the index or the
+  model.</p>
+</div>
+
+<h3>Pilot SLOs</h3>
+
+<table>
+  <caption>Example pilot SLOs for the Acme support engagement.</caption>
+  <thead><tr><th>SLO</th><th>Target</th><th>Window</th><th>Action on burn</th></tr></thead>
+  <tbody>
+    <tr><td>Deflection (in-scope)</td><td>≥ 25%</td><td>7d</td><td>Expand HITL; freeze prompt edits</td></tr>
+    <tr><td>Harmful rate</td><td>≤ 2%</td><td>24h</td><td>Page; disable auto-send</td></tr>
+    <tr><td>TTFT p95</td><td>≤ 800&nbsp;ms</td><td>1h</td><td>Route to smaller / cached path</td></tr>
+    <tr><td>E2E p95</td><td>≤ 4&nbsp;s</td><td>1h</td><td>Shed low-priority intents</td></tr>
+    <tr><td>Cost / success</td><td>≤ budget</td><td>1d</td><td>Tighten <code>forge.router</code> caps</td></tr>
+    <tr><td>Escalation SLA</td><td>ack ≤ 5&nbsp;min</td><td>page</td><td>Fail closed on refund path</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption><code>forge.fde.pilot</code> — SLO dashboard stub.</figcaption>
+<pre><code>from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class Slo:
+    name: str
+    target: float
+    higher_is_better: bool
+    current: float
+
+    @property
+    def ok(self) -&gt; bool:
+        if self.higher_is_better:
+            return self.current &gt;= self.target
+        return self.current &lt;= self.target
+
+
+@dataclass
+class PilotDashboard:
+    engagement_id: str
+    slos: list[Slo]
+
+    def summary(self) -&gt; str:
+        lines = [f"pilot {self.engagement_id}"]
+        for s in self.slos:
+            flag = "OK" if s.ok else "BURN"
+            lines.append(f"  {flag}  {s.name}: {s.current} (target {s.target})")
+        return "\n".join(lines)
+
+
+dash = PilotDashboard(
+    "acme-support-2026q1",
+    [
+        Slo("deflection", 0.25, True, 0.28),
+        Slo("harmful_rate", 0.02, False, 0.01),
+        Slo("ttft_p95_ms", 800, False, 920),
+        Slo("cost_per_success_usd", 0.04, False, 0.035),
+    ],
+)
+print(dash.summary())</code></pre>
+</figure>
+
+<pre class="output">pilot acme-support-2026q1
+  OK  deflection: 0.28 (target 0.25)
+  OK  harmful_rate: 0.01 (target 0.02)
+  BURN  ttft_p95_ms: 920 (target 800)
+  OK  cost_per_success_usd: 0.035 (target 0.04)</pre>
+
+<h3>Traffic Shape, Shadow and Canary</h3>
+
+<ul>
+  <li><strong>Shadow.</strong> New path scores live tickets without sending answers to
+  customers; compare to human or incumbent system offline.</li>
+  <li><strong>Canary.</strong> Small % of real assists; non-inferiority on golden + online
+  sample (Volume 12 / 24 release controls).</li>
+  <li><strong>HITL.</strong> Refunds and policy edge cases require approval; harness
+  <code>ask</code> is not optional in pilot.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Wire pilot metrics into <code>forge.ops</code> panels; the stub above is the contract
+    shape for a Grafana row, not a replacement for it.</li>
+    <li>Error budget for harmful rate is tiny — treat burns as incidents, not "model
+    quirks".</li>
+  </ul>
+</aside>
+
+<h3>Escalation and Human-in-the-Loop</h3>
+
+<table>
+  <caption>HITL matrix for the support pilot (illustrative).</caption>
+  <thead><tr><th>Intent / action</th><th>Auto</th><th>Ask (harness)</th><th>Deny</th></tr></thead>
+  <tbody>
+    <tr><td>where_is_order (grounded)</td><td>yes</td><td>—</td><td>ungrounded invent</td></tr>
+    <tr><td>password_reset link</td><td>—</td><td>tier-1 agent confirm</td><td>reset without MFA proof</td></tr>
+    <tr><td>refund ≤ policy</td><td>—</td><td>supervisor</td><td>above policy ceiling</td></tr>
+    <tr><td>refund &gt; policy</td><td>—</td><td>—</td><td>always</td></tr>
+    <tr><td>cross-tenant lookup</td><td>—</td><td>—</td><td>always</td></tr>
+  </tbody>
+</table>
+
+<figure class="diagram">
+<pre class="ascii">Live ticket
+   |
+   +-- shadow path scores offline (no customer send)
+   |
+   +-- canary %  --&gt; auto answer | ask queue | deny+escalate
+   |
+   +-- burn on harmful SLO --&gt; disable auto-send globally
+   |
+   +-- on-call ack within SLA or fail closed on high-risk tools</pre>
+<figcaption>Pilot traffic is shaped; escalation is a control, not a hope.</figcaption>
+</figure>
+
+<p class="facet">Traffic shape questions that belong in the pilot ADR</p>
+<ul>
+  <li>Which queues and languages enter the pilot first?</li>
+  <li>What fraction is shadow versus canary in week 1 versus week 4?</li>
+  <li>Who is paged when harmful burn trips — FDE, platform, or customer support lead?</li>
+  <li>What is the rollback: prompt pin, index pin, or feature flag off?</li>
+</ul>
+
+<div class="frame exercise" data-title="Exercise · Burn drill">
+  <p>Using the dashboard stub, set <code>harmful_rate</code> to 0.03. Write the first three
+  actions in the runbook and which Forge package you freeze first.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="integration-patterns">Integration Patterns</h2>
+<p class="chapter-lede">Customer delivery is ACL-aware RAG, tool calls into customer APIs,
+routing with cost caps, and guardrails mapped to written policy — all on the Volume 24
+platform path, not a side stack.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>The FDE wires a notebook to the customer's SharePoint, pastes chunks into a prompt,
+  and calls a public model. It "works" until an ACL miss, a surprise bill, or a policy
+  violation. Integration without <code>forge.rag</code> filters, <code>forge.guard</code>
+  and <code>forge.router</code> is a liability transfer dressed as progress.</p>
+</div>
+
+<figure class="diagram">
+<pre class="ascii">Customer clients (SSO)
+        |
+        v
+ platform/ gateway   (Volume 24)
+        |
+        +-- forge.guard (pre)     ← customer policy pack
+        +-- forge.router          ← cost / residency / latency caps
+        +-- forge.rag             ← ACL + freshness on customer corpus
+        +-- tools / MCP           ← customer APIs via harness
+        +-- forge.guard (post)
+        +-- forge.eval / forge.ops
+        |
+        v
+ audit + cost ledger + traces</pre>
+<figcaption>Narrative wiring: FDE configures and proves; platform packages enforce.</figcaption>
+</figure>
+
+<h3>RAG over Customer Corpora with ACLs</h3>
+
+<ul>
+  <li>Index build runs in the customer VPC with group claims on each chunk.</li>
+  <li>Filter-before-rank: foreign scopes never enter the prompt (Volume 14 / 24).</li>
+  <li>Freshness: policy documents carry <code>effective_at</code>; stale chunks drop.</li>
+</ul>
+
+<h3>Tool Calling, Routing and Guardrails</h3>
+
+<ul>
+  <li><strong>Tools.</strong> Order, refund, user-lookup APIs behind
+  <code>forge.harness</code> allow/ask/deny — same as Platform 1.0 agents.</li>
+  <li><strong>Router.</strong> Prefer small / cached routes when
+  <code>forge.eval</code> says quality holds; residency tags exclude non-compliant
+  providers.</li>
+  <li><strong>Guards.</strong> Map written customer policy IDs to guard rule packs; fail
+  closed on must-never.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>The FDE's job is to <em>bind</em> customer policy to existing Forge seams, not to
+    invent a parallel middleware for each account.</li>
+    <li>Cost caps belong in the router and ledger, not in a spreadsheet updated weekly.</li>
+  </ul>
+</aside>
+
+<h3>Policy Pack Mapping</h3>
+
+<table>
+  <caption>From customer policy language to Forge enforcement (example).</caption>
+  <thead><tr><th>Policy sentence</th><th>Package</th><th>Enforcement</th></tr></thead>
+  <tbody>
+    <tr><td>"No customer PII may leave the EU."</td><td><code>forge.router</code></td><td>Residency filter on artefacts</td></tr>
+    <tr><td>"Agents must not issue refunds above £50 without approval."</td><td><code>forge.harness</code></td><td><code>ask</code> / <code>deny</code> on tool</td></tr>
+    <tr><td>"Answers must cite the knowledge base."</td><td><code>forge.rag</code> + eval</td><td>Grounding gate in suite</td></tr>
+    <tr><td>"Do not assist with credential stuffing."</td><td><code>forge.guard</code></td><td>Pre-guard refuse</td></tr>
+    <tr><td>"Ticket bodies retained 90 days."</td><td><code>forge.ops</code> / platform</td><td>Retention job + delete path</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>Cost-cap helper the FDE configures per engagement (feeds
+<code>forge.router</code> budgets).</figcaption>
+<pre><code>from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class EngagementBudget:
+    engagement_id: str
+    daily_usd: float
+    per_success_usd: float
+    prefer_small_route: bool = True
+
+    def admit(self, spent_today: float, projected_task_usd: float) -&gt; str:
+        if spent_today &gt;= self.daily_usd:
+            return "shed"
+        if projected_task_usd &gt; self.per_success_usd and self.prefer_small_route:
+            return "force_small"
+        if projected_task_usd &gt; self.per_success_usd * 2:
+            return "refuse"
+        return "allow"
+
+
+b = EngagementBudget("acme-support-2026q1", daily_usd=200.0, per_success_usd=0.04)
+for spent, proj in [(10.0, 0.03), (10.0, 0.06), (201.0, 0.02), (10.0, 0.10)]:
+    print(spent, proj, b.admit(spent, proj))</code></pre>
+</figure>
+
+<pre class="output">10.0 0.03 allow
+10.0 0.06 force_small
+201.0 0.02 shed
+10.0 0.1 refuse</pre>
+
+<p class="facet">Narrative wiring checklist</p>
+<ul>
+  <li><code>platform/api</code> — SSO claims become request envelope tenant/groups.</li>
+  <li><code>platform/knowledge</code> — wraps <code>forge.rag</code> with customer corpus.</li>
+  <li><code>platform/control</code> — guard → router → workload with engagement budget.</li>
+  <li><code>platform/eval</code> — customer golden suites registered beside platform CI.</li>
+  <li><code>platform/ops</code> — pilot SLO panels and cost ledger rows labelled by
+  <code>engagement_id</code>.</li>
+</ul>
+
+<div class="frame exercise" data-title="Exercise · Policy pack">
+  <p>Translate three sentences from a fictional customer Acceptable Use Policy into
+  <code>forge.guard</code> rule IDs and one harness tool permission matrix for refunds.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 9 -->
+<section class="chapter">
+<h2 id="change-management">Change Management</h2>
+<p class="chapter-lede">Champions, runbooks and deflection metrics move organisations.
+Productivity and case claims must carry
+<span class="evidence documented">Documented</span> versus
+<span class="evidence inferred">Inferred</span> labels — especially in customer
+settings where optimism is a sales hazard.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A deck claims "40% productivity lift" citing a famous paper and a two-week champion
+  pilot with no control group. Training was a lunch-and-learn. When results fade, trust
+  dies. The failure was not the model — it was unlabelled inference sold as evidence.</p>
+</div>
+
+<h3>Training Champions and Runbooks</h3>
+
+<ul>
+  <li>Name champions per queue; give them escalation authority and a feedback form that
+  files golden-set candidates.</li>
+  <li>Ship a one-page runbook: when to trust, when to escalate, how to report bad answers.</li>
+  <li>Deflection metrics for support: define in-scope intents; exclude out-of-scope before
+  celebrating.</li>
+</ul>
+
+<h3>Documented versus Inferred Claims</h3>
+
+<p class="facet">Documented (cite primary artefacts)</p>
+<ul>
+  <li><span class="evidence documented">Documented</span> Brynjolfsson et al., 2023 report
+  productivity effects of generative AI in a customer-support setting with measured
+  handling-time changes — cite the paper's population and design, not a slogan.</li>
+  <li><span class="evidence documented">Documented</span> Peng et al., 2023 provide a
+  controlled experiment on Copilot task time — relevant analogy for coding assistants, not
+  automatic proof for ticket deflection.</li>
+  <li><span class="evidence documented">Documented</span> Amershi et al., 2019 publish
+  human–AI interaction guidelines usable in champion training checklists.</li>
+  <li><span class="evidence documented">Documented</span> Your pilot dashboard numbers, when
+  logged with methodology (denominator, intent filter, period).</li>
+</ul>
+
+<p class="facet">Inferred (label explicitly)</p>
+<ul>
+  <li><span class="evidence inferred">Inferred</span> "We will see the same lift as
+  Brynjolfsson et al. because we also do support" — different tooling, workforce and
+  ticket mix.</li>
+  <li><span class="evidence inferred">Inferred</span> Champion smiles in a demo as evidence
+  of production deflection.</li>
+  <li><span class="evidence inferred">Inferred</span> Vendor case studies without
+  methodology sections.</li>
+</ul>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>Mixing Documented citations with Inferred forecasts in one bullet is how customer
+    trust erodes. Split them visually in every deck.</li>
+    <li>Parnin et al., 2023 (<span class="evidence documented">Documented</span> interview
+    study) surface how hard product copilots are to evaluate — use that humility in
+    change management, not as a reason to skip metrics.</li>
+  </ul>
+</aside>
+
+<figure class="diagram">
+<pre class="ascii">[Documented]                         [Inferred]
+Paper / pilot log with method        Analogy from another domain
+Customer-signed golden metrics       Champion anecdote
+Guard/ACL test exports               "Should be fine in VPC"</pre>
+<figcaption>Evidence hygiene for customer communication — same discipline as Volume 21.</figcaption>
+</figure>
+
+<h3>Deflection Metrics without Self-Deception</h3>
+
+<ul>
+  <li>Define <em>in-scope</em> intents in the brief; report deflection only on that
+  denominator.</li>
+  <li>Separate "customer abandoned" from "AI resolved" — abandonment is not success.</li>
+  <li>Track reopen rate within 72&nbsp;h; a silent wrong answer is not deflection.</li>
+  <li>Publish Documented pilot numbers beside any Inferred extrapolation in the same
+  slide — never blended into one big percentage.</li>
+</ul>
+
+<table>
+  <caption>Example metric card for a weekly champion review.</caption>
+  <thead><tr><th>Metric</th><th>Value</th><th>Evidence</th></tr></thead>
+  <tbody>
+    <tr><td>In-scope tickets</td><td class="num">1 240</td><td><span class="evidence documented">Documented</span> queue filter export</td></tr>
+    <tr><td>AI-resolved (no reopen 72h)</td><td class="num">310</td><td><span class="evidence documented">Documented</span> pilot log</td></tr>
+    <tr><td>Deflection</td><td class="num">25.0%</td><td><span class="evidence documented">Documented</span> 310/1240</td></tr>
+    <tr><td>"Similar to Brynjolfsson lift"</td><td>—</td><td><span class="evidence inferred">Inferred</span> — do not claim</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Amershi et al., 2019 guidelines belong in champion training: appropriate
+    confidence, graceful failure, easy appeal to a human.</li>
+    <li>Public FDE / solutions-engineering practice notes that lack methodology stay
+    <span class="evidence inferred">Inferred</span> even when they appear on vendor
+    blogs.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 10 -->
+<section class="chapter">
+<h2 id="handoff">Handoff and Operability</h2>
+<p class="chapter-lede">Handoff is a packet, not a farewell email: runbooks, on-call
+expectations, cost reports, model/prompt change control, and a clear list of what product
+engineering owns next.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>The FDE rotates off. Prompts live in a private doc. The index build is a shell history.
+  On-call is "page the champion". A model provider deprecates an endpoint and nobody knows
+  the registry owner. The customer experienced a demo series, not a system.</p>
+</div>
+
+<figure class="listing">
+<figcaption><code>forge.fde.handoff</code> — handoff packet builder.</figcaption>
+<pre><code>from __future__ import annotations
+
+from dataclasses import dataclass, field, asdict
+from typing import Any
+import json
+
+
+@dataclass
+class HandoffPacket:
+    engagement_id: str
+    brief_version: str
+    architecture_links: list[str]
+    runbooks: list[str]
+    oncall: dict[str, str]
+    slo_dashboard: str
+    cost_report_path: str
+    change_control: list[str]
+    eval_suites: list[str]
+    product_owns_next: list[str]
+    known_risks: list[str] = field(default_factory=list)
+
+    def render_markdown(self) -&gt; str:
+        lines = [
+            f"# Handoff · {self.engagement_id}",
+            f"Brief: {self.brief_version}",
+            "",
+            "## On-call",
+            *(f"- {k}: {v}" for k, v in self.oncall.items()),
+            "",
+            "## Runbooks",
+            *(f"- {r}" for r in self.runbooks),
+            "",
+            "## Change control",
+            *(f"- {c}" for c in self.change_control),
+            "",
+            "## Product engineering owns next",
+            *(f"- {p}" for p in self.product_owns_next),
+            "",
+            f"SLO dashboard: {self.slo_dashboard}",
+            f"Cost report: {self.cost_report_path}",
+            f"Eval suites: {', '.join(self.eval_suites)}",
+        ]
+        if self.known_risks:
+            lines += ["", "## Known risks", *(f"- {r}" for r in self.known_risks)]
+        return "\n".join(lines)
+
+
+def build_handoff(**kwargs: Any) -&gt; HandoffPacket:
+    pkt = HandoffPacket(**kwargs)
+    if not pkt.runbooks or not pkt.oncall or not pkt.change_control:
+        raise ValueError("runbooks, oncall and change_control are required")
+    return pkt
+
+
+pkt = build_handoff(
+    engagement_id="acme-support-2026q1",
+    brief_version="brief@3",
+    architecture_links=["platform/README.md", "engagements/acme/adr/"],
+    runbooks=["rb-harmful-burn.md", "rb-connector-down.md"],
+    oncall={"primary": "support-ai-oncall", "secondary": "platform-oncall"},
+    slo_dashboard="grafana:/d/acme-pilot",
+    cost_report_path="s3://acme-ai/cost/weekly.csv",
+    change_control=[
+        "prompts via PR + forge.eval gate",
+        "model only through registry artefact",
+        "index rebuild requires data steward ack",
+    ],
+    eval_suites=["support_golden", "guard_redteam", "rag_cross_tenant"],
+    product_owns_next=[
+        "multi-language intents",
+        "shared refund tool in platform/agent",
+    ],
+    known_risks=["TTFT burn on peak sale days"],
+)
+print(pkt.render_markdown())
+print("---")
+print("json keys:", sorted(asdict(pkt).keys()))</code></pre>
+</figure>
+
+<pre class="output"># Handoff · acme-support-2026q1
+Brief: brief@3
+
+## On-call
+- primary: support-ai-oncall
+- secondary: platform-oncall
+
+## Runbooks
+- rb-harmful-burn.md
+- rb-connector-down.md
+
+## Change control
+- prompts via PR + forge.eval gate
+- model only through registry artefact
+- index rebuild requires data steward ack
+
+## Product engineering owns next
+- multi-language intents
+- shared refund tool in platform/agent
+
+SLO dashboard: grafana:/d/acme-pilot
+Cost report: s3://acme-ai/cost/weekly.csv
+Eval suites: support_golden, guard_redteam, rag_cross_tenant
+
+## Known risks
+- TTFT burn on peak sale days
+---
+json keys: ['architecture_links', 'brief_version', 'change_control', 'cost_report_path', 'engagement_id', 'eval_suites', 'known_risks', 'oncall', 'product_owns_next', 'runbooks', 'slo_dashboard']</pre>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>If product engineering cannot name the next three backlog items from the packet,
+    handoff failed.</li>
+    <li>Change control without <code>forge.eval</code> gates is a suggestion, not a
+    control.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 11 -->
+<section class="chapter">
+<h2 id="failure-modes">Failure Modes of FDE Work</h2>
+<p class="chapter-lede">This chapter is deliberately frank. Most failed AI engagements die
+from process and honesty failures, not from missing a newer model.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>After enough customer sites, the same corpses reappear: dazzling demos, vague scope,
+  nobody owning data quality, shadow IT models on personal keys, and security questionnaires
+  answered with screenshots. Naming these modes is how you refuse to repeat them.</p>
+</div>
+
+<h3>Demo-Driven Development</h3>
+
+<ul>
+  <li>Optimising the three champion tickets instead of the golden-set distribution.</li>
+  <li>Hot-fixing prompts in the meeting; never checking them into version control.</li>
+  <li>Hiding guard refusals because they "look bad" in the room.</li>
+  <li>Success criterion = applause. Exit criterion never written.</li>
+</ul>
+
+<p><strong>Countermeasure.</strong> Reproducibility pack required before any external demo.
+Show one deliberate refusal. Tie the next meeting to an exit-criteria diff, not a new
+feature.</p>
+
+<h3>Unbounded Scope</h3>
+
+<ul>
+  <li>"While you're here, also do search, also do agents, also do the mobile app."</li>
+  <li>Exit criteria that grow every week without a kill discussion.</li>
+  <li>Custom one-offs that never become platform ADRs — shadow product engineering.</li>
+</ul>
+
+<p><strong>Countermeasure.</strong> K4 in the PoC checklist. Written declines. Configure
+before build; build only with a path back into <code>platform/</code> or
+<code>forge.*</code>.</p>
+
+<h3>Unowned Data Quality</h3>
+
+<ul>
+  <li>CSV in email as the system of record.</li>
+  <li>No steward for labels; FDE labels alone; customer disputes later.</li>
+  <li>Indexes rebuilt from memory; stale policy chunks serving as truth.</li>
+</ul>
+
+<p><strong>Countermeasure.</strong> Data reality section of the brief; co-owned golden set;
+freshness metadata; delete paths.</p>
+
+<h3>Shadow IT Models</h3>
+
+<ul>
+  <li>Personal API keys in champion browsers.</li>
+  <li>Unregistered models "just for the PoC" that somehow reach production traffic.</li>
+  <li>Copying customer text into public consumer chat tools for "debugging".</li>
+</ul>
+
+<p><strong>Countermeasure.</strong> Registry allow-list only; secrets in customer vault;
+treat consumer-tool paste as a security incident.</p>
+
+<h3>Security Theatre</h3>
+
+<ul>
+  <li>Hundred-row questionnaires answered without a threat model.</li>
+  <li>Guards disabled to hit a latency slide.</li>
+  <li>"We'll turn on SSO after the pilot" with production data already flowing.</li>
+</ul>
+
+<p><strong>Countermeasure.</strong> Chapter 4 checklists as gates, not appendix. Fail closed.
+Kill criteria when security blocks measurement indefinitely <em>or</em> when teams demand
+measurement without controls — both are failure modes.</p>
+
+<aside class="callout security"><span class="title">Frank list — stop the engagement if</span>
+  <ul>
+    <li>Decision owner will not name kill criteria.</li>
+    <li>You are asked to bypass ACL "for the demo tenants".</li>
+    <li>Cost is unbounded and nobody will set a router cap.</li>
+    <li>Productivity claims must be presented without Documented/Inferred labels.</li>
+    <li>Handoff is refused because "we'll keep the FDE forever".</li>
+  </ul>
+</aside>
+
+<ul class="failure-modes">
+  <li>Demo-driven development without a reproducibility pack.</li>
+  <li>Unbounded scope; exit criteria that only expand.</li>
+  <li>Unowned data quality and solo-labelled golden sets.</li>
+  <li>Shadow IT models and personal API keys.</li>
+  <li>Security theatre; guards off; SSO deferred with real data.</li>
+  <li>Vanity leaderboards replacing customer tasks.</li>
+  <li>Pilot declared without SLOs or on-call.</li>
+  <li>Handoff email without a packet.</li>
+  <li>Inferred productivity lifts sold as documented fact.</li>
+  <li>Building a parallel stack beside <code>platform/</code>.</li>
+</ul>
+
+<h3>How These Modes Interact</h3>
+
+<p>Demo-driven development invites unbounded scope ("just one more wow"). Unbounded scope
+starves data ownership. Missing data ownership makes evaluation theatrical, which tempts
+shadow IT models to "unblock the demo". Shadow IT then collides with security questionnaires
+answered as theatre. The cure is not a pep talk — it is the brief, kill criteria,
+co-owned golden set and handoff packet enforced as gates.</p>
+
+<figure class="diagram">
+<pre class="ascii">demo-driven ──▶ scope creep ──▶ no data owner
+      │                              │
+      ▼                              ▼
+ skip guards                   vanity metrics
+      │                              │
+      └────────▶ shadow IT keys ◀────┘
+                      │
+                      ▼
+              renewals anger / kill late</pre>
+<figcaption>Failure modes compound; interrupt early with Chapter 3 kill criteria.</figcaption>
+</figure>
+
+<table>
+  <caption>Detection signals and first response.</caption>
+  <thead><tr><th>Mode</th><th>Early signal</th><th>First response</th></tr></thead>
+  <tbody>
+    <tr><td>Demo-driven</td><td>No repro pack before external demo</td><td>Cancel demo or demote to lab</td></tr>
+    <tr><td>Unbounded scope</td><td>New asks without exit diffs</td><td>Trigger K4; written decline</td></tr>
+    <tr><td>Unowned data</td><td>Labels only from FDE</td><td>Pause eval; name co-owner</td></tr>
+    <tr><td>Shadow IT</td><td>Personal keys in chat logs</td><td>Incident; rotate; registry only</td></tr>
+    <tr><td>Security theatre</td><td>Guards off in staging</td><td>Fail closed; no production data</td></tr>
+  </tbody>
+</table>
+
+<div class="frame exercise" data-title="Exercise · Post-mortem">
+  <p>Write a one-page post-mortem for a fictional engagement that failed via demo-driven
+  development plus shadow IT. Include timeline, root cause, and which
+  <code>forge.fde</code> gate would have stopped it.</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 12 -->
+<section class="chapter">
+<h2 id="retrospective">Engagement Retrospective</h2>
+<p class="chapter-lede">Scorecards turn anecdotes into portfolio learning. Reusable assets
+return to Forge and <code>services/</code> / <code>platform/</code>; the playbook updates
+so the next FDE starts ahead.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Each engagement feels unique. The same connector bug is fixed three times. Kill
+  rationales live in chat. Leadership asks whether FDE capacity is well spent and receives
+  stories instead of a scorecard.</p>
+</div>
+
+<figure class="listing">
+<figcaption><code>forge.fde.scorecard</code> — engagement scorecard.</figcaption>
+<pre><code>from __future__ import annotations
+
+from dataclasses import dataclass, asdict
+
+
+@dataclass
+class ScoreDimension:
+    name: str
+    score: int  # 1-5
+    notes: str
+
+
+@dataclass
+class EngagementScorecard:
+    engagement_id: str
+    outcome: str  # "pilot" | "killed" | "handed_off" | "deferred"
+    dimensions: list[ScoreDimension]
+    assets_returned: list[str]
+    playbook_updates: list[str]
+
+    @property
+    def mean(self) -&gt; float:
+        return sum(d.score for d in self.dimensions) / max(1, len(self.dimensions))
+
+
+def render_scorecard(sc: EngagementScorecard) -&gt; str:
+    lines = [
+        f"scorecard {sc.engagement_id} outcome={sc.outcome} mean={sc.mean:.2f}",
+    ]
+    for d in sc.dimensions:
+        lines.append(f"  {d.score}/5  {d.name}: {d.notes}")
+    lines.append("assets: " + ", ".join(sc.assets_returned))
+    lines.append("playbook: " + "; ".join(sc.playbook_updates))
+    return "\n".join(lines)
+
+
+sc = EngagementScorecard(
+    "acme-support-2026q1",
+    "handed_off",
+    [
+        ScoreDimension("discovery_quality", 5, "brief validated day 2"),
+        ScoreDimension("poc_discipline", 4, "one demo hotfix logged"),
+        ScoreDimension("eval_co_ownership", 5, "N=120 co-labelled"),
+        ScoreDimension("pilot_slos", 3, "TTFT burns on peak days"),
+        ScoreDimension("handoff", 5, "packet merged to platform docs"),
+        ScoreDimension("asset_reuse", 4, "FakeOrderAPI → forge.fde.connectors"),
+    ],
+    assets_returned=[
+        "forge.fde.connectors.FakeOrderAPI",
+        "policy pack acme-support-v2",
+        "golden slice where_is_order",
+    ],
+    playbook_updates=[
+        "require synthetic plan by day 5 if sample blocked",
+        "add peak-sale latency scenario to pilot template",
+    ],
+)
+print(render_scorecard(sc))
+print("asdict_keys", sorted(asdict(sc).keys()))</code></pre>
+</figure>
+
+<pre class="output">scorecard acme-support-2026q1 outcome=handed_off mean=4.33
+  5/5  discovery_quality: brief validated day 2
+  4/5  poc_discipline: one demo hotfix logged
+  5/5  eval_co_ownership: N=120 co-labelled
+  3/5  pilot_slos: TTFT burns on peak days
+  5/5  handoff: packet merged to platform docs
+  4/5  asset_reuse: FakeOrderAPI → forge.fde.connectors
+assets: forge.fde.connectors.FakeOrderAPI, policy pack acme-support-v2, golden slice where_is_order
+playbook: require synthetic plan by day 5 if sample blocked; add peak-sale latency scenario to pilot template
+asdict_keys ['assets_returned', 'dimensions', 'engagement_id', 'outcome', 'playbook_updates']</pre>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>A killed engagement with a sharp scorecard is a successful learning loop.</li>
+    <li>Assets that do not land in Forge/`platform/` did not really return — they stayed
+    tribal knowledge.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise" data-title="Practical project · Customer support pilot pack">
+  <p>Run the fictional Acme engagement end to end on Forge.</p>
+  <ol>
+    <li>Author and validate an engagement brief with <code>forge.fde.brief</code>.</li>
+    <li>Generate a synthetic corpus; build a tiny ACL index path via
+    <code>forge.rag</code> (or the platform knowledge wrapper).</li>
+    <li>Co-own a golden set (≥ 20 cases in the exercise; ≥ 100 in a real PoC).</li>
+    <li>Implement the PoC slice with fake order API contract tests, guards and router cost
+    cap.</li>
+    <li>Evaluate offline; fill the PoC checklist; only then draft pilot SLOs.</li>
+    <li>Produce a handoff packet and an engagement scorecard; list two assets merged
+    back.</li>
+  </ol>
+</div>
+</section>
+
+<!-- ================================================================ REVIEW -->
+<section class="review">
+<h1>Review and Next Steps</h1>
+
+<p>Volume 27 closes the curriculum's customer-delivery arc. Volumes 1–24 built models,
+systems and a platform; Volume 25 indexes the reference layer; this volume teaches how
+Forward Deployed engineers turn that platform into measured outcomes under someone else's
+constraints — without confusing demos with deployments.</p>
+
+<h2>What This Volume Covered</h2>
+<ul>
+  <li>FDE role boundaries and the engagement lifecycle (Chapter 1).</li>
+  <li>Discovery that produces a validated engagement brief (Chapter 2).</li>
+  <li>Scoping with ADRs, PoC exit criteria and kill criteria (Chapter 3).</li>
+  <li>VPC / SSO / data / secrets checklists and synthetic corpora (Chapter 4).</li>
+  <li>Thin PoC slices on Forge with fakes, demo hygiene and contract tests (Chapter 5).</li>
+  <li>Customer co-owned golden sets and offline gates via <code>forge.eval</code>
+  (Chapter 6).</li>
+  <li>Pilot SLOs, shadow/canary and HITL escalation (Chapter 7).</li>
+  <li>Integration through <code>forge.rag</code>, <code>forge.guard</code>,
+  <code>forge.router</code> and <code>platform/</code> (Chapter 8).</li>
+  <li>Change management with Documented versus Inferred claim labels (Chapter 9).</li>
+  <li>Handoff packets and operability (Chapter 10).</li>
+  <li>Frank failure modes: demo-driven development and cousins (Chapter 11).</li>
+  <li>Scorecards and assets returning to Forge (Chapter 12).</li>
+</ul>
+
+<h2>What You Built</h2>
+<ul>
+  <li><code>forge.fde.brief</code> — schema + <code>validate_brief</code>.</li>
+  <li><code>forge.fde.poc</code> — exit/kill checklist evaluation.</li>
+  <li><code>forge.fde.corpus</code> — synthetic customer ticket generator.</li>
+  <li><code>forge.fde.connectors</code> — fake APIs with tenant contract tests.</li>
+  <li><code>forge.fde.pilot</code> — SLO dashboard stub.</li>
+  <li><code>forge.fde.handoff</code> — handoff packet builder.</li>
+  <li><code>forge.fde.scorecard</code> — engagement retrospective scores.</li>
+</ul>
+
+<h2>Important Code</h2>
+<table>
+  <caption>Listings that define the FDE control loop.</caption>
+  <thead><tr><th>Listing</th><th>Module</th><th>Invariant</th></tr></thead>
+  <tbody>
+    <tr><td>validate_brief</td><td><code>forge.fde.brief</code></td><td>Required fields; sample or synthetic; kill criteria present</td></tr>
+    <tr><td>evaluate_poc</td><td><code>forge.fde.poc</code></td><td>Kill beats exit; pending blocks pilot</td></tr>
+    <tr><td>generate_corpus</td><td><code>forge.fde.corpus</code></td><td>Tenant + policy labels on every row</td></tr>
+    <tr><td>FakeOrderAPI</td><td><code>forge.fde.connectors</code></td><td>Same order id ≠ cross-tenant leak</td></tr>
+    <tr><td>PilotDashboard</td><td><code>forge.fde.pilot</code></td><td>Numeric SLOs; burn is visible</td></tr>
+    <tr><td>build_handoff</td><td><code>forge.fde.handoff</code></td><td>Runbooks + on-call + change control required</td></tr>
+    <tr><td>EngagementScorecard</td><td><code>forge.fde.scorecard</code></td><td>Assets and playbook updates recorded</td></tr>
+  </tbody>
+</table>
+
+<h2>Important Architecture</h2>
+<figure class="diagram">
+<pre class="ascii">Engagement brief (forge.fde)
+        ↓
+PoC slice → platform gateway → guard → router → rag/tools → eval/ops
+        ↓
+Pilot SLOs + HITL
+        ↓
+Handoff packet → product engineering owns next
+        ↓
+Scorecard → assets back to forge.* / platform/</pre>
+<figcaption>FDE loop sitting on the Volume 24 platform — compose, do not fork.</figcaption>
+</figure>
+
+<figure class="diagram">
+<pre class="mermaid">flowchart LR
+  B[Brief] --&gt; P[PoC]
+  P --&gt; E[Eval gates]
+  E --&gt; L[Pilot SLOs]
+  L --&gt; H[Handoff]
+  H --&gt; S[Scorecard]
+  P -. kill .-&gt; S
+  E -. fail .-&gt; P</pre>
+<figcaption>Control flow including kill and fail paths.</figcaption>
+</figure>
+
+<h2>Failure Modes</h2>
+<ul class="failure-modes">
+  <li>Demo-driven development.</li>
+  <li>Unbounded scope without kill criteria.</li>
+  <li>Unowned data quality.</li>
+  <li>Shadow IT models and personal keys.</li>
+  <li>Security theatre; guards off for the slide.</li>
+  <li>Vanity leaderboards.</li>
+  <li>Pilot without SLOs or on-call.</li>
+  <li>Inferred lifts sold as documented evidence.</li>
+  <li>Handoff without a packet.</li>
+  <li>Parallel stacks beside <code>platform/</code>.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<ul>
+  <li>Brief validates; kill criteria non-empty.</li>
+  <li>PoC checklist green or engagement killed with a written note.</li>
+  <li>Golden set co-owned; <code>forge.eval</code> suites gated.</li>
+  <li>ACL and red-team probes green in customer staging.</li>
+  <li>Pilot dashboard shows burns; runbooks attached.</li>
+  <li>Handoff packet merged; scorecard filed; ≥ one asset returned.</li>
+</ul>
+
+<h2>Practical Project</h2>
+<div class="frame exercise" data-title="Customer support pilot pack">
+  <p>Brief → PoC → scored pilot plan on Forge, with golden-set eval, guardrails, cost cap
+  and handoff packet — Chapter 12 exercise, executed as a single portfolio artefact.</p>
+</div>
+
+<h2>Exercises</h2>
+<ol>
+  <li>Extend <code>validate_brief</code> to reject residency strings that do not match a
+  known allow-list.</li>
+  <li>Add a kill check K5: "harmful rate &gt; 5% on any rolling day in PoC".</li>
+  <li>Generate two tenants' corpora and write the ACL probe that must stay at zero cross
+  hits.</li>
+  <li>Label five claims in a vendor case study as Documented or Inferred; discard one that
+  cannot be sourced.</li>
+  <li>Draft a handoff packet for a killed engagement — what still returns as an asset?</li>
+  <li>Map each Chapter 11 failure mode to a concrete checklist row in Chapters 3–4.</li>
+  <li>Wire the pilot dashboard stub fields to illustrative Prometheus metric names.</li>
+  <li>Write the customer email that declines unbounded scope using K4 language.</li>
+</ol>
+
+<h2>Research Papers</h2>
+<table>
+  <caption>Sources that discipline FDE measurement and delivery — cite carefully.</caption>
+  <thead><tr><th>Source</th><th>Why it is here</th></tr></thead>
+  <tbody>
+    <tr><td>Amershi et al., 2019. Guidelines for Human-AI Interaction / SE for ML.</td><td>Champion UX and engineering process (Ch 1, 9, 12).</td></tr>
+    <tr><td>Brynjolfsson et al., 2023. Generative AI at Work.</td><td>Documented support productivity evidence — do not over-generalise (Ch 9).</td></tr>
+    <tr><td>Peng et al., 2023. Copilot productivity experiment.</td><td>Controlled design reference when claiming lifts (Ch 9).</td></tr>
+    <tr><td>Parnin et al., 2023. Building Your Own Product Copilot.</td><td>Interview evidence on copilots' evaluation pain (Ch 6, 9).</td></tr>
+    <tr><td>Shankar et al., 2024. Who Validates the Validators?</td><td>Judge drift; why humans co-own golden sets (Ch 6).</td></tr>
+    <tr><td>Breck et al., 2017. The ML Test Score.</td><td>Production-readiness rubric for pilot gates (Ch 7, 10).</td></tr>
+  </tbody>
+</table>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Generative AI at Work</span>
+    <span class="paper-meta">Brynjolfsson, Li and Raymond, 2023</span></div>
+  <dl>
+    <dt>Problem</dt><dd>What is the measured effect of generative AI tools on customer-support worker productivity?</dd>
+    <dt>Previous limitation</dt><dd>Anecdotes and lab tasks without large-scale workplace data.</dd>
+    <dt>Approach</dt><dd>Empirical study of support agents with access to a generative assistant; track handling time and related outcomes.</dd>
+    <dt>Contribution</dt><dd>Credible, documented productivity evidence in a support setting — with a specific population and design.</dd>
+    <dt>Practical impact</dt><dd>Chapter 9: cite with methodology; never paste the headline number onto a dissimilar pilot.</dd>
+    <dt>Limitations</dt><dd>One organisational context; tooling and ticket mix differ from your customer.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Who Validates the Validators?</span>
+    <span class="paper-meta">Shankar et al., 2024 · UIST</span></div>
+  <dl>
+    <dt>Problem</dt><dd>LLM-assisted evaluation can drift from human preference.</dd>
+    <dt>Previous limitation</dt><dd>Teams treat automated judges as ground truth.</dd>
+    <dt>Approach</dt><dd>Study alignment between LLM judges and humans; stress criteria drift.</dd>
+    <dt>Contribution</dt><dd>Shows validators need validation — organisationally: co-owned golden sets.</dd>
+    <dt>Practical impact</dt><dd>Chapter 6 co-ownership and human review loops.</dd>
+    <dt>Limitations</dt><dd>Does not remove the need for task-specific rubrics in each engagement.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">The ML Test Score</span>
+    <span class="paper-meta">Breck et al., 2017</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Teams lack a shared bar for ML production readiness.</dd>
+    <dt>Previous limitation</dt><dd>Accuracy-only gates.</dd>
+    <dt>Approach</dt><dd>Rubric across data, model, infra and monitoring tests.</dd>
+    <dt>Contribution</dt><dd>Readiness as a score, not a vibe.</dd>
+    <dt>Practical impact</dt><dd>Pilot and handoff checklists in Chapters 7 and 10.</dd>
+    <dt>Limitations</dt><dd>Pre-LLM risks need extending (injection, tool abuse) without discarding the idea.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Building Your Own Product Copilot</span>
+    <span class="paper-meta">Parnin et al., 2023 · arXiv:2312.14231</span></div>
+  <dl>
+    <dt>Problem</dt><dd>How do organisations actually build and test product copilots?</dd>
+    <dt>Previous limitation</dt><dd>Advice dominated by demos and blog optimism.</dd>
+    <dt>Approach</dt><dd>Interview study of practitioners.</dd>
+    <dt>Contribution</dt><dd>Documented challenges, opportunities and evaluation needs.</dd>
+    <dt>Practical impact</dt><dd>Humility in Chapters 6 and 9; evaluation is the hard part.</dd>
+    <dt>Limitations</dt><dd>Interview sample; still the right questions for FDE scorecards.</dd>
+  </dl>
+</section>
+
+<h2>Interview Questions</h2>
+<ol class="questions">
+  <li>What belongs in an engagement brief that a demo script cannot replace?</li>
+  <li>Write two PoC exit criteria and two kill criteria for a VPC-only RAG pilot.</li>
+  <li>How do you co-own a golden set with a customer who has no ML team?</li>
+  <li>Where do ACL filters run relative to generation, and which Forge package owns that?</li>
+  <li>A champion wants to disable guards for a board demo. What do you do?</li>
+  <li>Label three productivity claims as Documented or Inferred and justify.</li>
+  <li>Design pilot SLOs for harmful rate versus deflection — which burns first?</li>
+  <li>What must a handoff packet contain before the FDE rotates off?</li>
+  <li>How does demo-driven development fail a reproducibility pack?</li>
+  <li>When is "configure the platform" better than "build a custom agent"?</li>
+  <li>Map forge.guard, forge.router and forge.rag into a customer policy paragraph.</li>
+  <li>What does a high scorecard on a killed engagement mean?</li>
+</ol>
+
+<h2>Next Steps</h2>
+<p>This volume ends the forward-deployed delivery arc of the book series. For interview
+preparation and the collected glossary, paper cards and question bank, re-enter
+<strong>Volume 25 · Reference</strong>. For building and operating the integrated system
+FDEs configure on-site, return to <strong>Volume 24 · Capstone: The Complete AI
+Platform</strong>. Product-shaped case studies and evidence discipline live in
+<strong>Volume 21</strong>; keep Documented versus Inferred labels in every customer
+artefact you touch next.</p>
+<p class="facet">Continuous practice</p>
+<ul>
+  <li>Keep one engagement brief and handoff packet in your portfolio — even fictional.</li>
+  <li>Refuse to present productivity numbers without an evidence label.</li>
+  <li>Prefer killing early to demoing forever.</li>
+</ul>
+</section>
+
+<!-- end of Volume 27 · Forward Deployed AI Engineering -->
+<p class="no-toc" hidden>Volume 27 complete.</p>
+
+</body>
+</html>

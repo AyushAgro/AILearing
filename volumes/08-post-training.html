@@ -1,0 +1,2168 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 8 · Fine-Tuning and Post-Training</title>
+<meta name="volume" content="Volume 8 · Fine-Tuning and Post-Training">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 8</p>
+  <h1 class="no-toc">Fine-Tuning and Post-Training</h1>
+  <p class="tp-subtitle">SFT, PEFT, LoRA, RLHF, DPO and Domain Adaptation</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Turn a pretrained base model into a useful, aligned or domain-adapted model, and know when not to.</li>
+  <li>Implement every core post-training algorithm from scratch in PyTorch: masked SFT, LoRA, blockwise 4-bit quantisation, replay-based continued pretraining, Bradley–Terry reward models, PPO with a KL penalty, DPO and IPO, distillation and model merging.</li>
+  <li>Verify each implementation against a closed form, an analytical gradient or a parity test, not just a falling loss curve.</li>
+  <li>Map the from-scratch code onto Hugging Face PEFT and TRL, and wrap training in evaluation gates and model cards.</li>
+  <li>Ship the continuous package as <code>forge.posttrain</code> (SFT, LoRA, RM, PPO, DPO, distill, merge).</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>Volume 4 (training loop, cross-entropy, a small GPT / <code>forge.train</code>) and Volume 6 (mixed precision, optimiser-state memory, distributed training).</li>
+  <li>Comfort with policy gradients at the level of REINFORCE. Everything RLHF-specific is derived here.</li>
+  <li>Volume 10 (evaluation engineering) is previewed; Chapter 12 uses only its simplest statistics.</li>
+</ul>
+
+<p class="facet">How to read the code</p>
+<ul>
+  <li>Every listing was executed on an Apple M2 laptop CPU (Python 3.12, PyTorch 2.10, Transformers 5.6). Printed output is real and each run took under 30 seconds.</li>
+  <li>Listings seed <code>src/forge/posttrain/</code>; later volumes import the same APIs.</li>
+  <li>The only model download is <code>HuggingFaceTB/SmolLM2-135M</code> (Volume 1, Chapter 3). The remaining experiments use toy models chosen so that the right answer is known in closed form.</li>
+  <li>PEFT, TRL and bitsandbytes were <strong>not</strong> installed for this volume. Chapter 12 maps concepts to their APIs in tables rather than showing unexecuted code.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1  When to fine-tune      prompt vs RAG vs tools vs SFT vs continued pretraining
+Chapter 2  SFT                    chat templates, loss masking, packing, forgetting
+Chapter 3  Instruction data       human, Self-Instruct, synthetic; filtering; licences
+Chapter 4  PEFT and LoRA          LoRALinear from scratch, merge/unmerge, rank
+Chapter 5  QLoRA                  NF4, blockwise absmax, double quantisation, memory
+Chapter 6  Continued pretraining  replay, re-warming, forgetting measurement
+Chapter 7  Reward models          Bradley-Terry, accuracy, length bias, hacking
+Chapter 8  RLHF with PPO          KL-regularised RL, clipped surrogate, 4 models
+Chapter 9  DPO and variants       derivation, implementation, IPO/KTO/ORPO/SimPO
+Chapter 10 AI feedback            RLAIF, constitutions, critique-and-revise
+Chapter 11 Distillation, merging  KD with temperature, soups, task arithmetic, TIES
+Chapter 12 Production             PEFT/TRL mapping, gates, model cards, release</pre>
+<figcaption>Map of Volume 8.</figcaption>
+</figure>
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="when-to-fine-tune">When to Fine-Tune</h2>
+<p class="chapter-lede">Fine-tuning is the most expensive lever you can pull on a model's behaviour,
+and the one with the longest maintenance tail. Most teams that ask "should we fine-tune?" have a
+retrieval, prompting or evaluation problem. This chapter is a decision procedure.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A support assistant built on a hosted model answers 71% of tickets acceptably. Product wants
+  90%. Someone proposes fine-tuning an open 8B model on 20,000 historical tickets. Before anyone
+  rents GPUs, you must answer: which failures would fine-tuning fix, which would it make worse, and
+  what would it cost to keep the fine-tuned model current for two years?</p>
+</div>
+
+<p class="facet">Classify the failure first</p>
+<ul>
+  <li><strong>Knowledge gap</strong>: the model does not know a fact (a policy changed last week). Fine-tuning is a poor, lossy, stale-by-design database. Use retrieval (Volume 14).</li>
+  <li><strong>Capability gap</strong>: the model cannot do the reasoning or transformation even with the facts in context. Use a stronger model, decomposition, or tools; fine-tuning rarely adds new reasoning ability at small data scale.</li>
+  <li><strong>Behaviour gap</strong>: the model can do it but not reliably in your format, tone, length or policy. This is what SFT and preference tuning are best at.</li>
+  <li><strong>Efficiency gap</strong>: a large model does it well but is too slow or expensive. Distil into a smaller model (Chapter 11).</li>
+  <li><strong>Distribution gap</strong>: a whole domain's language (legal, clinical, a low-resource language, a codebase) is under-represented. Continued pretraining (Chapter 6).</li>
+</ul>
+
+<h3>Decision Table</h3>
+
+<table>
+  <caption>Problem-first comparison of adaptation levers. "Does not solve" is the column most teams skip.</caption>
+  <thead><tr><th>Lever</th><th>Solves</th><th>Does not solve</th><th>Data needed</th><th>Iteration time</th><th>Maintenance</th></tr></thead>
+  <tbody>
+    <tr><td>Prompting (instructions, few-shot, schemas)</td><td>Format, tone, simple policies, task framing</td><td>Missing knowledge; long-tail behaviours that need hundreds of examples; token cost of long prompts</td><td>5–50 examples for evaluation</td><td>Minutes</td><td>Prompt versioning; re-test on model upgrades</td></tr>
+    <tr><td>RAG</td><td>Fresh, private, citable knowledge; per-user access control</td><td>Style and format; reasoning over the retrieved text; retrieval misses</td><td>A corpus and 100+ labelled queries</td><td>Hours</td><td>Index freshness, chunking, retriever evaluation</td></tr>
+    <tr><td>Tools / function calling</td><td>Exact computation, live state, actions, authorisation</td><td>Choosing tools well without good descriptions; natural-language quality</td><td>Tool schemas and traces</td><td>Hours–days</td><td>API contracts, permissions (Volume 15)</td></tr>
+    <tr><td>SFT / LoRA</td><td>Reliable format, style, domain phrasing, narrow skills, shorter prompts</td><td>Knowledge that changes; hallucination in general; capabilities the base lacks</td><td>1k–100k curated demonstrations</td><td>Hours–days per run</td><td>Retrain on every base-model upgrade; regression suites</td></tr>
+    <tr><td>Preference tuning (DPO, RLHF)</td><td>Choosing between plausible outputs: helpfulness, harmlessness, verbosity, refusal calibration</td><td>Missing skills; anything the SFT model never produces</td><td>5k–500k preference pairs</td><td>Days</td><td>Reward hacking audits; labeller drift</td></tr>
+    <tr><td>Continued pretraining</td><td>Domain vocabulary, notation, under-represented languages</td><td>Instruction following (you must redo SFT); small data (&lt; 100M tokens rarely worth it)</td><td>100M–100B tokens</td><td>Days–weeks</td><td>Forgetting audits; full post-training rerun</td></tr>
+    <tr><td>Distillation</td><td>Latency and cost of a model that already works</td><td>Quality beyond the teacher; out-of-distribution robustness</td><td>Teacher outputs on 10k–1M prompts</td><td>Days</td><td>Re-distil when the teacher changes; licence terms</td></tr>
+  </tbody>
+</table>
+
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  A[Failure found in evaluation] --> B{Is the needed fact in the prompt?}
+  B -->|No| C[RAG or tools first]
+  B -->|Yes| D{Does a stronger model succeed with the same prompt?}
+  D -->|No| E[Decompose the task or add tools]
+  D -->|Yes| F{Is the gap cost or latency?}
+  F -->|Yes| G[Distil or route to a cheaper model]
+  F -->|No| H{Behaviour, format or style?}
+  H -->|Yes| I[Prompt harder, then SFT with LoRA]
+  H -->|No| J{Whole domain language missing?}
+  J -->|Yes| K[Continued pretraining then SFT]
+  J -->|No| L[Collect more evaluation data]</pre>
+<figcaption>Triage before training. Every branch assumes an evaluation set already exists.</figcaption>
+</figure>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Fine-tuning changes <em>which</em> outputs a model prefers far more than <em>what</em> it knows. LIMA (Zhou et al., 2023) argued that almost all knowledge comes from pretraining and alignment mainly teaches format: 1,000 curated examples were enough to make a 65B LLaMA a competitive assistant.</li>
+    <li>If a stronger model solves the task with the same prompt, the task is learnable, and distillation or SFT is plausible. If no model solves it, fine-tuning is unlikely to be the fix.</li>
+  </ul>
+</aside>
+
+<h3>Cost and Maintenance</h3>
+
+<ul>
+  <li><strong>Compute is the small cost.</strong> A LoRA run on 10k examples of an 8B model costs tens of GPU-hours. Data curation, evaluation and re-runs cost engineer-weeks.</li>
+  <li><strong>The base model will change.</strong> A fine-tune is pinned to one checkpoint. When a better base ships, you redo SFT, preference tuning and every evaluation. Budget for at least two re-runs per year.</li>
+  <li><strong>You now own serving.</strong> A fine-tuned open model needs inference infrastructure (Volume 12), or a hosted fine-tuning API with its own lock-in.</li>
+  <li><strong>Regression surface grows.</strong> Every post-training step can degrade unrelated abilities (safety, maths, multilingual). You need a regression suite, not just a target-task metric.</li>
+</ul>
+
+<h3>What Fine-Tuning Cannot Fix</h3>
+<ul class="failure-modes">
+  <li><strong>Hallucination of facts</strong>: SFT on facts the model did not know tends to teach it to produce confident answers in that style, including for facts it still does not know. Gekhman et al. (2024) found that fine-tuning on new knowledge is learned slowly and increases hallucination.</li>
+  <li><strong>Freshness</strong>: weights are a snapshot. Anything that changes weekly belongs in retrieval.</li>
+  <li><strong>Access control</strong>: weights cannot enforce "user A may see document X". Put authorisation in the retrieval and tool layers (Volume 17).</li>
+  <li><strong>Missing evaluation</strong>: without a test set you cannot tell whether the fine-tune helped. Build the evaluation first.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>A fine-tuned small model can match a large prompted model on a narrow task at a tenth of the serving cost. The price is ownership: data pipeline, training, evaluation and serving. Decide on total cost of ownership over the model's lifetime, not on per-token price.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="sft">Supervised Fine-Tuning and Instruction Tuning</h2>
+<p class="chapter-lede">SFT is ordinary next-token training on demonstrations, with two details that
+decide whether it works: how conversations are serialised into tokens, and which tokens receive
+loss.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>A base model continues text; it does not answer questions. Asked "What is LoRA?", SmolLM2-135M
+  may continue with more questions from a quiz. We want a model that, given a conversation, produces
+  the assistant's next turn and then stops.</p>
+</div>
+
+<h3>The Objective</h3>
+<p>Let a conversation be serialised into tokens <span class="math">x_1, \dots, x_T</span> and let
+<span class="math">M</span> be the set of positions belonging to assistant turns. SFT minimises</p>
+<div class="math">\mathcal{L}_{\text{SFT}}(\theta) = -\frac{1}{|M|} \sum_{t \in M} \log p_\theta(x_t \mid x_{&lt;t})</div>
+<ul>
+  <li>This is Volume 4's cross-entropy, restricted to <span class="math">M</span>. Prompt tokens still pass through the model as context; they just contribute no gradient.</li>
+  <li>In PyTorch and Hugging Face the restriction is implemented by setting label <code>-100</code> (the <code>ignore_index</code> of <code>F.cross_entropy</code>) on every position outside <span class="math">M</span>.</li>
+  <li>Normalisation matters: dividing by <span class="math">|M|</span> per batch weights every token equally; dividing per sequence weights every example equally. With gradient accumulation, normalise by the total count of unmasked tokens across micro-batches, or short answers get over-weighted.</li>
+</ul>
+
+<h3>Chat Templates</h3>
+<ul>
+  <li>A chat template is a Jinja program that turns a list of <code>{"role", "content"}</code> messages into a string with special tokens. It is part of the model's interface: training and inference must use the <em>identical</em> template.</li>
+  <li>Base checkpoints often ship no template. SmolLM2-135M's tokeniser has <code>chat_template = None</code>; its instruct sibling uses ChatML (<code>&lt;|im_start|&gt;role\n…&lt;|im_end|&gt;</code>), whose special tokens already exist in the base vocabulary as ids 1 and 2.</li>
+  <li><code>add_generation_prompt=True</code> appends the header of an empty assistant turn. The model generates from there; this is also where loss masking should start.</li>
+  <li>The end-of-turn token must be <strong>in</strong> the loss. A model never trained to emit <code>&lt;|im_end|&gt;</code> never stops.</li>
+</ul>
+
+<h4>Loss Masking with a Real Tokeniser</h4>
+
+<figure class="listing">
+<figcaption>Building SFT labels with <code>apply_chat_template</code>: mask everything up to and including the assistant header (sft_mask.py).</figcaption>
+<pre><code>import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+torch.manual_seed(0)
+name = "HuggingFaceTB/SmolLM2-135M"
+tok = AutoTokenizer.from_pretrained(name)
+print("base chat_template:", tok.chat_template)
+# ChatML, the template used by SmolLM2-Instruct; the base checkpoint ships none.
+tok.chat_template = (
+    "{% for m in messages %}"
+    "{{ '&lt;|im_start|&gt;' + m['role'] + '\n' + m['content'] + '&lt;|im_end|&gt;' + '\n' }}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}{{ '&lt;|im_start|&gt;assistant\n' }}{% endif %}"
+)
+
+
+def build_example(messages, tok):
+    """Token ids and labels; loss only on the final assistant turn."""
+    prompt_ids = tok.apply_chat_template(messages[:-1], add_generation_prompt=True,
+                                         tokenize=True, return_dict=False)
+    full_ids = tok.apply_chat_template(messages, tokenize=True, return_dict=False)
+    assert full_ids[: len(prompt_ids)] == prompt_ids, "template is not prefix-stable"
+    labels = [-100] * len(prompt_ids) + full_ids[len(prompt_ids):]
+    return torch.tensor(full_ids), torch.tensor(labels)
+
+
+msgs = [
+    {"role": "system", "content": "Answer in one sentence."},
+    {"role": "user", "content": "What is LoRA?"},
+    {"role": "assistant", "content": "A low-rank update to frozen weights."},
+]
+ids, labels = build_example(msgs, tok)
+print(repr(tok.decode(ids)))
+print("total tokens:", len(ids), " trained tokens:", int((labels != -100).sum()))
+for i, l in zip(ids.tolist()[-12:], labels.tolist()[-12:]):
+    print(f"{tok.convert_ids_to_tokens(i)!r:&gt;14}  label={l}")
+
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).eval()
+with torch.no_grad():
+    masked = model(ids[None], labels=labels[None]).loss
+    full = model(ids[None], labels=ids[None]).loss
+print(f"loss on assistant tokens only: {masked.item():.3f}")
+print(f"loss on every token:           {full.item():.3f}")</code></pre>
+</figure>
+
+<pre class="output">base chat_template: None
+'&lt;|im_start|&gt;system\nAnswer in one sentence.&lt;|im_end|&gt;\n&lt;|im_start|&gt;user\nWhat is LoRA?&lt;|im_end|&gt;\n&lt;|im_start|&gt;assistant\nA low-rank update to frozen weights.&lt;|im_end|&gt;\n'
+total tokens: 35  trained tokens: 11
+           'Ċ'  label=-100
+           'A'  label=49
+        'Ġlow'  label=1642
+           '-'  label=29
+        'rank'  label=12797
+     'Ġupdate'  label=6850
+         'Ġto'  label=288
+     'Ġfrozen'  label=12197
+    'Ġweights'  label=10379
+           '.'  label=30
+  '&lt;|im_end|&gt;'  label=2
+           'Ċ'  label=198
+loss on assistant tokens only: 7.554
+loss on every token:           7.989</pre>
+
+<ul>
+  <li>Only 11 of 35 tokens are trained. The <code>&lt;|im_end|&gt;</code> token (id 2) is in the loss, so the model learns to stop.</li>
+  <li>The trailing newline after <code>&lt;|im_end|&gt;</code> is also trained here. It is harmless because generation stops at <code>&lt;|im_end|&gt;</code>, but many recipes strip it; be deliberate either way.</li>
+  <li>Labels are aligned with inputs; the model shifts them internally (position <span class="math">t</span> predicts label <span class="math">t+1</span>). Shifting twice is the most common SFT bug: loss still falls, but the model learns to copy.</li>
+  <li>The prefix-stability assertion matters. Some templates render the <em>last</em> assistant turn differently (for example, removing reasoning from earlier turns), so the prompt ids are not a prefix of the full ids. Masking by prefix length then silently masks the wrong tokens.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Multi-turn conversations</span>
+  <ul>
+    <li>For multi-turn data, train on <em>every</em> assistant turn, not just the last: render once and mask by role span. Hugging Face templates that wrap assistant content in <code>{% generation %}</code> blocks let <code>apply_chat_template(..., return_assistant_tokens_mask=True)</code> return this mask directly.</li>
+    <li>Tool calls and tool results are separate roles. Train on the model's tool-call tokens; never train on tool outputs, which the model did not produce.</li>
+  </ul>
+</aside>
+
+<h3>Packing</h3>
+<ul>
+  <li><strong>Problem</strong>: instruction examples are short (a few hundred tokens) and highly variable in length. Padding a batch to its longest member wastes most of the compute.</li>
+  <li><strong>Naive packing</strong> concatenates examples into fixed-length rows separated by EOS. It fills the GPU, but causal attention now lets example 2 attend to example 1, which contaminates the context and teaches the model that unrelated conversations precede each turn.</li>
+  <li><strong>Correct packing</strong> keeps a per-row list of document boundaries and uses a block-diagonal causal mask, with position ids reset at each boundary. FlashAttention's variable-length kernels (<code>cu_seqlens</code>) implement this without materialising the mask.</li>
+  <li><strong>Loss normalisation</strong> changes with packing: a packed row mixes many examples, so per-sequence averaging is no longer per-example averaging.</li>
+</ul>
+
+<h3>Data Quality over Quantity</h3>
+<ul>
+  <li>LIMA (1,000 examples) and the FLAN line (Wei et al., 2021; Chung et al., 2022) sit at opposite ends: a small amount of high-quality, diverse data aligns format; a large mixture of tasks with templates improves zero-shot generalisation across tasks.</li>
+  <li>Repeated low-quality demonstrations (refusal boilerplate, truncated answers, wrong code) are learned faithfully. SFT imitates; it does not filter.</li>
+  <li>Response style dominates: if 30% of demonstrations start with "Certainly!", so will 30% of outputs.</li>
+</ul>
+
+<h3>Catastrophic Forgetting</h3>
+<ul>
+  <li>Full fine-tuning on a narrow distribution moves every weight towards that distribution. Abilities not exercised by the SFT data (other languages, maths, safety refusals) degrade.</li>
+  <li>Mitigations, in order of cost: lower learning rate and fewer epochs; LoRA (Biderman et al., 2024: "LoRA learns less and forgets less"); mixing in general instruction data; replay of pretraining data (Chapter 6); regularisers such as EWC (Kirkpatrick et al., 2017), rarely used at LLM scale.</li>
+  <li>Measure it: keep a frozen regression suite (general benchmarks, safety set, your previous tasks) and report deltas against the base for every checkpoint.</li>
+</ul>
+
+<ul class="failure-modes">
+  <li>Template mismatch between training and serving (different system prompt, missing generation header): quality drops sharply with no error.</li>
+  <li>EOS not trained: the model rambles into a fake user turn.</li>
+  <li>Loss on prompts: the model learns to generate user questions and system prompts; prompt-injection text in data becomes behaviour.</li>
+  <li>Too many epochs on small data: verbatim memorisation of training answers; evaluation looks great if the test set leaks.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="instruction-data">Instruction Data</h2>
+<p class="chapter-lede">The model you get is the data you train on. Instruction data pipelines have
+three sources, one filter stack and one legal question, and the filter stack is where most of the
+engineering goes.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>You need 20,000 high-quality demonstrations for an internal coding assistant. Human experts
+  cost roughly USD 5–50 per example. A frontier model can generate 20,000 in an hour for a few
+  hundred dollars. The generated set is cheaper, more consistent and more fluent, and it has
+  duplicates, subtle errors, a narrow style and possibly licence restrictions.</p>
+</div>
+
+<h3>Sources</h3>
+<table>
+  <caption>Instruction data sources and what each does not give you.</caption>
+  <thead><tr><th>Source</th><th>Strength</th><th>Does not give you</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr><td>Human-written demonstrations</td><td>Correctness in expert domains; realistic user intent</td><td>Scale; consistency between writers</td><td>InstructGPT: ~13k SFT prompts written or collected by ~40 contractors (Ouyang et al., 2022)</td></tr>
+    <tr><td>Converted task datasets</td><td>Huge task diversity cheaply</td><td>Natural conversational style; long-form answers</td><td>FLAN collections (Wei et al., 2021; Chung et al., 2022)</td></tr>
+    <tr><td>Self-Instruct</td><td>Scale from 175 seed tasks</td><td>Correctness; diversity beyond the generator's prior</td><td>Wang et al., 2022: 52k instructions from GPT-3 itself</td></tr>
+    <tr><td>Distillation from a stronger model</td><td>Fluent, consistent, cheap</td><td>Capabilities the student cannot learn by imitation; licence freedom</td><td>Alpaca, Vicuna-style data; Gudibande et al., 2023 on limits</td></tr>
+    <tr><td>Production logs</td><td>Exact target distribution</td><td>Good responses (logs contain the bad ones too); consent</td><td>Human-edited drafts from your own product</td></tr>
+  </tbody>
+</table>
+
+<h4>The Self-Instruct Loop</h4>
+<ol>
+  <li>Seed a task pool with human-written tasks (175 in the paper).</li>
+  <li>Prompt the model with 8 sampled tasks (6 human, 2 generated) to propose new instructions.</li>
+  <li>Classify each as classification or generation; generate inputs and outputs (output-first for classification to avoid label imbalance).</li>
+  <li>Filter: drop instructions with ROUGE-L &gt; 0.7 to any existing one, keywords the model cannot handle (images, files), and malformed outputs.</li>
+  <li>Add survivors to the pool and repeat.</li>
+</ol>
+
+<h3>A Filter Stack</h3>
+<figure class="listing">
+<figcaption>Exact dedup, length and boilerplate filters, and shingle-based near-dedup (datafilter.py).</figcaption>
+<pre><code>import hashlib
+import re
+from collections import Counter
+
+raw = [
+    {"prompt": "Explain LoRA.", "response": "LoRA freezes W and learns a low-rank "
+     "update BA, so only r(d_in + d_out) parameters train per matrix."},
+    {"prompt": "Explain  LoRA.", "response": "LoRA freezes W and learns a low-rank "
+     "update BA, so only r(d_in + d_out) parameters train per matrix."},
+    {"prompt": "Explain LoRA briefly", "response": "LoRA freezes W and learns a "
+     "low-rank update BA, so only r(d_in+d_out) parameters train per matrix!"},
+    {"prompt": "What is DPO?", "response": "As an AI language model, I cannot..."},
+    {"prompt": "Summarise PPO.", "response": "ok"},
+    {"prompt": "Write a haiku about GPUs", "response": "Silicon rivers / "
+     "matrices bloom in the heat / fans sing all night long"},
+    {"prompt": "Give the NF4 bit width.", "response": "NF4 stores 4 bits per weight "
+     "plus one absmax constant per block of 64."},
+]
+
+
+def norm(t):
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", t.lower())).strip()
+
+
+def shingles(t, n=3):
+    w = norm(t).split()
+    return {" ".join(w[i:i + n]) for i in range(max(1, len(w) - n + 1))}
+
+
+def jaccard(a, b):
+    return len(a &amp; b) / max(1, len(a | b))
+
+
+REFUSAL = re.compile(r"as an ai language model|i cannot help", re.I)
+kept, seen_exact, reasons = [], set(), Counter()
+for ex in raw:
+    text = ex["prompt"] + "\n" + ex["response"]
+    h = hashlib.sha256(norm(text).encode()).hexdigest()
+    if h in seen_exact:
+        reasons["exact duplicate"] += 1; continue
+    if len(ex["response"].split()) &lt; 4:
+        reasons["too short"] += 1; continue
+    if REFUSAL.search(ex["response"]):
+        reasons["boilerplate refusal"] += 1; continue
+    sh = shingles(ex["response"])
+    if any(jaccard(sh, shingles(k["response"])) &gt; 0.6 for k in kept):
+        reasons["near duplicate"] += 1; continue
+    seen_exact.add(h); kept.append(ex)
+
+print(f"kept {len(kept)}/{len(raw)}:", dict(reasons))
+for k in kept:
+    print(" -", k["prompt"])</code></pre>
+</figure>
+<pre class="output">kept 3/7: {'exact duplicate': 1, 'near duplicate': 1, 'boilerplate refusal': 1, 'too short': 1}
+ - Explain LoRA.
+ - Write a haiku about GPUs
+ - Give the NF4 bit width.</pre>
+
+<ul>
+  <li>The pairwise loop is <span class="math">O(n^2)</span>. At scale use MinHash with locality-sensitive hashing (Volume 5), then embedding-based semantic dedup for paraphrases.</li>
+  <li>The threshold is data-dependent: at <span class="math">n=5</span> shingles and 0.7, the "briefly" paraphrase survived (Jaccard 0.61 at <span class="math">n=3</span>). Tune on a labelled sample of duplicate pairs.</li>
+</ul>
+
+<p class="facet">Production filter stack</p>
+<ul>
+  <li><strong>Correctness</strong>: execute generated code against tests; check maths with a solver; for prose, an LLM judge with a rubric plus human audit of a random sample.</li>
+  <li><strong>Diversity</strong>: cluster prompt embeddings and cap examples per cluster; track instruction verb and topic distributions; over-sample the tail.</li>
+  <li><strong>Difficulty</strong>: drop examples the base model already answers perfectly (they add little); keep hard-but-correct ones.</li>
+  <li><strong>Decontamination</strong>: n-gram and embedding overlap against every evaluation set you will report.</li>
+  <li><strong>Safety and PII</strong>: remove personal data, secrets and toxic content (Volume 5 filters apply).</li>
+</ul>
+
+<h3>Licence Hygiene</h3>
+<ul>
+  <li>Many model providers' terms restrict using outputs to train competing models. Dataset licences (for example, non-commercial) propagate to your fine-tuned weights in practice even where the legal position is unsettled.</li>
+  <li>Keep a manifest per dataset: source, licence, generating model and its terms, date, filters applied, content hash. This becomes the "Training data" section of the model card (Chapter 12).</li>
+</ul>
+
+<aside class="callout security"><span class="title">Data poisoning</span>
+  <ul>
+    <li>Instruction data scraped from the web or user logs can contain deliberately planted trigger–behaviour pairs. A few hundred poisoned examples can install a backdoor that standard evaluations never trigger. Treat third-party instruction datasets as untrusted input (Volume 17).</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="peft">Parameter-Efficient Fine-Tuning</h2>
+<p class="chapter-lede">Full fine-tuning updates every weight and stores a full copy per task. PEFT
+freezes the base and trains a small number of new parameters. LoRA won because it adds zero
+inference latency after merging.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Full fine-tuning of an 8B model with Adam needs about 16 bytes per parameter (Volume 1): 128 GB
+  before activations. Serving 50 customer-specific variants would need 50 copies of 16 GB of
+  weights. We want per-task training that fits on one GPU and per-task artefacts measured in
+  megabytes.</p>
+</div>
+
+<h3>Possible Solutions</h3>
+<table>
+  <caption>PEFT families.</caption>
+  <thead><tr><th>Method</th><th>What trains</th><th>Inference cost</th><th>Does not solve</th></tr></thead>
+  <tbody>
+    <tr><td>Adapters (Houlsby et al., 2019)</td><td>Small bottleneck MLPs inserted after attention and MLP sublayers</td><td>Extra sequential layers: added latency at batch size 1</td><td>Latency; cannot be merged</td></tr>
+    <tr><td>Prefix tuning (Li &amp; Liang, 2021)</td><td>Trainable key/value vectors prepended at every layer</td><td>Consumes context length</td><td>Stable optimisation; strong performance on small models</td></tr>
+    <tr><td>Prompt tuning (Lester et al., 2021)</td><td>Soft prompt embeddings at the input only</td><td>A few extra tokens</td><td>Competitive quality below ~10B parameters</td></tr>
+    <tr><td>LoRA (Hu et al., 2021)</td><td>Low-rank <span class="math">\Delta W = BA</span> on chosen matrices</td><td>Zero after merging</td><td>Tasks needing high-rank updates (for example, continued pretraining)</td></tr>
+    <tr><td>DoRA (Liu et al., 2024)</td><td>LoRA on the direction plus a learned magnitude vector</td><td>Zero after merging</td><td>Extra training cost; small gains</td></tr>
+  </tbody>
+</table>
+
+<h3>LoRA Derivation</h3>
+<p>For a frozen weight <span class="math">W_0 \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}</span>, LoRA constrains the update to rank <span class="math">r \ll \min(d_{\text{in}}, d_{\text{out}})</span>:</p>
+<div class="math">h = W_0 x + \Delta W x = W_0 x + \frac{\alpha}{r} B A x, \qquad B \in \mathbb{R}^{d_{\text{out}} \times r},\; A \in \mathbb{R}^{r \times d_{\text{in}}}</div>
+<ul>
+  <li><strong>Hypothesis</strong> (Hu et al., 2021, building on intrinsic-dimension results): the update needed for adaptation has low intrinsic rank, even though <span class="math">W_0</span> is full rank.</li>
+  <li><strong>Parameters</strong>: <span class="math">r(d_{\text{in}} + d_{\text{out}})</span> instead of <span class="math">d_{\text{in}} d_{\text{out}}</span>.</li>
+  <li><strong>Initialisation</strong>: <span class="math">A</span> random, <span class="math">B = 0</span>, so <span class="math">\Delta W = 0</span> at step 0. The fine-tune starts exactly at the base model. Initialising both randomly would perturb the model before training.</li>
+  <li><strong>Scaling</strong>: <span class="math">\alpha / r</span> keeps the effective learning rate of <span class="math">\Delta W</span> roughly constant when you change <span class="math">r</span>, so you can sweep rank without retuning the learning rate. rsLoRA argues <span class="math">\alpha/\sqrt{r}</span> is the stable choice at high rank.</li>
+  <li><strong>Merging</strong>: <span class="math">W = W_0 + \frac{\alpha}{r} BA</span> is an ordinary dense matrix, so a merged model has no extra latency. Unmerging subtracts it again, which lets one server hot-swap adapters.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">            x (d_in)
+            |
+     +------+----------------+
+     |                       |
+     v                       v
+ W0 (frozen)            A (r x d_in)   random init
+ d_out x d_in                |
+     |                       v
+     |                  B (d_out x r)  zero init
+     |                       |
+     |                   x alpha/r
+     v                       v
+     +---------- + ----------+
+                 |
+                 v
+             h (d_out)</pre>
+<figcaption>LoRA forward pass. Only A and B receive gradients.</figcaption>
+</figure>
+
+<h3>LoRALinear from Scratch</h3>
+<figure class="listing">
+<figcaption>LoRALinear with merge/unmerge, a parity test, parameter savings and a rank sweep on a rank-4 target (lora.py).</figcaption>
+<pre><code>import math
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+torch.set_num_threads(2)
+
+
+class LoRALinear(nn.Module):
+    """y = x W0^T + (alpha/r) * x A^T B^T, with W0 frozen."""
+
+    def __init__(self, base: nn.Linear, r: int = 8, alpha: float = 16.0,
+                 dropout: float = 0.0):
+        super().__init__()
+        self.base = base
+        for p in self.base.parameters():
+            p.requires_grad_(False)
+        self.r, self.scale = r, alpha / r
+        self.A = nn.Parameter(torch.empty(r, base.in_features))   # (r, d_in)
+        self.B = nn.Parameter(torch.zeros(base.out_features, r))  # (d_out, r)
+        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+        self.drop = nn.Dropout(dropout)
+        self.merged = False
+
+    def forward(self, x):                                          # (..., d_in)
+        y = self.base(x)
+        if not self.merged:
+            y = y + (self.drop(x) @ self.A.T @ self.B.T) * self.scale
+        return y
+
+    def delta(self):
+        return (self.B @ self.A) * self.scale                      # (d_out, d_in)
+
+    @torch.no_grad()
+    def merge(self):
+        if not self.merged:
+            self.base.weight += self.delta()
+            self.merged = True
+
+    @torch.no_grad()
+    def unmerge(self):
+        if self.merged:
+            self.base.weight -= self.delta()
+            self.merged = False
+
+
+# 1. Zero-init B: the wrapped layer is exactly the base layer at step 0.
+base = nn.Linear(512, 512)
+lora = LoRALinear(base, r=8, alpha=16)
+x = torch.randn(4, 512)
+print("step-0 max |lora(x) - base(x)|:", (lora(x) - base(x)).abs().max().item())
+
+# 2. Merge/unmerge parity after B becomes non-zero.
+with torch.no_grad():
+    lora.B.normal_(0, 0.02)
+y_unmerged = lora(x)
+w_before = base.weight.clone()
+lora.merge()
+y_merged = lora(x)
+lora.unmerge()
+print("merged vs unmerged max diff:", (y_merged - y_unmerged).abs().max().item())
+print("weight restored after unmerge:",
+      torch.allclose(base.weight, w_before, atol=1e-6))
+
+# 3. Parameter savings.
+for d, r in [(4096, 8), (4096, 16), (8192, 64)]:
+    full, low = d * d, r * (2 * d)
+    print(f"d={d:5d} r={r:3d}: full={full:&gt;11,} lora={low:&gt;9,} "
+          f"ratio={low / full:.4%}")
+
+# 4. Tiny fine-tune: the target is W0 plus a rank-4 change.
+d_in, d_out, true_rank = 64, 64, 4
+W0 = torch.randn(d_out, d_in) / math.sqrt(d_in)
+dW = (torch.randn(d_out, true_rank) @ torch.randn(true_rank, d_in)) * 0.1
+X = torch.randn(2048, d_in)
+Y = X @ (W0 + dW).T
+
+for r in [1, 4, 8]:
+    torch.manual_seed(1)
+    base = nn.Linear(d_in, d_out, bias=False)
+    base.weight.data.copy_(W0)
+    m = LoRALinear(base, r=r, alpha=2 * r)
+    opt = torch.optim.Adam([m.A, m.B], lr=1e-2)
+    trace = []
+    for step in range(301):
+        idx = torch.randint(0, len(X), (128,))
+        loss = ((m(X[idx]) - Y[idx]) ** 2).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+        if step in (0, 50, 100, 300):
+            trace.append(f"{loss.item():.5f}")
+    n_train = sum(p.numel() for p in m.parameters() if p.requires_grad)
+    print(f"r={r}: trainable={n_train:5d} loss@0,50,100,300 = {', '.join(trace)}")</code></pre>
+</figure>
+<pre class="output">step-0 max |lora(x) - base(x)|: 0.0
+merged vs unmerged max diff: 2.384185791015625e-06
+weight restored after unmerge: True
+d= 4096 r=  8: full= 16,777,216 lora=   65,536 ratio=0.3906%
+d= 4096 r= 16: full= 16,777,216 lora=  131,072 ratio=0.7812%
+d= 8192 r= 64: full= 67,108,864 lora=1,048,576 ratio=1.5625%
+r=1: trainable=  128 loss@0,50,100,300 = 2.53488, 1.86513, 1.87713, 1.44593
+r=4: trainable=  512 loss@0,50,100,300 = 2.29520, 0.06454, 0.00047, 0.00000
+r=8: trainable= 1024 loss@0,50,100,300 = 2.47277, 0.02541, 0.00033, 0.00000</pre>
+
+<ul>
+  <li><strong>Parity</strong>: merged and unmerged outputs agree to <span class="math">2.4 \times 10^{-6}</span> in fp32. In bf16, merge-then-unmerge is <em>not</em> exact: rounding the merged weight loses bits. Keep an fp32 or original copy if you hot-swap adapters repeatedly.</li>
+  <li><strong>Rank</strong>: rank 1 cannot represent a rank-4 update and plateaus; rank 4 and 8 fit exactly. Real updates are not exactly low rank, so the question is how much of the spectrum matters for your task, which you answer with a rank sweep on your evaluation set.</li>
+</ul>
+
+<h4>LoRA on a Real Model</h4>
+<figure class="listing">
+<figcaption>Wrapping SmolLM2-135M's q_proj and v_proj with LoRALinear and training on four masked chat examples (lora_smol.py; imports the two listings above).</figcaption>
+<pre><code>import time
+import torch
+import torch.nn as nn
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from lora import LoRALinear
+from sft_mask import build_example, tok  # ChatML tokeniser from the SFT listing
+
+torch.manual_seed(0)
+torch.set_num_threads(4)
+model = AutoModelForCausalLM.from_pretrained("HuggingFaceTB/SmolLM2-135M",
+                                             dtype=torch.float32)
+for p in model.parameters():
+    p.requires_grad_(False)
+
+
+def add_lora(model, targets=("q_proj", "v_proj"), r=8, alpha=16):
+    for layer in model.model.layers:
+        attn = layer.self_attn
+        for t in targets:
+            setattr(attn, t, LoRALinear(getattr(attn, t), r=r, alpha=alpha))
+
+
+add_lora(model)
+total = sum(p.numel() for p in model.parameters())
+train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"total={total:,} trainable={train:,} ({train / total:.3%})")
+
+data = [
+    ("What is LoRA?", "A low-rank update to frozen weights."),
+    ("What is DPO?", "Preference optimisation without a reward model."),
+    ("What is SFT?", "Supervised training on demonstrations."),
+    ("What is QLoRA?", "LoRA on a 4-bit quantised base model."),
+]
+batch = [build_example([{"role": "user", "content": q},
+                        {"role": "assistant", "content": a}], tok) for q, a in data]
+L = max(len(i) for i, _ in batch)
+pad = tok.convert_tokens_to_ids("&lt;|endoftext|&gt;")
+ids = torch.stack([nn.functional.pad(i, (0, L - len(i)), value=pad) for i, _ in batch])
+lab = torch.stack([nn.functional.pad(l, (0, L - len(l)), value=-100) for _, l in batch])
+att = (torch.arange(L)[None] &lt; torch.tensor([len(i) for i, _ in batch])[:, None]).long()
+
+opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=2e-3)
+t0 = time.time()
+for step in range(31):
+    loss = model(input_ids=ids, attention_mask=att, labels=lab).loss
+    opt.zero_grad(); loss.backward(); opt.step()
+    if step % 5 == 0:
+        print(f"step {step:2d}  masked loss {loss.item():.3f}")
+print(f"{time.time() - t0:.1f}s on CPU")</code></pre>
+</figure>
+<pre class="output">total=134,975,808 trainable=460,800 (0.341%)
+step  0  masked loss 7.546
+step  5  masked loss 4.541
+step 10  masked loss 2.295
+step 15  masked loss 0.980
+step 20  masked loss 0.421
+step 25  masked loss 0.342
+step 30  masked loss 0.310
+15.8s on CPU</pre>
+<p>(Output printed by the imported modules at import time is omitted.)</p>
+<ul>
+  <li>Check the count by hand: SmolLM2-135M has 30 layers, <span class="math">d_{\text{model}} = 576</span>, and 3 KV heads of dimension 64, so <code>v_proj</code> is <span class="math">576 \to 192</span>. Per layer: <span class="math">8(576 + 576) + 8(576 + 192) = 15{,}360</span>; times 30 = 460,800. It matches.</li>
+  <li>Four examples memorised in 30 steps is overfitting, deliberately: it proves the gradient path (masking, padding, LoRA wiring) works. A real run needs a held-out set.</li>
+</ul>
+
+<h3>Rank, Alpha and Target Modules</h3>
+<table>
+  <caption>LoRA hyperparameters: practical defaults and what they trade.</caption>
+  <thead><tr><th>Knob</th><th>Typical</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td>Rank <span class="math">r</span></td><td>8–64</td><td>Capacity of the update. Higher helps for large distribution shifts (code, new language); little gain for style tasks.</td></tr>
+    <tr><td><span class="math">\alpha</span></td><td><span class="math">r</span> to <span class="math">2r</span></td><td>Update scale; interacts with learning rate. Fix the ratio when sweeping rank.</td></tr>
+    <tr><td>Target modules</td><td>All linear layers (q, k, v, o, gate, up, down)</td><td>Hu et al. found q and v sufficient for GPT-3; QLoRA found all layers needed to match full fine-tuning.</td></tr>
+    <tr><td>Learning rate</td><td>1e-4 to 3e-4</td><td>About 10× higher than full fine-tuning, because only a small subspace moves.</td></tr>
+    <tr><td>Dropout</td><td>0–0.1</td><td>Regularises on small datasets.</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout advanced"><span class="title">Multi-adapter serving</span>
+  <ul>
+    <li>Because unmerged LoRA is a side branch, one base model can serve many adapters in one batch: each request gathers its own <span class="math">A, B</span> (S-LoRA, Punica). This is the serving pattern behind per-customer fine-tunes (Volume 12).</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="qlora">QLoRA and Memory-Efficient Training</h2>
+<p class="chapter-lede">LoRA removes optimiser state for the base weights, but the frozen weights
+themselves still occupy 2 bytes per parameter. QLoRA stores them in 4 bits and backpropagates
+through the dequantised values.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>A 65B model in bf16 is 130 GB of frozen weights alone. Dettmers et al. (2023) fine-tuned it on
+  a single 48 GB GPU. That needs roughly 4 bits per weight with negligible quality loss, and a way
+  to survive memory spikes from long sequences.</p>
+</div>
+
+<h3>Three Ingredients</h3>
+<ul>
+  <li><strong>4-bit NormalFloat (NF4)</strong>: a 16-level code whose levels are quantiles of a standard normal, because pretrained weights are approximately zero-mean normal within a block. Each level is then used about equally often, which is information-theoretically efficient for normal data.</li>
+  <li><strong>Double quantisation</strong>: the per-block fp32 scales are themselves quantised to 8 bits.</li>
+  <li><strong>Paged optimisers</strong>: optimiser state lives in CUDA unified memory, so it pages to CPU RAM during gradient-checkpointing spikes instead of raising out-of-memory errors.</li>
+</ul>
+<p>Computation is in bf16: each forward pass dequantises a weight block, multiplies, and discards
+the bf16 copy. Gradients flow through the dequantised weight to the LoRA parameters; the 4-bit
+codes never change.</p>
+
+<h3>Blockwise Absmax Quantisation</h3>
+<p>For a block <span class="math">w \in \mathbb{R}^{B}</span> and a code book <span class="math">q_0 &lt; \dots &lt; q_{15}</span> in <span class="math">[-1, 1]</span>:</p>
+<div class="math">s = \max_i |w_i|, \qquad c_i = \arg\min_j \left| \frac{w_i}{s} - q_j \right|, \qquad \hat{w}_i = s \, q_{c_i}</div>
+<ul>
+  <li>Small blocks isolate outliers: one large weight only inflates the scale of its own block.</li>
+  <li>The cost is one scale per block: 32 bits per 64 weights is 0.5 extra bits per parameter.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>NF4 code book, blockwise quantise/dequantise, error versus uniform int4, outliers, double quantisation and fine-tuning memory (quant.py).</figcaption>
+<pre><code>import torch
+
+torch.manual_seed(0)
+N = torch.distributions.Normal(0.0, 1.0)
+
+
+def nf4_levels(offset: float = 0.9677083):
+    """16 levels: normal quantiles, exact zero, asymmetric 8 positive / 7 negative."""
+    pos = N.icdf(torch.linspace(offset, 0.5, 9)[:-1])        # 8 positive
+    neg = -N.icdf(torch.linspace(offset, 0.5, 8)[:-1])       # 7 negative
+    v = torch.cat([pos, torch.zeros(1), neg]).sort().values
+    return v / v.abs().max()                                  # into [-1, 1]
+
+
+NF4 = nf4_levels()
+INT4 = torch.linspace(-1, 1, 16)                              # uniform 4-bit grid
+print("NF4 levels:", [round(x, 4) for x in NF4.tolist()])
+
+
+def quantise(w, levels, block=64):
+    """Blockwise absmax: each block of `block` values gets one fp32 scale."""
+    wb = w.reshape(-1, block)                                 # (n_blocks, block)
+    absmax = wb.abs().amax(dim=1, keepdim=True)               # (n_blocks, 1)
+    normed = wb / absmax                                      # in [-1, 1]
+    codes = (normed[..., None] - levels).abs().argmin(-1)     # (n_blocks, block) 0..15
+    return codes.to(torch.uint8), absmax
+
+
+def dequantise(codes, absmax, levels, shape):
+    return (levels[codes.long()] * absmax).reshape(shape)
+
+
+w = torch.randn(4096, 1024) * 0.02                            # weights ~ N(0, s^2)
+for name, lv in [("uniform int4", INT4), ("NF4", NF4)]:
+    for block in (64, 1024):
+        c, s = quantise(w, lv, block)
+        w_hat = dequantise(c, s, lv, w.shape)
+        err = (w - w_hat)
+        rel = err.norm() / w.norm()
+        print(f"{name:12s} block={block:4d}  rel. error={rel:.4f}  "
+              f"mse={err.pow(2).mean():.3e}")
+
+# Outlier sensitivity: one large value per 64k weights.
+w_out = w.clone().flatten(); w_out[::65536] = 0.5; w_out = w_out.reshape(w.shape)
+for block in (64, 4096):
+    c, s = quantise(w_out, NF4, block)
+    rel = (w_out - dequantise(c, s, NF4, w.shape)).norm() / w_out.norm()
+    print(f"NF4 with outliers block={block:4d}  rel. error={rel:.4f}")
+
+# Double quantisation: quantise the fp32 absmax constants to 8 bits (block 256).
+c, s = quantise(w, NF4, 64)
+s_flat = s.flatten()
+mean = s_flat.mean()
+sb = (s_flat - mean).reshape(-1, 256)
+s_scale = sb.abs().amax(1, keepdim=True) / 127
+s_q = torch.round(sb / s_scale).clamp(-127, 127).to(torch.int8)
+s_hat = (s_q.float() * s_scale).flatten() + mean
+w_dq = dequantise(c, s_hat[:, None], NF4, w.shape)
+print(f"double-quant constant rel. error={(s_hat - s_flat).norm() / s_flat.norm():.5f}"
+      f"  weight rel. error={(w - w_dq).norm() / w.norm():.4f}")
+bits_single = 4 + 32 / 64
+bits_double = 4 + 8 / 64 + 32 / (64 * 256)
+print(f"bits/param: single={bits_single:.3f} double={bits_double:.3f}")
+
+
+def finetune_memory_gb(n_params, mode, lora_frac=0.004):
+    """Weights + grads + Adam states; excludes activations and KV cache."""
+    if mode == "full bf16 + Adam":
+        return n_params * (2 + 2 + 12) / 1e9      # bf16 w, bf16 g, fp32 master+m+v
+    if mode == "LoRA (bf16 base)":
+        base = n_params * 2
+    elif mode == "QLoRA (NF4 + DQ)":
+        base = n_params * bits_double / 8
+    trainable = n_params * lora_frac
+    return (base + trainable * (2 + 2 + 12)) / 1e9
+
+
+print(f"{'model':&gt;6} {'full bf16 + Adam':&gt;18} {'LoRA (bf16 base)':&gt;18} "
+      f"{'QLoRA (NF4 + DQ)':&gt;18}")
+for n in (1e9, 7e9, 13e9, 70e9):
+    row = [finetune_memory_gb(n, m) for m in
+           ("full bf16 + Adam", "LoRA (bf16 base)", "QLoRA (NF4 + DQ)")]
+    print(f"{n / 1e9:5.0f}B " + " ".join(f"{x:15.1f} GB" for x in row))</code></pre>
+</figure>
+<pre class="output">NF4 levels: [-1.0, -0.6962, -0.5251, -0.3949, -0.2844, -0.1848, -0.0911, 0.0, 0.0796, 0.1609, 0.2461, 0.3379, 0.4407, 0.5626, 0.723, 1.0]
+uniform int4 block=  64  rel. error=0.1005  mse=4.039e-06
+uniform int4 block=1024  rel. error=0.1335  mse=7.121e-06
+NF4          block=  64  rel. error=0.0920  mse=3.383e-06
+NF4          block=1024  rel. error=0.1044  mse=4.358e-06
+NF4 with outliers block=  64  rel. error=0.0934
+NF4 with outliers block=4096  rel. error=0.1854
+double-quant constant rel. error=0.00135  weight rel. error=0.0920
+bits/param: single=4.500 double=4.127
+ model   full bf16 + Adam   LoRA (bf16 base)   QLoRA (NF4 + DQ)
+    1B            16.0 GB             2.1 GB             0.6 GB
+    7B           112.0 GB            14.4 GB             4.1 GB
+   13B           208.0 GB            26.8 GB             7.5 GB
+   70B          1120.0 GB           144.5 GB            40.6 GB</pre>
+
+<ul>
+  <li>The generated levels match the NF4 table hard-coded in bitsandbytes to four decimals. The asymmetry (7 negative, 8 positive, one exact zero) guarantees that zero is representable, which matters for padding and sparse weights.</li>
+  <li>NF4 beats uniform int4 by about 16% in MSE at block 64 and by about 39% at block 1024. Normal-shaped levels waste fewer codes on the tails. (This uniform grid has no exact zero, which slightly flatters NF4.)</li>
+  <li>Block size is the outlier defence: with injected outliers, block 4096 doubles the error of block 64.</li>
+  <li>Double quantisation changes weight error by less than 0.0001 and saves 0.373 bits per parameter, about 3 GB on a 65B model, matching the paper's figure.</li>
+</ul>
+
+<h3>Memory Arithmetic for 1–70B</h3>
+<ul>
+  <li>The table covers weights and optimiser state only, with LoRA parameters at 0.4% of the model. Add <strong>activations</strong>: roughly <span class="math">2 \cdot L \cdot T \cdot d \cdot k</span> bytes per sequence, where <span class="math">k</span> is about 10–30 without checkpointing. Gradient checkpointing cuts this to about one activation per layer, at ~30% extra compute.</li>
+  <li><strong>7B</strong>: QLoRA fits comfortably on a 24 GB consumer GPU with 2k-token sequences; LoRA on bf16 needs ~16 GB plus activations (a 40–48 GB card); full fine-tuning needs a multi-GPU node with ZeRO-3 or FSDP.</li>
+  <li><strong>70B</strong>: QLoRA at ~41 GB plus activations fits one 80 GB GPU; LoRA with bf16 weights needs at least two 80 GB GPUs; full fine-tuning needs ~1.1 TB of state, sharded over 16+ GPUs.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Trade-offs of QLoRA</span>
+  <ul>
+    <li>Training throughput is lower than bf16 LoRA (dequantisation on every forward and backward pass).</li>
+    <li>Merging a LoRA trained on NF4 weights into bf16 weights is not the model you trained: the adapter compensated for quantisation error that the bf16 base does not have. Either serve the quantised base with the unmerged adapter, or merge into the dequantised weights and re-evaluate.</li>
+    <li>The 4-bit base limits quality slightly; Dettmers et al. report NF4 plus double quantisation matching 16-bit LoRA on their benchmarks, but check on yours.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="continued-pretraining">Continued Pretraining and Domain Adaptation</h2>
+<p class="chapter-lede">When a whole domain's language is missing, a few thousand demonstrations
+cannot supply it. Continued pretraining (CPT) runs the next-token objective on raw domain text,
+and the central engineering problem is not learning the domain but forgetting everything else.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>A general 7B model tokenises clinical notes poorly and misreads their abbreviations. You have 5B
+  tokens of de-identified notes. Training on them alone improves clinical perplexity and degrades
+  general reasoning, instruction following and safety behaviour, often invisibly until users find
+  it.</p>
+</div>
+
+<p class="facet">Possible solutions and what each does not solve</p>
+<ul>
+  <li><strong>Domain-adaptive pretraining</strong> (DAPT; Gururangan et al., 2020, "Don't Stop Pretraining"): continue on domain text. Does not preserve general ability on its own.</li>
+  <li><strong>Task-adaptive pretraining</strong> (TAPT): continue on unlabelled text from the task distribution. Cheap; narrow.</li>
+  <li><strong>Replay</strong>: mix a fraction of general pretraining data into the domain stream. The main forgetting defence; needs access to a representative general corpus.</li>
+  <li><strong>LoRA CPT</strong>: forgets less but learns less; domain shifts large enough to need CPT often need high-rank updates.</li>
+</ul>
+
+<h3>Recipe</h3>
+<ul>
+  <li><strong>Re-warm, then re-decay</strong> the learning rate. A converged checkpoint sits at the end of a decayed schedule; jumping straight to a high rate causes a loss spike and forgetting. Ibrahim et al. (2024) show re-warming plus re-decaying plus replay matches retraining from scratch on the union at a fraction of the compute.</li>
+  <li><strong>Peak learning rate</strong> lower than original pretraining (for example 1/3 to 1/10 of it); the higher it is, the more it learns and forgets.</li>
+  <li><strong>Replay</strong> of 5–30% general data, drawn from the original distribution if you have it, or from a similar open corpus.</li>
+  <li><strong>Tokeniser</strong>: extending the vocabulary for a new script or notation needs new embedding rows (initialised as the mean of their subword pieces) and more tokens to train them.</li>
+  <li><strong>Then redo post-training</strong>: CPT degrades chat behaviour. Either re-run SFT and preference tuning, or CPT the base and merge (Chapter 11) with the original instruct model.</li>
+</ul>
+
+<h3>Measuring Forgetting with Replay</h3>
+<p>The toy below makes forgetting measurable exactly. Two "domains" are random Markov chains over
+32 tokens. A small MLP language model is trained on the general chain, then continued on the domain
+chain with 0–50% general replay, re-warm and cosine decay.</p>
+
+<figure class="listing">
+<figcaption>Continued pretraining with replay; forgetting is the increase in general-domain loss (cpt.py).</figcaption>
+<pre><code>import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.set_num_threads(2)
+V, CTX = 32, 4
+
+
+def markov_source(seed, sharp=3.0):
+    """A 'domain': a random order-1 Markov chain over V tokens."""
+    g = torch.Generator().manual_seed(seed)
+    return torch.softmax(torch.randn(V, V, generator=g) * sharp, -1)
+
+
+def sample(P, n, seed):
+    g = torch.Generator().manual_seed(seed)
+    x = [0]
+    for _ in range(n - 1):
+        x.append(torch.multinomial(P[x[-1]], 1, generator=g).item())
+    return torch.tensor(x)
+
+
+def windows(seq):
+    X = seq.unfold(0, CTX + 1, 1)                     # (N, CTX+1)
+    return X[:, :-1], X[:, -1]
+
+
+class TinyLM(nn.Module):
+    def __init__(self, d=64):
+        super().__init__()
+        self.emb = nn.Embedding(V, d)
+        self.mlp = nn.Sequential(nn.Linear(CTX * d, 256), nn.GELU(), nn.Linear(256, V))
+
+    def forward(self, x):                             # (B, CTX)
+        return self.mlp(self.emb(x).flatten(1))       # (B, V)
+
+
+def train(model, X, Y, steps, lr, warmup=20, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    for s in range(steps):
+        for pg in opt.param_groups:                   # re-warm, then cosine decay
+            pg["lr"] = lr * min(1, (s + 1) / warmup) * 0.5 * (
+                1 + torch.cos(torch.tensor(s / steps * 3.14159)).item())
+        i = torch.randint(0, len(X), (256,), generator=g)
+        loss = F.cross_entropy(model(X[i]), Y[i])
+        opt.zero_grad(); loss.backward(); opt.step()
+
+
+@torch.no_grad()
+def nll(model, X, Y):
+    return F.cross_entropy(model(X), Y).item()
+
+
+gen, dom = markov_source(1), markov_source(2)
+Xg, Yg = windows(sample(gen, 40_000, 10))           # general corpus
+Xg_te, Yg_te = windows(sample(gen, 5_000, 11))
+Xd, Yd = windows(sample(dom, 20_000, 20))           # new domain
+Xd_te, Yd_te = windows(sample(dom, 5_000, 21))
+
+torch.manual_seed(0)
+base = TinyLM()
+train(base, Xg, Yg, steps=1500, lr=3e-3)
+print(f"base      general={nll(base, Xg_te, Yg_te):.3f}  "
+      f"domain={nll(base, Xd_te, Yd_te):.3f}")
+
+for replay in (0.0, 0.1, 0.3, 0.5):
+    m = TinyLM(); m.load_state_dict(base.state_dict())
+    n_rep = int(len(Xd) * replay / (1 - replay))
+    j = torch.randperm(len(Xg), generator=torch.Generator().manual_seed(3))[:n_rep]
+    X = torch.cat([Xd, Xg[j]]); Y = torch.cat([Yd, Yg[j]])
+    train(m, X, Y, steps=1000, lr=1e-3, seed=1)
+    g, d = nll(m, Xg_te, Yg_te), nll(m, Xd_te, Yd_te)
+    print(f"replay={replay:.1f} general={g:.3f}  domain={d:.3f}  "
+          f"forgetting={g - nll(base, Xg_te, Yg_te):+.3f}")</code></pre>
+</figure>
+<pre class="output">base      general=1.632  domain=7.402
+replay=0.0 general=3.975  domain=1.636  forgetting=+2.343
+replay=0.1 general=2.097  domain=1.664  forgetting=+0.465
+replay=0.3 general=1.839  domain=1.706  forgetting=+0.207
+replay=0.5 general=1.736  domain=1.754  forgetting=+0.104</pre>
+
+<ul>
+  <li>No replay: the domain is learned (7.40 → 1.64 nats) and the general domain is almost destroyed (+2.34 nats).</li>
+  <li>10% replay removes 80% of the forgetting at a domain cost of 0.03 nats. Returns diminish quickly after that: the replay curve is a Pareto front, and you pick a point on it with your evaluation suite.</li>
+  <li>This toy exaggerates forgetting (a tiny model with little spare capacity, and fully disjoint domains). Large models forget less per token, but the shape of the trade-off is the same.</li>
+</ul>
+
+<h3>Forgetting Measurement in Practice</h3>
+<ul>
+  <li><strong>Perplexity</strong> on held-out general text (cheap, sensitive, weakly correlated with downstream quality).</li>
+  <li><strong>Benchmark deltas</strong> on a fixed suite (knowledge, reasoning, code, multilingual), always against the pre-CPT checkpoint with paired comparisons (Volume 10).</li>
+  <li><strong>Behavioural suites</strong> after re-running post-training: instruction following, refusals, format compliance.</li>
+  <li>Report forgetting as a budget with a number (for example, "no more than 1 point on the general suite"), and gate releases on it (Chapter 12).</li>
+</ul>
+
+<ul class="failure-modes">
+  <li>No replay and a high re-warm learning rate: large general regressions that surface in production.</li>
+  <li>Domain data duplicated many times: memorisation of sensitive records (a privacy incident for clinical or legal data).</li>
+  <li>CPT on an instruct model: chat formatting and safety behaviour erode; you must redo alignment.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="reward-models">Reward Models</h2>
+<p class="chapter-lede">SFT can only imitate demonstrations. Humans are much better at comparing two
+answers than writing the best one, so preference learning starts by turning comparisons into a
+scalar reward.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Labellers disagree on absolute quality scores (one person's 7 is another's 5), but they agree
+  more often on "A is better than B". We need a function <span class="math">r_\phi(x, y)</span> that
+  scores any response to any prompt so that an optimiser can climb it.</p>
+</div>
+
+<h3>Bradley–Terry Preference Model</h3>
+<p>Assume each response has a latent quality and the probability that a labeller prefers <span class="math">y_w</span> over <span class="math">y_l</span> is</p>
+<div class="math">P(y_w \succ y_l \mid x) = \sigma\big(r(x, y_w) - r(x, y_l)\big) = \frac{\exp r(x, y_w)}{\exp r(x, y_w) + \exp r(x, y_l)}</div>
+<p>Maximum likelihood on a dataset of comparisons <span class="math">\mathcal{D} = \{(x, y_w, y_l)\}</span> gives the reward-model loss</p>
+<div class="math">\mathcal{L}_{\text{RM}}(\phi) = -\,\mathbb{E}_{(x, y_w, y_l) \sim \mathcal{D}} \left[ \log \sigma\big(r_\phi(x, y_w) - r_\phi(x, y_l)\big) \right]</div>
+<ul>
+  <li>Only differences matter: <span class="math">r</span> is identified up to an additive constant per prompt. Normalise rewards (for example, zero mean over a reference set) before using them in RL.</li>
+  <li>Architecture: the SFT model with the LM head replaced by a scalar head reading the final token's hidden state. InstructGPT used a 6B reward model for a 175B policy.</li>
+  <li>With <span class="math">K</span> responses ranked per prompt, InstructGPT trained on all <span class="math">\binom{K}{2}</span> pairs from one prompt in the same batch, to avoid overfitting from correlated pairs.</li>
+</ul>
+
+<h3>Training and Evaluating a Reward Model</h3>
+<p>Synthetic setting: responses are 16-dimensional feature vectors, a hidden utility vector defines
+true quality, and labels are sampled from a Bradley–Terry labeller. Feature 0 is "length", which
+the true utility ignores. In the second run the labellers have a length bias.</p>
+
+<figure class="listing">
+<figcaption>Bradley–Terry reward model with held-out accuracy, and what a labeller length bias does to it (rm.py).</figcaption>
+<pre><code>import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+D = 16
+w_true = torch.randn(D)                    # hidden human "utility"
+w_true[0] = 0.0                            # feature 0 = length: humans don't value it
+
+
+def make_pairs(n, length_bias):
+    """Response features; labellers prefer higher utility (+ a length bias)."""
+    a, b = torch.randn(n, D), torch.randn(n, D)
+    ua = a @ w_true + length_bias * a[:, 0]
+    ub = b @ w_true + length_bias * b[:, 0]
+    p_a = torch.sigmoid(ua - ub)           # Bradley-Terry labeller
+    a_wins = torch.rand(n) &lt; p_a
+    chosen = torch.where(a_wins[:, None], a, b)
+    rejected = torch.where(a_wins[:, None], b, a)
+    return chosen, rejected
+
+
+class RewardModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(D, 64), nn.GELU(), nn.Linear(64, 1))
+
+    def forward(self, x):                  # (B, D) -&gt; (B,)
+        return self.net(x).squeeze(-1)
+
+
+def bt_loss(r_chosen, r_rejected):
+    return -F.logsigmoid(r_chosen - r_rejected).mean()
+
+
+def accuracy(rm, c, r):
+    with torch.no_grad():
+        return (rm(c) &gt; rm(r)).float().mean().item()
+
+
+for bias in (0.0, 2.0):
+    torch.manual_seed(1)
+    c_tr, r_tr = make_pairs(4000, bias)
+    c_te, r_te = make_pairs(2000, 0.0)     # test labels from the true utility
+    rm = RewardModel()
+    opt = torch.optim.AdamW(rm.parameters(), lr=3e-3, weight_decay=1e-2)
+    for step in range(600):
+        i = torch.randint(0, 4000, (256,))
+        loss = bt_loss(rm(c_tr[i]), rm(r_tr[i]))
+        opt.zero_grad(); loss.backward(); opt.step()
+    # Oracle: how often the true utility itself agrees with noisy test labels.
+    oracle = ((c_te @ w_true) &gt; (r_te @ w_true)).float().mean().item()
+    probe = torch.zeros(1, D); probe[0, 0] = 3.0   # a "longer" otherwise-neutral answer
+    print(f"length_bias={bias}: train loss={loss.item():.3f} "
+          f"train acc={accuracy(rm, c_tr, r_tr):.3f} "
+          f"test acc={accuracy(rm, c_te, r_te):.3f} (oracle {oracle:.3f}) "
+          f"reward(long)-reward(neutral)="
+          f"{(rm(probe) - rm(torch.zeros(1, D))).item():+.2f}")</code></pre>
+</figure>
+<pre class="output">length_bias=0.0: train loss=0.234 train acc=0.904 test acc=0.878 (oracle 0.887) reward(long)-reward(neutral)=-0.06
+length_bias=2.0: train loss=0.202 train acc=0.915 test acc=0.795 (oracle 0.887) reward(long)-reward(neutral)=+6.20</pre>
+
+<ul>
+  <li><strong>Accuracy ceiling</strong>: labels are noisy, so even the true utility agrees with only 88.7% of held-out labels. The unbiased RM reaches 87.8%, close to that ceiling. Real RMs on human data score 65–75% because inter-labeller agreement is itself around 70–75% (InstructGPT reports ~73%).</li>
+  <li><strong>Bias is learned faithfully</strong>: with length-biased labellers, the RM's <em>training</em> accuracy is higher, its accuracy against true utility drops by 8 points, and it pays +6.2 reward for length alone. A policy optimised against this RM will get longer. This is the documented length bias of RLHF (Singhal et al., 2023).</li>
+</ul>
+
+<h3>Reward Hacking and Over-Optimisation</h3>
+<ul>
+  <li>A reward model is a proxy trained on a finite distribution. The policy is an optimiser that searches for inputs where the proxy is wrong, in regions the RM never saw.</li>
+  <li>Gao et al. (2022) measured this with a large "gold" RM standing in for humans: as the policy moves away from its initialisation (measured by <span class="math">d = \sqrt{D_{\text{KL}}(\pi \| \pi_{\text{ref}})}</span>), proxy reward rises monotonically while gold reward rises, peaks and falls. The gold curve fits <span class="math">d(\alpha - \beta \log d)</span> for RL and <span class="math">d(\alpha - \beta d)</span> for best-of-<span class="math">n</span>; larger RMs over-optimise later.</li>
+  <li>Typical hacks: length, lists and headings, sycophancy (agreeing with the user), confident tone, hedging, and exploiting known RM blind spots such as repeated phrases.</li>
+</ul>
+
+<p class="facet">Mitigations</p>
+<ul>
+  <li>KL penalty to the reference policy (Chapter 8), and early stopping on a held-out gold signal (human evaluation or a stronger judge).</li>
+  <li>Reward-model ensembles; penalise disagreement.</li>
+  <li>Explicit length control: length-normalised rewards, length-matched pairs, or a length penalty.</li>
+  <li>Refresh the RM with preferences collected on the <em>current</em> policy's outputs (iterated or online RLHF).</li>
+</ul>
+
+<h3>Evaluating Reward Models</h3>
+<ul>
+  <li>Held-out pairwise accuracy, broken down by category (chat, safety, reasoning, code). RewardBench (Lambert et al., 2024) is a public example.</li>
+  <li>Calibration: does <span class="math">\sigma(r_w - r_l)</span> match observed agreement rates?</li>
+  <li>Adversarial probes: pairs differing only in length, formatting, or a planted factual error.</li>
+  <li>Best-of-<span class="math">n</span> curves: sample <span class="math">n</span> responses, pick the RM's favourite, and check with humans or a gold judge whether quality actually rises with <span class="math">n</span>.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="rlhf-ppo">RLHF with PPO</h2>
+<p class="chapter-lede">RLHF optimises the policy against the reward model while a KL penalty keeps it
+near the SFT model. PPO is the optimiser InstructGPT used; it works, and it is the most
+operationally demanding step in post-training.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>We have an SFT policy and a reward model. Sampling many responses and keeping the best
+  (best-of-<span class="math">n</span>) already improves quality but multiplies inference cost by
+  <span class="math">n</span> forever. We want to move that improvement into the weights without
+  letting the policy exploit the reward model.</p>
+</div>
+
+<h3>The KL-Regularised Objective</h3>
+<div class="math">\max_{\pi_\theta} \; \mathbb{E}_{x \sim \mathcal{D},\, y \sim \pi_\theta(\cdot \mid x)} \big[ r_\phi(x, y) \big] \;-\; \beta \, \mathbb{E}_{x \sim \mathcal{D}} \Big[ D_{\text{KL}}\big(\pi_\theta(\cdot \mid x) \,\|\, \pi_{\text{ref}}(\cdot \mid x)\big) \Big]</div>
+<ul>
+  <li><span class="math">\pi_{\text{ref}}</span> is the frozen SFT model. The KL term keeps outputs in the region where the RM is trustworthy and where the language stays fluent.</li>
+  <li>This objective has a closed-form optimum (derived in Chapter 9): <span class="math">\pi^*(y \mid x) \propto \pi_{\text{ref}}(y \mid x) \exp(r(x, y) / \beta)</span>. PPO approximates it with sampled gradients; DPO exploits the closed form directly.</li>
+  <li>In practice the KL is applied per token: the reward at token <span class="math">t</span> is <span class="math">-\beta(\log \pi_\theta(y_t \mid \cdot) - \log \pi_{\text{ref}}(y_t \mid \cdot))</span>, and the RM score is added at the final token.</li>
+  <li>InstructGPT's PPO-ptx also adds a pretraining log-likelihood term to reduce regressions on public NLP benchmarks (the "alignment tax").</li>
+</ul>
+
+<h3>PPO's Clipped Surrogate</h3>
+<p>With probability ratio <span class="math">\rho_t(\theta) = \pi_\theta(a_t \mid s_t) / \pi_{\theta_{\text{old}}}(a_t \mid s_t)</span> and advantage estimate <span class="math">\hat{A}_t</span> (Schulman et al., 2017):</p>
+<div class="math">\mathcal{L}^{\text{CLIP}}(\theta) = \mathbb{E}_t \Big[ \min\big( \rho_t(\theta) \hat{A}_t,\; \operatorname{clip}(\rho_t(\theta), 1 - \epsilon, 1 + \epsilon)\, \hat{A}_t \big) \Big]</div>
+<ul>
+  <li>Samples are expensive (autoregressive generation), so PPO reuses each batch for several gradient epochs. Clipping removes the incentive to move <span class="math">\rho</span> outside <span class="math">[1-\epsilon, 1+\epsilon]</span>, a cheap trust region.</li>
+  <li>For LLMs, a state is the prompt plus tokens so far, and an action is the next token. Advantages come from a learned value head via generalised advantage estimation (GAE):</li>
+</ul>
+<div class="math">\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t), \qquad \hat{A}_t = \sum_{l \ge 0} (\gamma \lambda)^l \, \delta_{t+l}</div>
+
+<h3>The Four Models</h3>
+<figure class="diagram">
+<pre class="ascii">                 prompts x
+                     |
+                     v
+  +-------------------------------+   generate y (slow, autoregressive)
+  | POLICY pi_theta   (trainable) |-----------------------------+
+  +-------------------------------+                             |
+        ^  PPO update                                           v
+        |                          +----------------------------------------+
+        |                          | REFERENCE pi_ref (frozen SFT)          |
+        |                          |   -&gt; per-token log-ratio (KL penalty)  |
+        |                          | REWARD MODEL r_phi (frozen)            |
+        |                          |   -&gt; scalar score at final token       |
+        |                          | VALUE MODEL V_psi (trainable)          |
+        |                          |   -&gt; per-token baseline for GAE        |
+        |                          +----------------------------------------+
+        |                                             |
+        +------------ advantages, returns ------------+</pre>
+<figcaption>PPO-based RLHF keeps four models in memory; two of them are trained.</figcaption>
+</figure>
+
+<h3>A Miniature PPO Loop</h3>
+<p>A single prompt with 10 candidate responses makes every quantity exact. The reference (SFT)
+policy favours weaker responses. The proxy reward equals the true reward except for response 9,
+which the reward model scores highly (4.5) but which is actually bad (−1) and is rare under the
+reference. This is a reward-model loophole in miniature.</p>
+
+<figure class="listing">
+<figcaption>PPO with a KL-shaped reward and clipped surrogate on a 10-armed bandit, the closed-form optimum, and GAE on a token-level trajectory (ppo.py).</figcaption>
+<pre><code>import torch
+import torch.nn.functional as F
+
+torch.set_num_threads(2)
+K = 10                                                   # 10 candidate "responses"
+g = torch.Generator().manual_seed(0)
+ref_logits = torch.randn(K, generator=g)
+ref_logits[9] = -4.0                                     # rare under the SFT model
+logp_ref = F.log_softmax(ref_logits, -1)
+r_true = torch.empty(K)                                  # what we actually want:
+r_true[ref_logits[:9].argsort(descending=True)] = torch.linspace(0, 3, 9)
+r_true[9] = -1.0                                         # (SFT favours weak answers)
+r_proxy = r_true.clone(); r_proxy[9] = 4.5               # RM loophole on response 9
+
+
+def kl(logp, logq):                                      # KL(p || q), exact
+    return (logp.exp() * (logp - logq)).sum().item()
+
+
+def ppo(beta, iters=60, batch=256, epochs=4, clip=0.2, lr=0.1, seed=0):
+    torch.manual_seed(seed)
+    theta = ref_logits.clone().requires_grad_(True)      # policy init = reference
+    opt = torch.optim.Adam([theta], lr=lr)
+    log = []
+    for it in range(iters):
+        with torch.no_grad():                            # 1. roll out
+            logp_old = F.log_softmax(theta, -1)
+            a = torch.multinomial(logp_old.exp(), batch, replacement=True)
+            # 2. KL-shaped reward: r - beta * (log pi_old - log pi_ref)
+            R = r_proxy[a] - beta * (logp_old[a] - logp_ref[a])
+            adv = (R - R.mean()) / (R.std() + 1e-8)      # baseline = batch mean
+        for _ in range(epochs):                          # 3. clipped surrogate
+            logp = F.log_softmax(theta, -1)[a]
+            ratio = torch.exp(logp - logp_old[a])
+            surr = torch.min(ratio * adv, ratio.clamp(1 - clip, 1 + clip) * adv)
+            loss = -surr.mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        if it % 15 == 0 or it == iters - 1:
+            lp = F.log_softmax(theta.detach(), -1)
+            p = lp.exp()
+            log.append(f"it={it:2d} proxy={(p * r_proxy).sum():.2f} "
+                       f"true={(p * r_true).sum():.2f} KL={kl(lp, logp_ref):.2f} "
+                       f"p(hack)={p[9]:.2f}")
+    return log
+
+
+for beta in (0.0, 0.5, 1.0):
+    print(f"--- beta={beta}")
+    print("\n".join(ppo(beta)))
+
+# Closed-form optimum of the KL-regularised objective: pi* ~ pi_ref * exp(r / beta)
+for beta in (0.5, 1.0):
+    lp = F.log_softmax(logp_ref + r_proxy / beta, -1)
+    print(f"optimum beta={beta}: proxy={(lp.exp() * r_proxy).sum():.2f} "
+          f"true={(lp.exp() * r_true).sum():.2f} KL={kl(lp, logp_ref):.2f}")
+
+
+def gae(rewards, values, gamma=1.0, lam=0.95):
+    """Generalised advantage estimation for one trajectory (values has T+1)."""
+    adv, last = torch.zeros_like(rewards), 0.0
+    for t in reversed(range(len(rewards))):
+        delta = rewards[t] + gamma * values[t + 1] - values[t]
+        last = delta + gamma * lam * last
+        adv[t] = last
+    return adv, adv + values[:-1]                        # advantages, returns
+
+
+# RLHF shape: per-token -beta*KL, sequence reward on the final token.
+kl_tok = torch.tensor([0.02, 0.05, 0.01, 0.03])
+rew = -0.1 * kl_tok; rew[-1] += 1.0
+adv, ret = gae(rew, torch.tensor([0.5, 0.6, 0.7, 0.8, 0.0]))
+print("token rewards:", [round(x, 3) for x in rew.tolist()])
+print("advantages:   ", [round(x, 3) for x in adv.tolist()])</code></pre>
+</figure>
+<pre class="output">--- beta=0.0
+it= 0 proxy=0.85 true=0.84 KL=0.06 p(hack)=0.00
+it=15 proxy=2.94 true=2.67 KL=3.58 p(hack)=0.05
+it=30 proxy=4.49 true=-0.99 KL=6.47 p(hack)=1.00
+it=45 proxy=4.50 true=-1.00 KL=6.49 p(hack)=1.00
+it=59 proxy=4.50 true=-1.00 KL=6.50 p(hack)=1.00
+--- beta=0.5
+it= 0 proxy=0.85 true=0.84 KL=0.06 p(hack)=0.00
+it=15 proxy=2.88 true=1.07 KL=2.46 p(hack)=0.33
+it=30 proxy=3.10 true=0.94 KL=2.87 p(hack)=0.39
+it=45 proxy=3.34 true=0.63 KL=3.36 p(hack)=0.49
+it=59 proxy=3.25 true=0.64 KL=3.19 p(hack)=0.48
+--- beta=1.0
+it= 0 proxy=0.85 true=0.84 KL=0.06 p(hack)=0.00
+it=15 proxy=1.43 true=1.21 KL=0.43 p(hack)=0.04
+it=30 proxy=1.60 true=1.36 KL=0.60 p(hack)=0.04
+it=45 proxy=1.46 true=1.18 KL=0.46 p(hack)=0.05
+it=59 proxy=1.53 true=1.27 KL=0.53 p(hack)=0.05
+optimum beta=0.5: proxy=3.19 true=0.78 KL=3.06
+optimum beta=1.0: proxy=1.51 true=1.24 KL=0.51
+token rewards: [-0.002, -0.005, -0.001, 0.997]
+advantages:    [0.447, 0.367, 0.286, 0.197]</pre>
+
+<p class="facet">Reading the result</p>
+<ul>
+  <li><strong>β = 0</strong> reproduces Gao et al.'s over-optimisation curve in miniature: true reward rises to 2.67 at iteration 15, then collapses to −1 once the policy finds the loophole, while proxy reward keeps climbing. Without a gold signal you would ship the worst model.</li>
+  <li><strong>β = 1</strong>: true reward rises from 0.84 to about 1.27–1.36 while KL stays near 0.5 nats and the loophole stays at ~5% probability. The PPO result tracks the closed-form optimum (true 1.24, KL 0.51), which verifies the implementation.</li>
+  <li><strong>β = 0.5</strong> is in between: half the mass drifts to the hack. β is not a regulariser you set once; it decides which point on the proxy–gold curve you land on.</li>
+  <li><strong>The initial KL is 0.06, not 0</strong>: it is measured after the first update.</li>
+  <li><strong>GAE</strong>: with <span class="math">\gamma = 1</span> the sparse final reward propagates back to every token through the value baseline. Omitted here: the value model is trained with a regression loss on the returns, which doubles the trainable state.</li>
+</ul>
+
+<h3>Why RLHF Is Operationally Hard</h3>
+<ul>
+  <li><strong>Memory</strong>: four models (policy, reference, reward, value), two with optimiser state. For a 70B policy that is hundreds of GB before activations; teams share weights (value head on the RM), offload the reference, or use LoRA so the reference is "adapter disabled".</li>
+  <li><strong>Generation in the loop</strong>: rollouts are autoregressive and dominate wall-clock time; they need an inference engine (vLLM-style) with weights synchronised from the trainer every step.</li>
+  <li><strong>Hyperparameter sensitivity</strong>: KL coefficient (or adaptive KL target), clip range, value-loss coefficient, reward normalisation and whitening, GAE <span class="math">\lambda</span>, generation temperature, number of epochs. Huang et al. (2024) list dozens of implementation details needed to reproduce OpenAI's results.</li>
+  <li><strong>Instability</strong>: reward and KL can diverge suddenly; entropy collapse produces repetitive outputs; value-model errors produce noisy advantages.</li>
+  <li><strong>Evaluation lag</strong>: proxy reward always rises, so every checkpoint needs a gold-signal evaluation to catch the turn-over.</li>
+</ul>
+
+<aside class="callout advanced"><span class="title">Beyond PPO</span>
+  <ul>
+    <li>GRPO (Shao et al., 2024) drops the value model and uses the mean reward of a group of samples for the same prompt as the baseline, the same trick as our batch-mean baseline. It is the workhorse of RL with verifiable rewards for reasoning models (Volume 9).</li>
+    <li>RLOO (REINFORCE leave-one-out) and plain REINFORCE with good baselines work well for LLMs because the "environment" is a single step with a terminal reward.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 9 -->
+<section class="chapter">
+<h2 id="dpo">Direct Preference Optimisation and Variants</h2>
+<p class="chapter-lede">DPO removes the reward model and the RL loop. It observes that the
+KL-regularised objective has a closed-form optimum, inverts it to express the reward in terms of
+the policy, and fits that implicit reward to preferences with a classification loss.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Chapter 8's pipeline needs four models, online generation and a dozen fragile hyperparameters.
+  We want the same objective (maximise preference-consistent reward, stay close to the reference)
+  with a training loop as simple as SFT.</p>
+</div>
+
+<h3>Derivation</h3>
+<p><strong>Step 1: the optimum of the KL-constrained objective.</strong> For a fixed prompt <span class="math">x</span>, rewrite the objective from Chapter 8:</p>
+<div class="math">\max_\pi \; \mathbb{E}_{y \sim \pi}[r(x,y)] - \beta D_{\text{KL}}(\pi \| \pi_{\text{ref}}) = -\beta \, \mathbb{E}_{y \sim \pi}\left[ \log \frac{\pi(y \mid x)}{\pi_{\text{ref}}(y \mid x) \exp(r(x,y)/\beta)} \right]</div>
+<p>Define the partition function <span class="math">Z(x) = \sum_y \pi_{\text{ref}}(y \mid x) \exp(r(x,y)/\beta)</span> and the normalised distribution <span class="math">\pi^*(y \mid x) = \pi_{\text{ref}}(y \mid x) \exp(r(x,y)/\beta) / Z(x)</span>. Then the objective equals</p>
+<div class="math">-\beta \, D_{\text{KL}}\big(\pi \,\|\, \pi^*\big) + \beta \log Z(x)</div>
+<p>which is maximised exactly when <span class="math">\pi = \pi^*</span>, since <span class="math">Z(x)</span> does not depend on <span class="math">\pi</span>.</p>
+
+<p><strong>Step 2: invert for the reward.</strong> Taking logs of <span class="math">\pi^*</span>:</p>
+<div class="math">r(x, y) = \beta \log \frac{\pi^*(y \mid x)}{\pi_{\text{ref}}(y \mid x)} + \beta \log Z(x)</div>
+
+<p><strong>Step 3: substitute into Bradley–Terry.</strong> Only reward differences for the same prompt appear, so <span class="math">\beta \log Z(x)</span> cancels:</p>
+<div class="math">P(y_w \succ y_l \mid x) = \sigma\left( \beta \log \frac{\pi^*(y_w \mid x)}{\pi_{\text{ref}}(y_w \mid x)} - \beta \log \frac{\pi^*(y_l \mid x)}{\pi_{\text{ref}}(y_l \mid x)} \right)</div>
+
+<p><strong>Step 4: maximum likelihood over the policy.</strong> Parameterise <span class="math">\pi^*</span> by <span class="math">\pi_\theta</span> (Rafailov et al., 2023):</p>
+<div class="math">\mathcal{L}_{\text{DPO}}(\theta) = -\,\mathbb{E}_{(x, y_w, y_l)} \left[ \log \sigma\left( \beta \log \frac{\pi_\theta(y_w \mid x)}{\pi_{\text{ref}}(y_w \mid x)} - \beta \log \frac{\pi_\theta(y_l \mid x)}{\pi_{\text{ref}}(y_l \mid x)} \right) \right]</div>
+<ul>
+  <li><span class="math">\hat{r}_\theta(x, y) = \beta \log \frac{\pi_\theta(y \mid x)}{\pi_{\text{ref}}(y \mid x)}</span> is the <strong>implicit reward</strong>: "your language model is secretly a reward model".</li>
+  <li>The gradient is a weighted likelihood update:</li>
+</ul>
+<div class="math">\nabla_\theta \mathcal{L}_{\text{DPO}} = -\beta \, \mathbb{E}\Big[ \sigma\big(\hat{r}_\theta(x, y_l) - \hat{r}_\theta(x, y_w)\big) \big( \nabla_\theta \log \pi_\theta(y_w \mid x) - \nabla_\theta \log \pi_\theta(y_l \mid x) \big) \Big]</div>
+<ul>
+  <li>Pairs the model already ranks correctly get small weights; wrongly ranked pairs get weights near 1. Unlike unlikelihood training, the reference ratio stops the model from degenerating.</li>
+  <li><span class="math">\log \pi_\theta(y \mid x)</span> is the <strong>sum</strong> of token log-probabilities over the response only: exactly the masked quantity from Chapter 2.</li>
+</ul>
+
+<h3>Implementation and Verification</h3>
+<figure class="listing">
+<figcaption>Sequence log-probabilities with masking, the DPO and IPO losses, three unit checks, and a toy where the optimum is known in closed form (dpo.py).</figcaption>
+<pre><code>import math
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+torch.set_num_threads(2)
+
+
+def sequence_logprob(logits, labels):
+    """Sum of log p(token) over response tokens; labels=-100 are ignored.
+    logits: (B, T, V) from the model, labels: (B, T) aligned to inputs."""
+    logits, labels = logits[:, :-1], labels[:, 1:]            # predict next token
+    mask = labels != -100
+    safe = labels.clamp(min=0)
+    lp = torch.gather(F.log_softmax(logits, -1), 2, safe[..., None]).squeeze(-1)
+    return (lp * mask).sum(-1)                                # (B,)
+
+
+def dpo_loss(pi_c, pi_r, ref_c, ref_r, beta=0.1):
+    """All inputs are (B,) summed log-probs of chosen / rejected responses."""
+    r_c = beta * (pi_c - ref_c)                               # implicit rewards
+    r_r = beta * (pi_r - ref_r)
+    loss = -F.logsigmoid(r_c - r_r).mean()
+    return loss, r_c.detach(), r_r.detach()
+
+
+def ipo_loss(pi_c, pi_r, ref_c, ref_r, tau=0.1):
+    h = (pi_c - ref_c) - (pi_r - ref_r)
+    return ((h - 1 / (2 * tau)) ** 2).mean()
+
+
+# Check 1: masking and summation on a random "model".
+logits = torch.randn(2, 6, 11)
+labels = torch.tensor([[-100, -100, 3, 4, 5, 1], [-100, -100, -100, 7, 2, 9]])
+manual = sum(F.log_softmax(logits[0, t - 1], -1)[labels[0, t]] for t in (2, 3, 4, 5))
+print("seq logprob matches manual sum:",
+      torch.allclose(sequence_logprob(logits, labels)[0], manual))
+
+# Check 2: policy == reference gives loss log 2 and zero rewards.
+lp = torch.randn(8)
+loss, rc, rr = dpo_loss(lp, lp - 1, lp, lp - 1)
+print(f"loss at init = {loss.item():.4f} (log 2 = {math.log(2):.4f})")
+
+# Check 3: gradient = -beta * sigmoid(-(margin)) on the chosen log-prob.
+pc = torch.tensor([-5.0], requires_grad=True)
+loss, _, _ = dpo_loss(pc, torch.tensor([-7.0]), torch.tensor([-6.0]),
+                      torch.tensor([-6.5]), beta=0.5)
+loss.backward()
+margin = 0.5 * ((-5 + 6) - (-7 + 6.5))
+analytic = -0.5 * torch.sigmoid(torch.tensor(-margin)).item()
+print(f"autograd={pc.grad.item():.5f} analytic={analytic:.5f}")
+
+# Toy: one prompt, K responses, preferences from a Bradley-Terry labeller.
+K, beta = 6, 0.5
+ref_logits = torch.randn(K)
+logp_ref = F.log_softmax(ref_logits, -1)
+r = torch.linspace(-1, 1, K)                                  # true reward
+target = F.softmax(logp_ref + r / beta, -1)                   # pi* = pi_ref e^{r/b} / Z
+
+a = torch.multinomial(logp_ref.exp(), 20_000, replacement=True)
+b = torch.multinomial(logp_ref.exp(), 20_000, replacement=True)
+keep = a != b; a, b = a[keep], b[keep]
+a_wins = torch.rand(len(a)) &lt; torch.sigmoid(r[a] - r[b])
+ch, rj = torch.where(a_wins, a, b), torch.where(a_wins, b, a)
+
+
+def train(loss_name, ch, rj, steps=1500):
+    theta = ref_logits.clone().requires_grad_(True)
+    opt = torch.optim.Adam([theta], lr=0.05)
+    for _ in range(steps):
+        lp = F.log_softmax(theta, -1)
+        args = (lp[ch], lp[rj], logp_ref[ch], logp_ref[rj])
+        loss = dpo_loss(*args, beta)[0] if loss_name == "dpo" else ipo_loss(*args)
+        opt.zero_grad(); loss.backward(); opt.step()
+    return F.softmax(theta.detach(), -1)
+
+
+pi = train("dpo", ch, rj)
+print("pi_ref :", [round(x, 3) for x in logp_ref.exp().tolist()])
+print("pi*    :", [round(x, 3) for x in target.tolist()])
+print("pi_DPO :", [round(x, 3) for x in pi.tolist()])
+print(f"TV(pi_DPO, pi*) = {0.5 * (pi - target).abs().sum():.3f}")
+
+# Deterministic preferences: always prefer the higher true reward.
+ch_d, rj_d = torch.where(r[a] &gt; r[b], a, b), torch.where(r[a] &gt; r[b], b, a)
+for name in ("dpo", "ipo"):
+    p = train(name, ch_d, rj_d)
+    print(f"{name.upper()} on deterministic prefs: p(best)={p[-1]:.3f} "
+          f"p(worst)={p[0]:.2e}")</code></pre>
+</figure>
+<pre class="output">seq logprob matches manual sum: True
+loss at init = 0.6931 (log 2 = 0.6931)
+autograd=-0.16041 analytic=-0.16041
+pi_ref : [0.114, 0.28, 0.067, 0.362, 0.083, 0.094]
+pi*    : [0.009, 0.051, 0.027, 0.327, 0.167, 0.418]
+pi_DPO : [0.009, 0.05, 0.03, 0.341, 0.171, 0.398]
+TV(pi_DPO, pi*) = 0.021
+DPO on deterministic prefs: p(best)=0.996 p(worst)=8.52e-16
+IPO on deterministic prefs: p(best)=0.649 p(worst)=1.04e-04</pre>
+
+<ul>
+  <li><strong>Closed form recovered</strong>: trained only on sampled pairwise preferences, the DPO policy lands within total-variation distance 0.021 of <span class="math">\pi_{\text{ref}} e^{r/\beta}/Z</span>, the optimum of the RLHF objective, with no reward model and no sampling from the policy.</li>
+  <li><strong>At initialisation</strong> the loss is <span class="math">\log 2</span> and implicit rewards are zero: a useful sanity check in any real DPO run.</li>
+  <li><strong>The weakness</strong>: with deterministic preferences (every comparison won by the same side), the Bradley–Terry likelihood wants an infinite reward gap. DPO drives <span class="math">p(\text{worst})</span> to <span class="math">10^{-15}</span> and ignores <span class="math">\beta</span>: the KL regularisation is effectively lost. IPO's squared loss targets a finite margin <span class="math">1/(2\tau)</span> and stays near the reference (Azar et al., 2023).</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Known DPO failure modes</span>
+  <ul>
+    <li><strong>Both log-probabilities fall</strong>: DPO only constrains the <em>margin</em>. In practice the chosen log-probability often decreases too, moving mass to responses in neither set. Monitor <code>logps/chosen</code>; add an SFT term on chosen responses (as in RPO) if it collapses.</li>
+    <li><strong>Length exploitation</strong>: summed log-ratios favour longer chosen responses when preferences are length-biased (SimPO's motivation).</li>
+    <li><strong>Off-policy data</strong>: pairs generated by another model teach the policy about responses it would never produce. Generate candidates from the SFT policy itself, then label.</li>
+  </ul>
+</aside>
+
+<h3>Variants</h3>
+<table>
+  <caption>DPO and its successors. <span class="math">h = \log\frac{\pi_\theta(y_w)}{\pi_{\text{ref}}(y_w)} - \log\frac{\pi_\theta(y_l)}{\pi_{\text{ref}}(y_l)}</span>.</caption>
+  <thead><tr><th>Method</th><th>Loss (sketch)</th><th>Data</th><th>Reference model</th><th>What it fixes</th></tr></thead>
+  <tbody>
+    <tr><td>DPO (Rafailov et al., 2023)</td><td><span class="math">-\log\sigma(\beta h)</span></td><td>Pairs</td><td>Yes</td><td>Removes RM and RL loop</td></tr>
+    <tr><td>IPO (Azar et al., 2023)</td><td><span class="math">(h - \tfrac{1}{2\tau})^2</span></td><td>Pairs</td><td>Yes</td><td>Overfitting to deterministic preferences</td></tr>
+    <tr><td>KTO (Ethayarajh et al., 2024)</td><td>Prospect-theory value of <span class="math">\beta \log\frac{\pi_\theta(y)}{\pi_{\text{ref}}(y)}</span> relative to a KL reference point, separate weights for desirable and undesirable</td><td>Unpaired thumbs up/down</td><td>Yes</td><td>Needs no pairs; uses cheap binary feedback</td></tr>
+    <tr><td>ORPO (Hong et al., 2024)</td><td><span class="math">\mathcal{L}_{\text{SFT}} - \lambda \log\sigma\big(\log\frac{\text{odds}_\theta(y_w)}{\text{odds}_\theta(y_l)}\big)</span></td><td>Pairs</td><td>No</td><td>Single stage: SFT and preference together</td></tr>
+    <tr><td>SimPO (Meng et al., 2024)</td><td><span class="math">-\log\sigma\big(\tfrac{\beta}{|y_w|}\log\pi_\theta(y_w) - \tfrac{\beta}{|y_l|}\log\pi_\theta(y_l) - \gamma\big)</span></td><td>Pairs</td><td>No</td><td>Length bias (length-normalised reward), memory (no reference)</td></tr>
+  </tbody>
+</table>
+
+<h3>Offline versus Online Preference Learning</h3>
+<ul>
+  <li><strong>Offline</strong> (vanilla DPO): a fixed dataset of pairs. Cheap and stable; the policy drifts away from the data distribution as it trains, so later updates learn from increasingly off-policy pairs.</li>
+  <li><strong>Online or iterative</strong>: sample new pairs from the current policy each round, label with humans, an RM or an AI judge, and repeat DPO. Closes much of the gap to PPO in published comparisons at a fraction of the complexity.</li>
+  <li><strong>Choice</strong>: start with offline DPO on on-policy (SFT-generated) pairs; move to iterative DPO when gains plateau; use PPO or GRPO when you have a reliable, cheap reward (verifiable tasks, Volume 9).</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 10 -->
+<section class="chapter">
+<h2 id="ai-feedback">AI Feedback and Constitutional Methods</h2>
+<p class="chapter-lede">Human preference labels are slow, expensive, inconsistent and sometimes
+harmful to collect (labellers reading toxic content). If a strong model can judge responses
+against written principles, it can replace most of the human labels.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>You need 200,000 preference labels on harmlessness and helpfulness, refreshed every time the
+  policy changes. At USD 1 per human comparison and a week's turnaround, iterative preference
+  learning is infeasible.</p>
+</div>
+
+<h3>Constitutional AI</h3>
+<p>Bai et al. (2022, "Constitutional AI") replace human harmlessness labels with a list of natural-language principles (the constitution), in two stages.</p>
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  A[Helpful-only model] --> B[Sample responses to red-team prompts]
+  B --> C[Critique against a sampled principle]
+  C --> D[Revise the response]
+  D --> E[SL-CAI: SFT on revised responses]
+  E --> F[Sample response pairs]
+  F --> G[AI judge picks the better one per principle]
+  G --> H[Train preference model on AI labels]
+  H --> I[RL-CAI: RL against that preference model]</pre>
+<figcaption>Constitutional AI: critique-and-revise SFT, then reinforcement learning from AI feedback.</figcaption>
+</figure>
+<ul>
+  <li><strong>Supervised stage</strong>: the model critiques its own harmful answer ("Identify ways this response is harmful…"), revises it, and is fine-tuned on the revisions. This removes the most egregious behaviour cheaply.</li>
+  <li><strong>RL stage (RLAIF)</strong>: an AI model compares pairs of responses against a principle; its probabilities (soft labels) train the preference model. Human labels remain for helpfulness in the original work.</li>
+  <li><strong>Outcome reported</strong>: a less evasive model that was more harmless at equal helpfulness than an RLHF baseline; chain-of-thought in the judge improved label quality.</li>
+</ul>
+
+<h3>RLAIF</h3>
+<ul>
+  <li>Lee et al. (2023) compared RLAIF with RLHF on summarisation and dialogue: human raters preferred them at similar rates, and even a judge the same size as the policy helped.</li>
+  <li><strong>Direct RLAIF</strong>: skip the reward model and query the LLM judge for a score during RL. More expensive per step; no RM staleness.</li>
+  <li>The same machinery powers modern synthetic pipelines: generate <span class="math">n</span> candidates from the policy, score them with a judge or RM, keep best and worst as a DPO pair (UltraFeedback, Zephyr's distilled DPO; Tunstall et al., 2023).</li>
+</ul>
+
+<h3>Writing Principles</h3>
+<ul>
+  <li>Specific and checkable beats aspirational: "Do not provide step-by-step synthesis routes for weapons" is testable; "Be good" is not.</li>
+  <li>Each principle becomes a judge prompt; sample one principle per comparison to cover the set.</li>
+  <li>Keep principles, judge prompts and judge model versions under version control: they are training data.</li>
+</ul>
+
+<ul class="failure-modes">
+  <li><strong>Judge bias propagates</strong>: position bias, verbosity bias and self-preference (a judge favouring its own family's style) become the policy's behaviour. Swap positions and average; audit with humans.</li>
+  <li><strong>Over-refusal</strong>: harmlessness principles without helpfulness counterweights produce evasive models. Measure over-refusal on benign prompts that look risky.</li>
+  <li><strong>Collapse of diversity</strong>: optimising many models against the same judges homogenises style.</li>
+  <li><strong>Judge exploitation</strong>: the policy learns what the judge rewards, exactly as with a learned RM (Chapter 7).</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 11 -->
+<section class="chapter">
+<h2 id="distillation-merging">Distillation and Model Merging</h2>
+<p class="chapter-lede">Two ways to get a model without another expensive training run from
+preferences: copy a bigger model's behaviour into a smaller one, or combine several fine-tuned
+models' weights into one.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>A 70B model meets the quality bar but costs 10× too much to serve. Separately, you have three
+  LoRA fine-tunes of the same 8B base (SQL, support tone, German) and want one model that does all
+  three without multi-adapter serving.</p>
+</div>
+
+<h3>Knowledge Distillation</h3>
+<p>Hinton et al. (2015) train a student on the teacher's softened distribution. With temperature <span class="math">T</span>, <span class="math">p^{(T)} = \operatorname{softmax}(z / T)</span>:</p>
+<div class="math">\mathcal{L}_{\text{KD}} = \alpha \, T^2 \, D_{\text{KL}}\big(p_{\text{teacher}}^{(T)} \,\|\, p_{\text{student}}^{(T)}\big) + (1 - \alpha)\, \mathrm{CE}\big(y, p_{\text{student}}^{(1)}\big)</div>
+<ul>
+  <li>Soft targets carry "dark knowledge": the relative probabilities of wrong answers encode similarity structure that a one-hot label discards.</li>
+  <li>The <span class="math">T^2</span> factor compensates for gradients of the soft term shrinking as <span class="math">1/T^2</span>, so <span class="math">\alpha</span> keeps its meaning when you change <span class="math">T</span>.</li>
+  <li>For LLMs: <strong>logit distillation</strong> applies this per token (needs the teacher's logits and a shared tokeniser); <strong>sequence-level distillation</strong> (Kim &amp; Rush, 2016) is SFT on teacher-generated text, which works across tokenisers and closed APIs.</li>
+  <li>Forward KL (above) is mode-covering; reverse KL <span class="math">D_{\text{KL}}(p_s \| p_t)</span> is mode-seeking and is preferred by on-policy distillation methods (the student generates, the teacher scores its tokens).</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Distillation loss with temperature, the <span class="math">T^2</span> check, and a small student trained with and without a teacher (distill.py).</figcaption>
+<pre><code>import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+torch.set_num_threads(2)
+
+
+def kd_loss(student_logits, teacher_logits, labels, T=2.0, alpha=0.5):
+    """Hinton et al. 2015: soft-target KL at temperature T, scaled by T^2."""
+    soft = F.kl_div(F.log_softmax(student_logits / T, -1),
+                    F.log_softmax(teacher_logits / T, -1),
+                    log_target=True, reduction="batchmean") * T * T
+    hard = F.cross_entropy(student_logits, labels)
+    return alpha * soft + (1 - alpha) * hard
+
+
+# Why T^2: the soft-target gradient shrinks as 1/T^2 for large T.
+z_s, z_t = torch.randn(1, 10, requires_grad=True), torch.randn(1, 10)
+for T in (1, 2, 4, 8):
+    z_s.grad = None
+    F.kl_div(F.log_softmax(z_s / T, -1), F.log_softmax(z_t / T, -1),
+             log_target=True, reduction="batchmean").backward()
+    gn = z_s.grad.norm().item()
+    print(f"T={T}: grad norm={gn:.4f}  x T^2={gn * T * T:.4f}")
+
+# Teacher: big MLP on lots of data. Student: small MLP on few labels.
+D, C = 20, 10
+W = torch.randn(D, C)
+
+
+def data(n):
+    x = torch.randn(n, D)
+    y = (x @ W + 0.5 * torch.sin(3 * x[:, :C])).argmax(-1)
+    return x, y
+
+
+def mlp(h):
+    return nn.Sequential(nn.Linear(D, h), nn.GELU(), nn.Linear(h, h), nn.GELU(),
+                         nn.Linear(h, C))
+
+
+def fit(model, x, y, steps, teacher=None, T=2.0, lr=3e-3):
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
+    for _ in range(steps):
+        i = torch.randint(0, len(x), (128,))
+        logits = model(x[i])
+        if teacher is None:
+            loss = F.cross_entropy(logits, y[i])
+        else:
+            with torch.no_grad():
+                t = teacher(x[i])
+            loss = kd_loss(logits, t, y[i], T=T, alpha=0.9)
+        opt.zero_grad(); loss.backward(); opt.step()
+    return model
+
+
+@torch.no_grad()
+def acc(m, x, y):
+    return (m(x).argmax(-1) == y).float().mean().item()
+
+
+x_big, y_big = data(50_000); x_small, y_small = data(1_000); x_te, y_te = data(10_000)
+teacher = fit(mlp(512), x_big, y_big, 3000)
+print(f"teacher acc={acc(teacher, x_te, y_te):.3f} "
+      f"params={sum(p.numel() for p in teacher.parameters()):,}")
+torch.manual_seed(1)
+hard = fit(mlp(32), x_small, y_small, 2000)
+torch.manual_seed(1)
+soft = fit(mlp(32), x_small, y_small, 2000, teacher=teacher)
+print(f"student params={sum(p.numel() for p in hard.parameters()):,}")
+print(f"student, hard labels only : acc={acc(hard, x_te, y_te):.3f}")
+print(f"student, KD (T=2, a=0.9)  : acc={acc(soft, x_te, y_te):.3f}")</code></pre>
+</figure>
+<pre class="output">T=1: grad norm=0.3854  x T^2=0.3854
+T=2: grad norm=0.0889  x T^2=0.3556
+T=4: grad norm=0.0215  x T^2=0.3439
+T=8: grad norm=0.0053  x T^2=0.3403
+teacher acc=0.887 params=278,538
+student params=2,058
+student, hard labels only : acc=0.826
+student, KD (T=2, a=0.9)  : acc=0.871</pre>
+<ul>
+  <li>The raw gradient falls roughly as <span class="math">1/T^2</span> (0.385 → 0.005); after scaling by <span class="math">T^2</span> it is nearly constant.</li>
+  <li>On the same 1,000 labelled inputs, the 135× smaller student recovers most of the gap to the teacher (82.6% → 87.1% versus 88.7%). The teacher's soft labels are worth far more per example than hard labels.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Imitation limits</span>
+  <ul>
+    <li>Gudibande et al. (2023, "The False Promise of Imitating Proprietary LLMs") found imitation models copy the teacher's <em>style</em> convincingly, fooling crowd raters, while closing little of the gap in factuality and capability. Evaluate distilled models on capability benchmarks, not just preference ratings.</li>
+    <li>Check the teacher's licence and terms of service before distilling from it.</li>
+  </ul>
+</aside>
+
+<h3>Model Merging</h3>
+<p>Fine-tunes of the same base stay in a connected low-loss region, so their weights can often be combined arithmetically.</p>
+<ul>
+  <li><strong>Weight averaging / model soups</strong> (Wortsman et al., 2022): average several fine-tunes of the same task with different hyperparameters; often beats the best single run on accuracy and robustness.</li>
+  <li><strong>Task arithmetic</strong> (Ilharco et al., 2022): a task vector is <span class="math">\tau_i = \theta_i - \theta_0</span>. Add them to combine skills, subtract to remove behaviour:</li>
+</ul>
+<div class="math">\theta_{\text{merged}} = \theta_0 + \lambda \sum_i \tau_i</div>
+<ul>
+  <li><strong>TIES-Merging</strong> (Yadav et al., 2023) targets interference between task vectors in three steps: <strong>trim</strong> each <span class="math">\tau_i</span> to its top-<span class="math">k</span>% magnitude entries (default 20%); <strong>elect</strong> a sign per parameter from the summed magnitudes; <strong>disjoint merge</strong>, averaging only the entries that agree with the elected sign.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Averaging, task arithmetic and TIES on two linear "fine-tunes" with sparse useful updates plus dense drift (merge.py).</figcaption>
+<pre><code>import torch
+
+torch.manual_seed(0)
+D = 256
+
+
+def finetune(base, X, Y, steps=300, lr=0.05):
+    """Least-squares 'fine-tune' of a linear model from a shared base."""
+    w = base.clone().requires_grad_(True)
+    opt = torch.optim.SGD([w], lr=lr)
+    for _ in range(steps):
+        loss = ((X @ w - Y) ** 2).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+    return w.detach()
+
+
+def mse(w, X, Y):
+    return ((X @ w - Y) ** 2).mean().item()
+
+
+# Pretrained base; each task reads a disjoint half of the input features.
+w_base = torch.randn(D)
+regions = [torch.arange(0, 128), torch.arange(128, 256)]
+tasks = []
+for region in regions:
+    w_star = w_base.clone()
+    idx = region[torch.randperm(len(region))[:20]]
+    w_star[idx] += torch.randn(20) * 2.0                   # sparse useful change
+    X = torch.zeros(400, D)
+    X[:, region] = torch.randn(400, len(region))
+    Y = X @ w_star + 0.1 * torch.randn(400)
+    tasks.append((X, Y))
+# Real fine-tunes also drift every weight a little (shared-layer updates,
+# optimiser noise); simulate that with small dense noise on all weights.
+w_ft = [finetune(w_base, X, Y) + 0.3 * torch.randn(D) for X, Y in tasks]
+tau = [w - w_base for w in w_ft]                       # task vectors
+
+
+def ties(taus, density=0.2):
+    """TIES: trim to top-k magnitude, elect a sign per weight, disjoint mean."""
+    trimmed = []
+    for t in taus:
+        k = int(density * t.numel())
+        thresh = t.abs().kthvalue(t.numel() - k).values
+        trimmed.append(torch.where(t.abs() &gt; thresh, t, torch.zeros_like(t)))
+    T = torch.stack(trimmed)                           # (n_tasks, D)
+    sign = torch.sign(T.sum(0))                        # elected sign by total mass
+    agree = (torch.sign(T) == sign) &amp; (T != 0)
+    return (T * agree).sum(0) / agree.sum(0).clamp(min=1)
+
+
+merges = {
+    "base": w_base,
+    "fine-tuned A": w_ft[0],
+    "fine-tuned B": w_ft[1],
+    "weight average": (w_ft[0] + w_ft[1]) / 2,
+    "task arithmetic (l=1.0)": w_base + 1.0 * (tau[0] + tau[1]),
+    "TIES (density 0.2)": w_base + ties(tau),
+}
+print(f"{'model':26s} {'task A mse':&gt;10} {'task B mse':&gt;10}")
+for name, w in merges.items():
+    print(f"{name:26s} {mse(w, *tasks[0]):10.3f} {mse(w, *tasks[1]):10.3f}")
+cos = torch.nn.functional.cosine_similarity(tau[0], tau[1], dim=0)
+print(f"cosine(task A vector, task B vector) = {cos:.3f}")</code></pre>
+</figure>
+<pre class="output">model                      task A mse task B mse
+base                          121.611     51.032
+fine-tuned A                   11.489     60.919
+fine-tuned B                  145.774     12.020
+weight average                 38.036     21.642
+task arithmetic (l=1.0)        22.847     28.204
+TIES (density 0.2)             11.845     13.398
+cosine(task A vector, task B vector) = -0.007</pre>
+<ul>
+  <li><strong>Averaging</strong> halves each task vector, so each task keeps only half its improvement.</li>
+  <li><strong>Task arithmetic</strong> keeps each full update but also adds the other task's dense drift, which hurts: task B's error (28.2) is more than twice its fine-tuned value.</li>
+  <li><strong>TIES</strong> trims the small drift entries and keeps the large useful ones, so the merged model is almost as good as each specialist on both tasks. This is the "redundant parameters interfere" mechanism of the paper, built into the toy by construction; on real models the gains are smaller and task-dependent.</li>
+  <li>Merging needs a shared base checkpoint (same architecture, same initialisation). Merging models fine-tuned from different bases does not work without alignment of permutation symmetries.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 12 -->
+<section class="chapter">
+<h2 id="production-post-training">Production Post-Training</h2>
+<p class="chapter-lede">A production post-training pipeline is mostly not training code: it is data
+versioning, reproducible configuration, evaluation gates and release documentation around a
+library call.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Three engineers run SFT and DPO experiments with different seeds, datasets and chat templates.
+  One checkpoint wins a demo and is shipped. Two weeks later it refuses benign medical questions
+  and outputs invalid JSON 8% of the time. Nobody can reproduce it or say what changed.</p>
+</div>
+
+<h3>Mapping This Volume to PEFT and TRL</h3>
+<p>Use libraries in production; use the from-scratch code to test them. Every row below is a parity
+check you can run on a small model: identical inputs, compare losses or outputs to a tolerance.</p>
+<table>
+  <caption>From-scratch components and their Hugging Face equivalents (API names as documented for PEFT, TRL and Transformers; check the installed version).</caption>
+  <thead><tr><th>This volume</th><th>Library equivalent</th><th>Parity check</th></tr></thead>
+  <tbody>
+    <tr><td><code>build_example</code> masking</td><td>TRL <code>SFTTrainer</code> with <code>SFTConfig(assistant_only_loss=True)</code> or completion-only loss; tokenizer <code>apply_chat_template</code></td><td>Count and position of <code>-100</code> labels on the same conversation</td></tr>
+    <tr><td>Packing discussion</td><td><code>SFTConfig(packing=True)</code> with padding-free/flash-attention variable-length batching</td><td>Loss equal to unpacked batch on the same examples</td></tr>
+    <tr><td><code>LoRALinear</code>, <code>add_lora</code></td><td>PEFT <code>LoraConfig(r, lora_alpha, lora_dropout, target_modules)</code>, <code>get_peft_model</code></td><td>Copy <span class="math">A, B</span> into PEFT's <code>lora_A</code>/<code>lora_B</code>; outputs match</td></tr>
+    <tr><td><code>merge</code>/<code>unmerge</code></td><td>PEFT <code>merge_and_unload()</code>, <code>unmerge_adapter()</code>, <code>disable_adapter()</code></td><td>Merged vs unmerged logits within tolerance</td></tr>
+    <tr><td>NF4 quantise</td><td>Transformers <code>BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16)</code></td><td>Code book equals Chapter 5's levels; dequantised error comparable</td></tr>
+    <tr><td><code>bt_loss</code></td><td>TRL <code>RewardTrainer</code></td><td>Loss on the same pair logits</td></tr>
+    <tr><td>Mini-PPO, <code>gae</code></td><td>TRL <code>PPOTrainer</code>; <code>GRPOTrainer</code>, <code>RLOOTrainer</code> for critic-free variants</td><td>Per-token KL and advantages on one logged batch</td></tr>
+    <tr><td><code>dpo_loss</code>, <code>ipo_loss</code></td><td>TRL <code>DPOTrainer</code> with <code>DPOConfig(beta, loss_type="sigmoid" | "ipo")</code></td><td>Loss and <code>rewards/chosen</code> on one batch</td></tr>
+    <tr><td>KTO, ORPO, SimPO</td><td><code>KTOTrainer</code>, <code>ORPOTrainer</code>, <code>CPOTrainer(loss_type="simpo")</code></td><td>As above</td></tr>
+    <tr><td><code>kd_loss</code></td><td>TRL <code>GKDTrainer</code> (generalised on-policy distillation) or a custom <code>compute_loss</code></td><td>KL on fixed logits</td></tr>
+    <tr><td><code>ties</code></td><td><code>mergekit</code> (linear, task_arithmetic, ties, dare methods); PEFT <code>add_weighted_adapter</code></td><td>Merged tensor equal on a toy checkpoint</td></tr>
+  </tbody>
+</table>
+
+<h3>Pipeline</h3>
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  A[Versioned datasets and manifests] --> B[SFT with LoRA]
+  B --> C[Eval gate 1: task, regression, safety]
+  C --> D[Sample on-policy pairs]
+  D --> E[Label: humans, RM or AI judge]
+  E --> F[DPO or PPO]
+  F --> G[Eval gate 2: win rate, forgetting, over-refusal]
+  G --> H[Merge or quantise for serving]
+  H --> I[Eval gate 3: serving parity]
+  I --> J[Model card and staged release]
+  J --> K[Production feedback]
+  K --> A</pre>
+<figcaption>Post-training as a gated pipeline; every artefact is versioned and every transition is gated.</figcaption>
+</figure>
+
+<h3>Experiment Management</h3>
+<ul>
+  <li>Log per run: base model revision hash, tokeniser and chat template hash, dataset manifest hashes, full config, library versions, seed, hardware, and the evaluation report.</li>
+  <li>Track the right training metrics: masked token count per step (SFT); reward mean and std, KL, entropy, clip fraction and value loss (PPO); <code>rewards/chosen</code>, <code>rewards/rejected</code>, margins, accuracy and <code>logps/chosen</code> (DPO).</li>
+  <li>Save adapters and optimiser state separately; adapters are megabytes and cheap to keep for every checkpoint.</li>
+</ul>
+
+<h3>Evaluation Gates</h3>
+<figure class="listing">
+<figcaption>A release gate: paired bootstrap confidence intervals on improvements, forgetting budgets and hard limits (gate.py; synthetic per-example scores).</figcaption>
+<pre><code>import random
+from dataclasses import dataclass
+
+
+@dataclass
+class Gate:
+    metric: str
+    kind: str          # "min_delta" (candidate - baseline &gt;= t) or "max_value"
+    threshold: float
+
+
+GATES = [
+    Gate("task_win_rate_vs_baseline", "min_delta", 0.0),   # CI lower bound &gt; 0
+    Gate("mmlu_subset_acc", "min_delta", -0.01),          # forgetting budget: 1 pt
+    Gate("safety_refusal_recall", "min_delta", -0.005),
+    Gate("over_refusal_rate", "max_value", 0.05),
+    Gate("format_valid_json", "min_delta", 0.0),
+]
+
+
+def paired_bootstrap_delta(cand, base, n=2000, seed=0):
+    """95% CI for mean(cand - base) over the same examples."""
+    rng = random.Random(seed)
+    d = [c - b for c, b in zip(cand, base)]
+    means = sorted(sum(rng.choice(d) for _ in d) / len(d) for _ in range(n))
+    return sum(d) / len(d), means[int(0.025 * n)], means[int(0.975 * n)]
+
+
+def evaluate(cand, base):
+    ok = True
+    for g in GATES:
+        if g.kind == "max_value":
+            v = sum(cand[g.metric]) / len(cand[g.metric])
+            passed = v &lt;= g.threshold
+            print(f"{g.metric:28s} value={v:.3f} &lt;= {g.threshold}: "
+                  f"{'PASS' if passed else 'FAIL'}")
+        else:
+            m, lo, hi = paired_bootstrap_delta(cand[g.metric], base[g.metric])
+            passed = lo &gt; g.threshold if g.threshold == 0.0 else m &gt;= g.threshold
+            print(f"{g.metric:28s} delta={m:+.3f} CI=[{lo:+.3f},{hi:+.3f}]: "
+                  f"{'PASS' if passed else 'FAIL'}")
+        ok &amp;= passed
+    return ok
+
+
+rng = random.Random(1)
+N = 400
+base = {"task_win_rate_vs_baseline": [0.5] * N,
+        "mmlu_subset_acc": [int(rng.random() &lt; 0.62) for _ in range(N)],
+        "safety_refusal_recall": [int(rng.random() &lt; 0.97) for _ in range(N)],
+        "over_refusal_rate": [int(rng.random() &lt; 0.03) for _ in range(N)],
+        "format_valid_json": [int(rng.random() &lt; 0.95) for _ in range(N)]}
+cand = {"task_win_rate_vs_baseline": [int(rng.random() &lt; 0.58) for _ in range(N)],
+        "mmlu_subset_acc": [x if rng.random() &gt; 0.06 else 1 - x
+                            for x in base["mmlu_subset_acc"]],
+        "safety_refusal_recall": [int(rng.random() &lt; 0.97) for _ in range(N)],
+        "over_refusal_rate": [int(rng.random() &lt; 0.07) for _ in range(N)],
+        "format_valid_json": [max(x, int(rng.random() &lt; 0.5))
+                              for x in base["format_valid_json"]]}
+print("RELEASE" if evaluate(cand, base) else "BLOCK RELEASE")</code></pre>
+</figure>
+<pre class="output">task_win_rate_vs_baseline    delta=+0.122 CI=[+0.072,+0.170]: PASS
+mmlu_subset_acc              delta=-0.013 CI=[-0.033,+0.007]: FAIL
+safety_refusal_recall        delta=-0.003 CI=[-0.025,+0.020]: PASS
+over_refusal_rate            value=0.077 &lt;= 0.05: FAIL
+format_valid_json            delta=+0.035 CI=[+0.018,+0.055]: PASS
+BLOCK RELEASE</pre>
+<ul>
+  <li>The candidate wins 62% of pairwise comparisons (a significant +12 points over a 50% tie) and would ship on the headline metric alone. The gate blocks it on the forgetting budget and on over-refusal: exactly the failure in this chapter's problem statement.</li>
+  <li>Win-rate is encoded as 1 (win) or 0 (loss) against a baseline tie value of 0.5. Real gates use judged pairwise comparisons with position swapping (Volume 10).</li>
+  <li>The forgetting gate uses the point estimate, so noise can fail a harmless candidate; with 400 examples the CI is ±2 points. Size evaluation sets for the budget you want to enforce.</li>
+</ul>
+
+<h3>Model Cards and Release</h3>
+<p>Mitchell et al. (2019) proposed model cards as standard release documentation. For a post-trained model, include:</p>
+<ul>
+  <li><strong>Lineage</strong>: base model and revision; every post-training stage in order (CPT, SFT, DPO, merge, quantisation) with configs.</li>
+  <li><strong>Training data</strong>: dataset manifests, licences, synthetic data generators and their terms, filters, decontamination against the reported evaluations.</li>
+  <li><strong>Intended use and out-of-scope use</strong>, including the failure classes from Chapter 1 that fine-tuning does not fix.</li>
+  <li><strong>Evaluation</strong>: task metrics with confidence intervals, regression deltas against the base, safety and over-refusal results, known weaknesses.</li>
+  <li><strong>Serving requirements</strong>: chat template, stop tokens, recommended sampling settings, quantisation format.</li>
+</ul>
+<p class="facet">Release</p>
+<ul>
+  <li>Shadow traffic, then a canary percentage, with online metrics compared to the incumbent (Volume 12).</li>
+  <li>Keep the previous model hot for instant rollback; adapters make this cheap.</li>
+  <li>Feed production failures back into the evaluation set before the next training run.</li>
+</ul>
+
+<aside class="callout security"><span class="title">Fine-tuning erodes safety</span>
+  <ul>
+    <li>Qi et al. (2023) showed that fine-tuning an aligned model on a few dozen adversarial examples, or even on benign data, can remove safety behaviour. Every fine-tune, including customer fine-tunes on a platform, needs its own safety regression gate.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ REVIEW -->
+<section class="review">
+<h1>Volume Review</h1>
+
+<h2>What You Learned</h2>
+<ul>
+  <li>Fine-tuning fixes behaviour, format and efficiency gaps; it is a poor fix for knowledge freshness, access control and missing capabilities.</li>
+  <li>SFT is masked next-token loss: labels <code>-100</code> on everything except assistant tokens, end-of-turn token included, with an identical chat template at training and serving.</li>
+  <li>Data quality, diversity and decontamination matter more than volume; synthetic data needs a filter stack and licence tracking.</li>
+  <li>LoRA trains <span class="math">\Delta W = \frac{\alpha}{r}BA</span> with <span class="math">B = 0</span> at initialisation, and merges into a dense weight with zero serving overhead.</li>
+  <li>QLoRA stores the frozen base as NF4 with blockwise absmax scales and double quantisation (4.127 bits per parameter), putting 70B fine-tuning on one 80 GB GPU.</li>
+  <li>Continued pretraining needs replay and learning-rate re-warming, and forgetting must be measured against a budget.</li>
+  <li>Reward models fit Bradley–Terry likelihoods; they learn labeller biases faithfully, and optimising against them over-optimises.</li>
+  <li>RLHF maximises reward minus <span class="math">\beta</span>·KL, with PPO's clipped surrogate and four models; <span class="math">\beta</span> decides where you land on the proxy–gold curve.</li>
+  <li>DPO follows from the closed-form optimum <span class="math">\pi^* \propto \pi_{\text{ref}} e^{r/\beta}</span>; IPO, KTO, ORPO and SimPO each fix one of its weaknesses.</li>
+  <li>AI feedback (RLAIF, Constitutional AI) replaces most human labels, and imports the judge's biases.</li>
+  <li>Distillation transfers behaviour through soft targets; merging combines fine-tunes of a shared base, and TIES reduces interference.</li>
+</ul>
+
+<h2>What You Built</h2>
+<ul>
+  <li>A chat-template SFT example builder with prefix-stability checks on the real SmolLM2 tokeniser.</li>
+  <li><code>forge.posttrain</code>: <code>LoRALinear</code> with merge/unmerge, and a LoRA fine-tune of SmolLM2-135M (0.34% of parameters trainable).</li>
+  <li>An NF4 code book that reproduces bitsandbytes' table, blockwise quantise/dequantise, double quantisation and a fine-tuning memory calculator.</li>
+  <li>A continued-pretraining harness with replay and forgetting measurement.</li>
+  <li>A Bradley–Terry reward model with accuracy against an oracle ceiling.</li>
+  <li>Mini-PPO with KL shaping, verified against the closed-form optimum, and GAE.</li>
+  <li>DPO and IPO losses with masking, gradient and closed-form verification.</li>
+  <li>A distillation loss, merging by averaging, task arithmetic and TIES, an instruction-data filter and a release gate.</li>
+</ul>
+
+<h2>Important Code</h2>
+<table>
+  <caption>Listings to keep; later volumes extend them inside <code>forge.posttrain</code>.</caption>
+  <thead><tr><th>Listing</th><th>Forge module</th><th>Concept</th><th>Extended in</th></tr></thead>
+  <tbody>
+    <tr><td><code>build_example</code></td><td><code>forge.posttrain.sft</code></td><td>Chat formatting and loss masking</td><td>Volumes 9, 15</td></tr>
+    <tr><td><code>LoRALinear</code>, <code>add_lora</code></td><td><code>forge.posttrain.lora</code></td><td>Parameter-efficient fine-tuning</td><td>Volume 12</td></tr>
+    <tr><td><code>quantise</code>, <code>dequantise</code>, <code>nf4_levels</code></td><td><code>forge.posttrain.qlora</code></td><td>Weight quantisation</td><td>Volume 11</td></tr>
+    <tr><td><code>bt_loss</code>, <code>RewardModel</code></td><td><code>forge.posttrain.rm</code></td><td>Preference modelling</td><td>Volumes 10, 18</td></tr>
+    <tr><td><code>ppo</code>, <code>gae</code></td><td><code>forge.posttrain.ppo</code></td><td>KL-regularised policy optimisation</td><td>Volume 9</td></tr>
+    <tr><td><code>sequence_logprob</code>, <code>dpo_loss</code></td><td><code>forge.posttrain.dpo</code></td><td>Direct preference optimisation</td><td>Volume 9</td></tr>
+    <tr><td><code>kd_loss</code>, <code>ties</code></td><td><code>forge.posttrain.merge</code></td><td>Distillation and merging</td><td>Volumes 11, 18</td></tr>
+    <tr><td><code>Gate</code>, <code>paired_bootstrap_delta</code></td><td><code>forge.eval</code></td><td>Release gating</td><td>Volume 10</td></tr>
+  </tbody>
+</table>
+
+<h2>Important Architecture</h2>
+<figure class="diagram">
+<pre class="ascii">Base model (pretrained)
+   |
+   +--(optional) continued pretraining + replay ----------+
+   |                                                      |
+   v                                                      v
+SFT (masked loss, LoRA/QLoRA) ---------------------&gt; eval gate
+   |
+   v
+on-policy samples -&gt; labels (human | RM | AI judge)
+   |
+   +-- reward model -&gt; PPO/GRPO (policy, ref, RM, value)
+   |
+   +-- DPO / IPO / KTO / SimPO (policy, ref)
+   |
+   v
+merge / distil / quantise ---------------------------&gt; eval gate
+   |
+   v
+model card -&gt; shadow -&gt; canary -&gt; release -&gt; feedback -&gt; data</pre>
+<figcaption>The post-training stack from base model to release.</figcaption>
+</figure>
+
+<h2>Failure Modes</h2>
+<ul class="failure-modes">
+  <li>Fine-tuning to add knowledge that belongs in retrieval.</li>
+  <li>Chat-template mismatch, double label shift, untrained end-of-turn token, loss on prompts.</li>
+  <li>Naive packing with cross-document attention.</li>
+  <li>Merging a LoRA trained on an NF4 base into bf16 weights without re-evaluation.</li>
+  <li>Continued pretraining without replay; catastrophic forgetting found by users.</li>
+  <li>Reward models learning length and style biases; reward hacking with β too small.</li>
+  <li>DPO with deterministic or off-policy pairs; chosen log-probabilities collapsing.</li>
+  <li>AI-judge biases (position, verbosity, self-preference) becoming policy behaviour.</li>
+  <li>Distilled models that imitate style but not capability.</li>
+  <li>Shipping on a headline win rate without forgetting, safety and over-refusal gates.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<ul>
+  <li>Build the evaluation set before the training set, and decontaminate training data against it.</li>
+  <li>Target metrics with paired confidence intervals against the incumbent.</li>
+  <li>Regression suites with explicit forgetting budgets (general ability, safety, previous tasks).</li>
+  <li>For preference tuning: gold-signal checks (humans or a stronger judge) on every checkpoint, KL to reference, response length distribution.</li>
+  <li>Over-refusal on benign-but-risky-looking prompts; format validity for structured outputs.</li>
+  <li>Serving parity after merging and quantisation.</li>
+</ul>
+
+<h2>Practical Project</h2>
+<div class="frame exercise" data-title="Forge-Instruct">
+  <p>Instruction-tune a small open model (SmolLM2-360M or similar) end to end and decide whether each stage earned its cost. Deliver:</p>
+  <ol>
+    <li>A curated instruction set of 2–5k examples with a manifest (sources, licences, filters, dedup and decontamination statistics).</li>
+    <li>LoRA SFT with the <code>build_example</code> masking, cross-checked against TRL's <code>SFTTrainer</code> labels on 10 conversations.</li>
+    <li>A reward model trained on 2k on-policy pairs labelled by an AI judge with position swapping; report held-out accuracy and a length-bias probe.</li>
+    <li>DPO from the SFT checkpoint; plot implicit reward margins and chosen log-probabilities.</li>
+    <li>A comparison of base, SFT and DPO models with Volume 10's harness: pairwise win rate, a general regression suite, a safety and over-refusal suite, all with confidence intervals.</li>
+    <li>A model card and a release decision produced by the gate from Chapter 12.</li>
+  </ol>
+</div>
+
+<h2>Exercises</h2>
+<ol>
+  <li>Show that normalising SFT loss per sequence instead of per token changes the effective weight of each example. Construct a batch where the two disagree on the gradient direction.</li>
+  <li>Modify <code>LoRALinear</code> to DoRA: decompose <span class="math">W = m \frac{V}{\|V\|_c}</span> with LoRA on <span class="math">V</span>. Verify merge parity.</li>
+  <li>Implement uniform int4 with an exact zero and compare its error to NF4 on Laplace-distributed weights. When does NF4 lose?</li>
+  <li>In <code>cpt.py</code>, replace replay with an L2 penalty to the base weights. Plot forgetting against domain loss for both methods.</li>
+  <li>Add a reward-model ensemble to <code>ppo.py</code> where one member lacks the loophole, and penalise disagreement. At which β does β = 0.5 stop hacking?</li>
+  <li>Derive the gradient of the IPO loss and explain why it does not diverge on deterministic preferences.</li>
+  <li>Implement SimPO in <code>dpo.py</code> with response lengths attached to the 6 responses; show its behaviour when longer responses are preferred.</li>
+  <li>Implement DARE (random drop and rescale of task vectors) and compare it with TIES in <code>merge.py</code>.</li>
+</ol>
+
+<h2>Research Papers</h2>
+<table>
+  <caption>Papers referenced in this volume.</caption>
+  <thead><tr><th>Paper</th><th>Why it matters here</th></tr></thead>
+  <tbody>
+    <tr><td>Howard &amp; Ruder, 2018. <em>Universal Language Model Fine-tuning for Text Classification</em>. arXiv:1801.06146</td><td>ULMFiT: pretrain, then adapt; discriminative learning rates.</td></tr>
+    <tr><td>Wei et al., 2021. <em>Finetuned Language Models Are Zero-Shot Learners</em>. arXiv:2109.01652</td><td>FLAN instruction tuning.</td></tr>
+    <tr><td>Chung et al., 2022. <em>Scaling Instruction-Finetuned Language Models</em>. arXiv:2210.11416</td><td>Scaling tasks and models in instruction tuning.</td></tr>
+    <tr><td>Wang et al., 2022. <em>Self-Instruct: Aligning Language Models with Self-Generated Instructions</em>. arXiv:2212.10560</td><td>Synthetic instruction generation.</td></tr>
+    <tr><td>Zhou et al., 2023. <em>LIMA: Less Is More for Alignment</em>. arXiv:2305.11206</td><td>1,000 curated examples; the superficial alignment hypothesis.</td></tr>
+    <tr><td>Houlsby et al., 2019. <em>Parameter-Efficient Transfer Learning for NLP</em>. arXiv:1902.00751</td><td>Adapters.</td></tr>
+    <tr><td>Li &amp; Liang, 2021. <em>Prefix-Tuning</em>. arXiv:2101.00190; Lester et al., 2021. <em>The Power of Scale for Parameter-Efficient Prompt Tuning</em>. arXiv:2104.08691</td><td>Soft-prompt methods.</td></tr>
+    <tr><td>Hu et al., 2021. <em>LoRA: Low-Rank Adaptation of Large Language Models</em>. arXiv:2106.09685</td><td>Chapter 4.</td></tr>
+    <tr><td>Liu et al., 2024. <em>DoRA: Weight-Decomposed Low-Rank Adaptation</em>. arXiv:2402.09353</td><td>Magnitude–direction LoRA.</td></tr>
+    <tr><td>Dettmers et al., 2023. <em>QLoRA: Efficient Finetuning of Quantized LLMs</em>. arXiv:2305.14314</td><td>NF4, double quantisation, paged optimisers.</td></tr>
+    <tr><td>Biderman et al., 2024. <em>LoRA Learns Less and Forgets Less</em>. arXiv:2405.09673</td><td>LoRA versus full fine-tuning trade-off.</td></tr>
+    <tr><td>Gururangan et al., 2020. <em>Don't Stop Pretraining</em>. arXiv:2004.10964</td><td>Domain- and task-adaptive pretraining.</td></tr>
+    <tr><td>Ibrahim et al., 2024. <em>Simple and Scalable Strategies to Continually Pre-train Large Language Models</em>. arXiv:2403.08763</td><td>Re-warming, re-decaying and replay.</td></tr>
+    <tr><td>Kirkpatrick et al., 2017. <em>Overcoming Catastrophic Forgetting in Neural Networks</em>. arXiv:1612.00796</td><td>EWC.</td></tr>
+    <tr><td>Christiano et al., 2017. <em>Deep Reinforcement Learning from Human Preferences</em>. arXiv:1706.03741</td><td>Learning rewards from pairwise comparisons.</td></tr>
+    <tr><td>Stiennon et al., 2020. <em>Learning to Summarize from Human Feedback</em>. arXiv:2009.01325</td><td>RLHF for language with a KL penalty.</td></tr>
+    <tr><td>Ouyang et al., 2022. <em>Training Language Models to Follow Instructions with Human Feedback</em>. arXiv:2203.02155</td><td>InstructGPT: SFT, RM, PPO-ptx.</td></tr>
+    <tr><td>Schulman et al., 2017. <em>Proximal Policy Optimization Algorithms</em>. arXiv:1707.06347</td><td>Clipped surrogate.</td></tr>
+    <tr><td>Bai et al., 2022. <em>Training a Helpful and Harmless Assistant with RLHF</em>. arXiv:2204.05862</td><td>HH-RLHF data and trade-offs.</td></tr>
+    <tr><td>Bai et al., 2022. <em>Constitutional AI: Harmlessness from AI Feedback</em>. arXiv:2212.08073</td><td>Critique-and-revise; RLAIF.</td></tr>
+    <tr><td>Lee et al., 2023. <em>RLAIF</em>. arXiv:2309.00267</td><td>AI versus human feedback at scale.</td></tr>
+    <tr><td>Gao et al., 2022. <em>Scaling Laws for Reward Model Overoptimization</em>. arXiv:2210.10760</td><td>Proxy versus gold reward curves.</td></tr>
+    <tr><td>Singhal et al., 2023. <em>A Long Way to Go: Investigating Length Correlations in RLHF</em>. arXiv:2310.03716</td><td>Length bias.</td></tr>
+    <tr><td>Rafailov et al., 2023. <em>Direct Preference Optimization</em>. arXiv:2305.18290</td><td>Chapter 9.</td></tr>
+    <tr><td>Azar et al., 2023. <em>A General Theoretical Paradigm to Understand Learning from Human Preferences</em>. arXiv:2310.12036</td><td>IPO.</td></tr>
+    <tr><td>Ethayarajh et al., 2024. <em>KTO: Model Alignment as Prospect Theoretic Optimization</em>. arXiv:2402.01306</td><td>Unpaired binary feedback.</td></tr>
+    <tr><td>Hong et al., 2024. <em>ORPO: Monolithic Preference Optimization without Reference Model</em>. arXiv:2403.07691</td><td>Single-stage SFT plus preference.</td></tr>
+    <tr><td>Meng et al., 2024. <em>SimPO: Simple Preference Optimization with a Reference-Free Reward</em>. arXiv:2405.14734</td><td>Length-normalised, reference-free.</td></tr>
+    <tr><td>Hinton et al., 2015. <em>Distilling the Knowledge in a Neural Network</em>. arXiv:1503.02531</td><td>Temperature distillation.</td></tr>
+    <tr><td>Kim &amp; Rush, 2016. <em>Sequence-Level Knowledge Distillation</em>. arXiv:1606.07947</td><td>Distillation via generated sequences.</td></tr>
+    <tr><td>Gudibande et al., 2023. <em>The False Promise of Imitating Proprietary LLMs</em>. arXiv:2305.15717</td><td>Imitation limits.</td></tr>
+    <tr><td>Wortsman et al., 2022. <em>Model Soups</em>. arXiv:2203.05482</td><td>Weight averaging.</td></tr>
+    <tr><td>Ilharco et al., 2022. <em>Editing Models with Task Arithmetic</em>. arXiv:2212.04089</td><td>Task vectors.</td></tr>
+    <tr><td>Yadav et al., 2023. <em>TIES-Merging: Resolving Interference When Merging Models</em>. arXiv:2306.01708</td><td>Trim, elect sign, disjoint merge.</td></tr>
+    <tr><td>Mitchell et al., 2019. <em>Model Cards for Model Reporting</em>. arXiv:1810.03993</td><td>Release documentation.</td></tr>
+  </tbody>
+</table>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">LoRA: Low-Rank Adaptation of Large Language Models</span>
+    <span class="paper-meta">Hu et al., 2021 · ICLR</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Full fine-tuning of every weight for each downstream task is storage- and compute-heavy at LLM scale.</dd>
+    <dt>Previous limitation</dt><dd>Adapters added depth and latency; prefix tuning was hard to optimise and slow at inference for long prefixes.</dd>
+    <dt>Approach</dt><dd>Freeze the pretrained weight <span class="math">W</span> and learn a low-rank update <span class="math">\Delta W = BA</span> injected into attention (and later FFN) projections; merge at serving time.</dd>
+    <dt>Contribution</dt><dd>Matched full fine-tuning quality with orders-of-magnitude fewer trainable parameters; no extra inference latency when merged.</dd>
+    <dt>Practical impact</dt><dd>Default PEFT method in open-source stacks; foundation of QLoRA multi-adapter serving.</dd>
+    <dt>Limitations</dt><dd>Rank and target-module choices matter; can underfit relative to full FT on some domains (Biderman et al. 2024).</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">QLoRA: Efficient Finetuning of Quantized LLMs</span>
+    <span class="paper-meta">Dettmers et al., 2023 · NeurIPS</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Fine-tuning a 65B model needed more than 780 GB of GPU memory in 16-bit.</dd>
+    <dt>Previous limitation</dt><dd>4-bit quantisation was used for inference; training through quantised weights lost quality.</dd>
+    <dt>Approach</dt><dd>Freeze the base in NF4 with blockwise scales and double quantisation, backpropagate into LoRA adapters in bf16, and page optimiser state.</dd>
+    <dt>Contribution</dt><dd>65B fine-tuning on a single 48 GB GPU matching 16-bit fine-tuning quality on their benchmarks; the Guanaco models.</dd>
+    <dt>Practical impact</dt><dd>Made fine-tuning large open models accessible on single GPUs; standard in bitsandbytes, PEFT and TRL.</dd>
+    <dt>Limitations</dt><dd>Slower than bf16 LoRA; adapters are tied to the quantised base; evaluation relied partly on GPT-4 judgements.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Training Language Models to Follow Instructions with Human Feedback</span>
+    <span class="paper-meta">Ouyang et al., 2022 · NeurIPS</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Pretrained LMs next-token predict well but do not reliably follow user instructions or stay helpful and harmless.</dd>
+    <dt>Previous limitation</dt><dd>SFT alone underused preference signal; pure RL without a KL constraint drifted from the pretrained distribution.</dd>
+    <dt>Approach</dt><dd>InstructGPT pipeline: SFT on demos → Bradley–Terry reward model on rankings → PPO with KL penalty to the SFT policy (PPO-ptx mixes pretraining gradients).</dd>
+    <dt>Contribution</dt><dd>Showed labelers preferred a 1.3B InstructGPT model over a 175B base GPT-3; established the three-stage RLHF recipe.</dd>
+    <dt>Practical impact</dt><dd>Template for ChatGPT-era alignment stacks and for open RLHF libraries.</dd>
+    <dt>Limitations</dt><dd>Operationally heavy (four models); proxy reward over-optimisation; preferences reflect a narrow rater pool.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Direct Preference Optimization: Your Language Model is Secretly a Reward Model</span>
+    <span class="paper-meta">Rafailov et al., 2023 · NeurIPS</span></div>
+  <dl>
+    <dt>Problem</dt><dd>RLHF with PPO is complex, unstable and expensive: a reward model, on-policy sampling and four models in memory.</dd>
+    <dt>Previous limitation</dt><dd>Treating preference learning as RL required explicit reward modelling and policy-gradient estimation.</dd>
+    <dt>Approach</dt><dd>Use the closed-form optimum of the KL-constrained objective to reparameterise the reward in terms of the policy, then fit Bradley–Terry preferences with a binary cross-entropy loss.</dd>
+    <dt>Contribution</dt><dd>An RL-free preference optimisation method matching or beating PPO on sentiment control, summarisation and dialogue.</dd>
+    <dt>Practical impact</dt><dd>Became the default open-source preference tuning method and spawned IPO, KTO, ORPO and SimPO.</dd>
+    <dt>Limitations</dt><dd>Offline and off-policy by default; overfits deterministic preferences; only constrains the margin, so chosen likelihood can fall.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Constitutional AI: Harmlessness from AI Feedback</span>
+    <span class="paper-meta">Bai et al., 2022 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Harmlessness from human labels alone is expensive and exposes raters to toxic content.</dd>
+    <dt>Previous limitation</dt><dd>HH-RLHF needed many human preference labels for both helpfulness and harmlessness.</dd>
+    <dt>Approach</dt><dd>Write a constitution of principles; critique-and-revise with an AI; train on AI preference labels (RLAIF) for harmlessness while keeping human labels for helpfulness.</dd>
+    <dt>Contribution</dt><dd>Showed AI feedback can replace much of the harmlessness labelling while remaining competitive with human RLHF.</dd>
+    <dt>Practical impact</dt><dd>Made principle-driven self-critique and RLAIF standard tools in post-training.</dd>
+    <dt>Limitations</dt><dd>Constitution quality and judge biases still matter; not a substitute for red-teaming.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">TIES-Merging: Resolving Interference When Merging Models</span>
+    <span class="paper-meta">Yadav et al., 2023 · NeurIPS</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Averaging fine-tuned checkpoints (or task vectors) often destroys specialised skills through sign interference.</dd>
+    <dt>Previous limitation</dt><dd>Model soups and naive task arithmetic ignore conflicting update directions across tasks.</dd>
+    <dt>Approach</dt><dd>Trim low-magnitude parameters, elect a consensus sign per coordinate, then merge only agreeing disjoint updates.</dd>
+    <dt>Contribution</dt><dd>Higher multi-task retention than averaging or untrimmed task arithmetic on several multitask suites.</dd>
+    <dt>Practical impact</dt><dd>Practical recipe for combining LoRA/domain adapters without full joint retraining.</dd>
+    <dt>Limitations</dt><dd>Hyperparameters (trim rate) matter; does not create capabilities absent from the parents.</dd>
+  </dl>
+</section>
+
+<h2>Interview Questions</h2>
+<ol class="questions">
+  <li>A team wants to fine-tune a model so it "knows" the company's product catalogue, which changes weekly. What do you recommend and why?</li>
+  <li>Walk through how you would build labels for a multi-turn conversation with tool calls. Which tokens get loss?</li>
+  <li>Why is LoRA's <span class="math">B</span> initialised to zero? What goes wrong if both matrices are random?</li>
+  <li>Estimate the GPU memory for QLoRA fine-tuning of a 70B model with 4k-token sequences. What dominates after the weights?</li>
+  <li>Why do NF4 levels come from normal quantiles, and why is block size an outlier defence?</li>
+  <li>Your domain-adapted model lost 4 points on a general benchmark. What three changes do you try first?</li>
+  <li>Derive the DPO loss from the KL-regularised RLHF objective. Where does the partition function go?</li>
+  <li>DPO training shows rising reward margins but falling chosen log-probabilities. Is that a problem? What would you do?</li>
+  <li>Explain reward over-optimisation and how you would detect it during a PPO run.</li>
+  <li>Why does PPO-based RLHF need four models? Which can you share or remove, and what does GRPO change?</li>
+  <li>When would you choose KTO over DPO, and SimPO over DPO?</li>
+  <li>You merged three LoRA fine-tunes with task arithmetic and one skill regressed. How do you diagnose and fix it?</li>
+</ol>
+
+<h2>Next Volume</h2>
+<p>Volume 9 turns post-training towards reasoning. You will train models to spend test-time
+compute: chain-of-thought and self-consistency, process versus outcome reward models, best-of-<span class="math">n</span>
+and tree search, and reinforcement learning with verifiable rewards using GRPO, the critic-free
+descendant of this volume's PPO loop.</p>
+<p class="facet">Prerequisites from this volume</p>
+<ul>
+  <li>Masked sequence log-probabilities and chat templates (Chapters 2 and 9).</li>
+  <li>KL-regularised policy optimisation, advantages and baselines (Chapter 8).</li>
+  <li>Reward models, over-optimisation and gold-signal evaluation (Chapter 7).</li>
+</ul>
+</section>
+
+</body>
+</html>

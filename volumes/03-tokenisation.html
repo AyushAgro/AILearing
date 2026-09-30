@@ -1,0 +1,1424 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 3 · Tokenisation and Representations</title>
+<meta name="volume" content="Volume 3 · Tokenisation and Representations">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 3</p>
+  <h1 class="no-toc">Tokenisation and Representations</h1>
+  <p class="tp-subtitle">From Bytes to Contextual Vectors</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Build byte-level BPE, WordPiece and Unigram tokenisers from scratch, and prove parity with production libraries.</li>
+  <li>Understand how the tokeniser silently shapes cost, context length, multilingual fairness, arithmetic, code and security.</li>
+  <li>Treat special tokens and chat templates as a versioned contract between training and serving.</li>
+  <li>Understand embeddings from static lookup tables to contextual hidden states, and measure their geometry on a real model.</li>
+  <li>Evaluate tokenisers with numbers: bytes per token, fertility, round-trip exactness, speed and cross-language premium.</li>
+  <li>Ship the continuous package pieces as <code>forge.tokenizers</code> (BPE, WordPiece, Unigram, eval).</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>Volume 2: you can implement a Transformer block and know where the embedding matrix and LM head sit; Forge lives under <code>src/forge/</code>.</li>
+  <li>Working knowledge of Unicode as an engineer (you have fought an encoding bug). Nothing about tokenisers is assumed.</li>
+</ul>
+
+<p class="facet">How to read the code</p>
+<ul>
+  <li>Every listing was executed on an Apple Silicon laptop (Python 3.12, PyTorch, <code>regex</code>, <code>tiktoken</code>, Hugging Face <code>tokenizers</code> and <code>transformers</code>). Printed output is real.</li>
+  <li>Listings are pedagogical; the integrated modules they seed are <code>forge.tokenizers.bpe</code>, <code>forge.tokenizers.wordpiece</code>, <code>forge.tokenizers.unigram</code> and the evaluation helpers.</li>
+  <li>The training corpus for our own tokeniser is this book's curriculum file (<code>MASTER_PLAN.md</code>, ~94 KB of English). It is deliberately tiny so every run takes under a second.</li>
+  <li>Models used: <code>HuggingFaceTB/SmolLM2-135M</code> (tokeniser and embeddings) and <code>sentence-transformers/all-MiniLM-L6-v2</code> (a BERT WordPiece vocabulary and pooling). Both were already cached locally.</li>
+  <li>Shared code lives in <code>bpe.py</code> (Chapter 2); later listings import <code>ByteBPE</code>, <code>GPT2_PAT</code> and <code>CORPUS</code> from it.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1  The problem          chars vs words vs subwords vs bytes; Unicode
+Chapter 2  BPE from scratch     trainer, encoder, GPT-2 regex, round-trip test
+Chapter 3  WordPiece, Unigram   greedy longest match; EM + Viterbi; SentencePiece
+Chapter 4  Special tokens       BOS/EOS/PAD, chat templates, vocabulary size
+Chapter 5  Production           tiktoken and HF tokenizers; parity and speed
+Chapter 6  Failure modes        digits, code, glitch tokens, security
+Chapter 7  Embeddings           cosine, weight tying, anisotropy (SmolLM2)
+Chapter 8  Contextual reps      layers, polysemy, pooling for sentence vectors
+Chapter 9  Evaluation           bytes/token, fertility, fairness, speed</pre>
+<figcaption>Map of Volume 3.</figcaption>
+</figure>
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="problem">The Tokenisation Problem</h2>
+<p class="chapter-lede">A Transformer consumes integers, not text. The tokeniser is the function that
+turns a string into those integers, and it fixes three things before a single weight is trained: the
+sequence length of every input, the size of the embedding and output layers, and what the model can
+and cannot see. It is the one component that is never retrained and rarely re-examined.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>We need a mapping <span class="math">\text{encode}: \Sigma^* \to \{0,\dots,V-1\}^*</span> and its
+  inverse <span class="math">\text{decode}</span> such that (a) every possible string can be encoded
+  (open vocabulary), (b) <span class="math">\text{decode}(\text{encode}(x)) = x</span> exactly, (c)
+  sequences are short, because attention cost grows with length, and (d) <span class="math">V</span> is
+  small enough that the embedding table and softmax are affordable. These four goals conflict.</p>
+</div>
+
+<h3>Possible Solutions</h3>
+
+<table>
+  <caption>Unit choices and what each does not solve.</caption>
+  <thead><tr><th>Unit</th><th>Typical V</th><th>Sequence length</th><th>What it does not solve</th></tr></thead>
+  <tbody>
+    <tr><td>Words (split on spaces)</td><td>10<sup>5</sup>–10<sup>6</sup>+</td><td>Shortest</td><td>Out-of-vocabulary words become <code>[UNK]</code>; no sharing between <em>run</em>, <em>running</em>, <em>runner</em>; languages without spaces (Chinese, Thai) break.</td></tr>
+    <tr><td>Characters (code points)</td><td>~150k possible code points</td><td>Long (≈4–5× words)</td><td>Rare code points still unseen; long sequences cost quadratic attention; the model must learn spelling from scratch.</td></tr>
+    <tr><td>Bytes (UTF-8)</td><td>256</td><td>Longest (non-Latin scripts 2–4× more than chars)</td><td>Fully open vocabulary, but sequences are very long; see ByT5 and the Byte Latent Transformer for architectures that cope.</td></tr>
+    <tr><td>Subwords (BPE, WordPiece, Unigram)</td><td>32k–256k</td><td>Between words and characters</td><td>Frequent strings get one token, rare ones fall back to pieces. Compression is uneven across languages and domains.</td></tr>
+    <tr><td>Byte-level subwords</td><td>50k–200k</td><td>As subwords</td><td>Subwords whose base alphabet is the 256 bytes, so nothing is ever unknown. The modern default (GPT-2 onwards, Llama 3, Qwen).</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Tokenisation is <strong>lossless compression with a fixed, learned codebook</strong>. The model's cost is paid per token, so compression rate is a direct cost multiplier.</li>
+    <li>Every choice moves cost between two places: the sequence axis (attention, KV cache, latency) and the vocabulary axis (embedding memory, softmax FLOPs, rare-token under-training).</li>
+  </ul>
+</aside>
+
+<h3>The Sequence Length Trade-off</h3>
+<p>Let a text have <span class="math">B</span> UTF-8 bytes and let the tokeniser compress at
+<span class="math">c</span> bytes per token. Then <span class="math">T = B / c</span>, and per layer:</p>
+<div class="math">\text{FLOPs}_{\text{attn}} \propto T^2 d = \frac{B^2}{c^2} d, \qquad
+\text{KV bytes} = 2 L T d_{kv} \cdot \text{bytes}_{\text{dtype}} \propto \frac{B}{c}</div>
+<ul>
+  <li>Doubling <span class="math">c</span> quarters attention FLOPs and halves the KV cache and the number of decode steps.</li>
+  <li>The price is a larger <span class="math">V</span>: the embedding and LM head are both <span class="math">V \times d</span>, and the output softmax costs <span class="math">2 V d</span> FLOPs per token.</li>
+  <li>A fixed context window of <span class="math">T_{\max}</span> tokens holds <span class="math">c \cdot T_{\max}</span> bytes. A language at half the compression gets half the effective context and pays double per character.</li>
+</ul>
+
+<h3>Unicode, UTF-8 and Normalisation</h3>
+
+<h4>Code points and bytes</h4>
+<ul>
+  <li>Unicode assigns code points (U+0000 to U+10FFFF). UTF-8 encodes each as 1–4 bytes: ASCII is 1 byte, most European accents 2, Devanagari and CJK 3, emoji 4.</li>
+  <li>This is why byte-level tokenisers start with a "tax" on non-Latin scripts: a Hindi character is three bytes before any merging.</li>
+  <li>Not every byte sequence is valid UTF-8. A byte-level decoder that splits a multi-byte character across tokens must re-join before decoding, or use <code>errors="replace"</code> at the very end only.</li>
+</ul>
+
+<h4>Normalisation (NFC, NFKC)</h4>
+<ul>
+  <li><strong>NFC</strong> composes: <code>e</code> + combining acute (U+0301) becomes <code>é</code> (U+00E9). Canonically equivalent strings become byte-identical. Safe for almost all text.</li>
+  <li><strong>NFKC</strong> also applies compatibility mappings: full-width <code>Ａ</code> becomes <code>A</code>, the ligature <code>ﬁ</code> becomes <code>fi</code>, superscript <code>²</code> becomes <code>2</code>. It is lossy: <code>x²</code> and <code>x2</code> collapse.</li>
+  <li>Byte-level BPE (GPT-2, tiktoken) applies <em>no</em> normalisation, so it is exactly reversible. SentencePiece defaults to NFKC-like normalisation (<code>nmt_nfkc</code>), so <code>decode(encode(x))</code> may differ from <code>x</code>.</li>
+</ul>
+
+<h4>Grapheme clusters</h4>
+<ul>
+  <li>What a user perceives as one character may be several code points: <code>👩‍👩‍👧</code> is 5 code points (joined by U+200D zero-width joiners) and 18 bytes; a Devanagari syllable is a consonant plus vowel sign.</li>
+  <li>Tokenisers do not respect grapheme boundaries. Truncating a token sequence can split a grapheme, yielding invalid UTF-8 or a visibly broken character in streamed output.</li>
+</ul>
+
+<ul class="failure-modes">
+  <li><strong>Streaming mojibake</strong>: decoding each token independently while streaming prints <code>�</code> when a character spans two tokens. Buffer incomplete UTF-8 sequences before emitting.</li>
+  <li><strong>Normalisation mismatch</strong>: normalising at training but not at serving (or vice versa) changes token IDs for accented text and silently degrades quality.</li>
+  <li><strong>Length limits in characters</strong>: enforcing limits with <code>len(str)</code> rather than token counts under- or over-fills context by a factor of up to 4 for non-Latin text.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="bpe">Byte Pair Encoding from Scratch</h2>
+<p class="chapter-lede">BPE began as a 1994 compression algorithm and was adapted to neural machine
+translation by Sennrich et al. (2015). GPT-2 made it byte-level and added a pre-tokenisation regex.
+That combination, unchanged in essence, tokenises most text processed by LLMs today. We build it in
+about 70 lines as the start of <code>forge.tokenizers.bpe</code>, then prove it matches <code>tiktoken</code> exactly.</p>
+
+<h3>The Algorithm</h3>
+
+<div class="frame simple">
+  <p class="facet">Simple Version</p>
+  <ol>
+    <li>Start with a vocabulary of the 256 byte values. Represent the corpus as byte sequences.</li>
+    <li>Count every adjacent pair of symbols. Merge the most frequent pair into a new symbol and record the merge.</li>
+    <li>Repeat until the vocabulary reaches the target size <span class="math">V</span>.</li>
+    <li>To encode new text, replay the merges in the order they were learned.</li>
+  </ol>
+</div>
+
+<p>Training is greedy: at step <span class="math">k</span> it picks</p>
+<div class="math">(a, b)^{*} = \arg\max_{(a,b)} \sum_{w \in \mathcal{W}} f(w) \cdot \text{count}_{w}(a, b)</div>
+<ul>
+  <li><span class="math">\mathcal{W}</span> is the set of distinct pre-tokens (chunks), <span class="math">f(w)</span> its corpus frequency.</li>
+  <li>The merge list is ordered: its index is the <strong>rank</strong>. Encoding must apply lower-ranked merges first, or it produces different tokens than training saw.</li>
+  <li>BPE optimises nothing globally. It is a greedy compression heuristic, and that is why its token boundaries are sometimes linguistically odd.</li>
+  <li><strong>Byte fallback</strong>: because the base vocabulary is the 256 UTF-8 bytes, every Unicode string is encodable. There is no UNK. A single BPE token may still be an incomplete UTF-8 sequence, so decoding must buffer until a valid character forms.</li>
+</ul>
+
+<h3>Pre-tokenisation</h3>
+<p>Running BPE over raw text would let merges cross word and punctuation boundaries, producing tokens
+like <code>"dog."</code> and <code>"dog!"</code> that waste vocabulary. GPT-2 first splits text with a
+regex and only merges inside each chunk.</p>
+<ul>
+  <li><code>'(?:[sdmt]|ll|ve|re)</code>: English contractions as their own chunks.</li>
+  <li><code> ?\p{L}+</code>: a run of letters with an optional <em>leading</em> space. The space belongs to the following word, which is why tokens look like <code>Ġworld</code>.</li>
+  <li><code> ?\p{N}+</code>: a run of digits (GPT-2 allows any length; cl100k caps it at three).</li>
+  <li><code> ?[^\s\p{L}\p{N}]+</code>: punctuation and symbols.</li>
+  <li><code>\s+(?!\S)</code> then <code>\s+</code>: whitespace, leaving the last space to attach to the next word.</li>
+</ul>
+
+<h3>Implementation</h3>
+
+<h4>Training with incremental pair updates</h4>
+<ul>
+  <li>Naive training recounts all pairs after every merge: <span class="math">O(N)</span> per merge, <span class="math">O(NV)</span> in total.</li>
+  <li>We work on the <em>unique</em> chunks with counts (a few thousand, not the full corpus) and keep an inverted index <code>pair → chunks containing it</code>. A merge only touches chunks that contain the winning pair.</li>
+  <li>Production trainers (HF <code>tokenizers</code>, SentencePiece) add a priority queue with lazy deletion so that finding the maximum is <span class="math">O(\log P)</span> rather than a linear scan.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>bpe.py: byte-level BPE trainer, encoder and decoder with the GPT-2 pre-tokenisation regex.</figcaption>
+<pre><code>import collections, time
+import regex as re
+
+GPT2_PAT = re.compile(
+    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+
+def get_pairs(word):                       # word: tuple of ints
+    return zip(word, word[1:])
+
+def merge_word(word, pair, new_id):
+    out, i = [], 0
+    while i &lt; len(word):
+        if i &lt; len(word) - 1 and (word[i], word[i + 1]) == pair:
+            out.append(new_id); i += 2
+        else:
+            out.append(word[i]); i += 1
+    return tuple(out)
+
+class ByteBPE:
+    def __init__(self):
+        self.merges = {}                   # (a, b) -&gt; new id; insertion order = rank
+        self.vocab = {i: bytes([i]) for i in range(256)}
+
+    def train(self, text, vocab_size):
+        # 1. pre-tokenise and count unique chunks (words) as byte tuples
+        words = collections.Counter(
+            tuple(m.encode("utf-8")) for m in GPT2_PAT.findall(text))
+        # 2. global pair counts, plus an index pair -&gt; words containing it
+        pairs = collections.Counter()
+        where = collections.defaultdict(set)
+        for w, c in words.items():
+            for p in get_pairs(w):
+                pairs[p] += c; where[p].add(w)
+        for new_id in range(256, vocab_size):
+            if not pairs:
+                break
+            best = max(pairs, key=lambda p: (pairs[p], -p[0], -p[1]))
+            self.merges[best] = new_id
+            self.vocab[new_id] = self.vocab[best[0]] + self.vocab[best[1]]
+            # 3. incremental update: only words containing `best` change
+            for w in list(where.pop(best, ())):
+                if w not in words:
+                    continue
+                c = words.pop(w)
+                for p in get_pairs(w):
+                    pairs[p] -= c; where[p].discard(w)
+                    if pairs[p] &lt;= 0: del pairs[p]
+                nw = merge_word(w, best, new_id)
+                words[nw] = words.get(nw, 0) + c
+                for p in get_pairs(nw):
+                    pairs[p] += c; where[p].add(nw)
+        return self
+
+    def _encode_chunk(self, ids):
+        while len(ids) &gt;= 2:
+            # apply the lowest-rank (earliest-learned) merge present
+            pair = min(get_pairs(ids), key=lambda p: self.merges.get(p, float("inf")))
+            if pair not in self.merges:
+                break
+            ids = merge_word(ids, pair, self.merges[pair])
+        return list(ids)
+
+    def encode(self, text):
+        out = []
+        for chunk in GPT2_PAT.findall(text):
+            out.extend(self._encode_chunk(tuple(chunk.encode("utf-8"))))
+        return out
+
+    def decode(self, ids):
+        return b"".join(self.vocab[i] for i in ids).decode("utf-8", errors="replace")
+CORPUS = "/Users/ayushagrawal/Work/LLM Learning/ai-engineering-book/MASTER_PLAN.md"   # any text file</code></pre>
+</figure>
+
+<figure class="listing">
+<figcaption>Train 768 merges on the curriculum file, inspect merges, and run a round-trip property test.</figcaption>
+<pre><code>import time, random
+from bpe import ByteBPE, GPT2_PAT, CORPUS
+text = open(CORPUS).read()
+print(f"corpus: {len(text):,} chars, {len(text.encode()):,} bytes")
+print("pre-tokens:", GPT2_PAT.findall("Hello world, it's 2024!  x=1"))
+t0 = time.perf_counter()
+tok = ByteBPE().train(text, vocab_size=1024)
+print(f"trained 768 merges in {time.perf_counter()-t0:.2f}s")
+for pair, nid in list(tok.merges.items())[:6]:
+    print(nid, repr(tok.vocab[nid]))
+print("last merge:", repr(tok.vocab[1023]))
+s = "Tokenisation shapes cost. naïve café 東京 🙂"
+ids = tok.encode(s)
+print(len(s.encode()), "bytes -&gt;", len(ids), "tokens")
+print([tok.vocab[i] for i in ids][:12])
+# round-trip property test on random unicode
+random.seed(0)
+pool = "abc XYZ 012 éü 東京 🙂\n\t  ;{}"
+for _ in range(2000):
+    x = "".join(random.choice(pool) for _ in range(random.randint(0, 40)))
+    assert tok.decode(tok.encode(x)) == x, x
+print("round-trip: 2000 random strings OK")
+print(f"bytes/token on corpus: {len(text.encode())/len(tok.encode(text)):.2f}")</code></pre>
+</figure>
+<pre class="output">corpus: 94,419 chars, 94,642 bytes
+pre-tokens: ['Hello', ' world', ',', ' it', "'s", ' 2024', '!', ' ', ' x', '=', '1']
+trained 768 merges in 0.47s
+256 b'  '
+257 b'in'
+258 b' a'
+259 b'on'
+260 b'er'
+261 b'ti'
+last merge: b'train'
+50 bytes -&gt; 31 tokens
+[b'T', b'o', b'ken', b'isation', b' sh', b'ap', b'es', b' cost', b'.', b' n', b'a', b'\xc3']
+round-trip: 2000 random strings OK
+bytes/token on corpus: 2.51</pre>
+
+<p class="facet">What the output shows</p>
+<ul>
+  <li>The regex keeps the space with the following word (<code>' world'</code>, <code>' 2024'</code>) and isolates the double space so the second space attaches to <code>x</code>.</li>
+  <li>The first merge is two spaces, because the Markdown corpus is full of indentation. The corpus decides the vocabulary; our tiny English corpus gives no merges at all for <code>東京</code> or <code>🙂</code>, which stay as raw bytes.</li>
+  <li><code>b'\xc3'</code> is half of the UTF-8 encoding of <code>ï</code>. A single token need not be valid UTF-8; only the concatenated sequence must be.</li>
+  <li>The round-trip test is the single most important tokeniser test. Byte-level BPE with no normaliser passes it by construction; keep it as a property test anyway, because a later "cleanup" step (strip, normalise, lower-case) is how it breaks.</li>
+</ul>
+
+<h4>Encoding: merge-rank application</h4>
+<ul>
+  <li>For each chunk, repeatedly find the adjacent pair with the lowest rank and merge it, until no pair is in the merge table.</li>
+  <li>This is <span class="math">O(n^2)</span> per chunk in our version. Chunks are short (a word), so it is acceptable; tiktoken uses the same algorithm in Rust with a linear scan over a small array.</li>
+  <li>Encoding is <em>not</em> "longest match from the vocabulary". Two tokenisers with the same vocabulary but different merge orders produce different IDs.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Correctness trap</span>
+  <p>Applying merges in <em>frequency</em> order on the new text, rather than rank order, looks
+  plausible and gives mostly-similar output. It is wrong, and the mismatch appears only on rare strings,
+  which is exactly where models are fragile. Always test token-for-token parity against a reference.</p>
+</aside>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">Byte-level BPE strengths</p>
+    <ul>
+      <li>Open vocabulary: no <code>[UNK]</code>, ever.</li>
+      <li>Exactly reversible when no normaliser is used.</li>
+      <li>Simple, fast, deterministic encoding.</li>
+    </ul></div>
+  <div class="cons"><p class="facet">Weaknesses</p>
+    <ul>
+      <li>Greedy merges are corpus-frequency artefacts, not morphology.</li>
+      <li>Non-Latin scripts start at 2–3 bytes per character and get fewer merges.</li>
+      <li>Deterministic segmentation: no built-in regularisation.</li>
+    </ul></div>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="wordpiece-unigram">WordPiece and Unigram</h2>
+<p class="chapter-lede">BPE is one of three subword families in production. WordPiece (BERT) and the
+Unigram language model (T5, ALBERT, XLNet, many multilingual models via SentencePiece) differ in how
+they choose the vocabulary and, more importantly for engineers, in how they segment at inference.</p>
+
+<h3>WordPiece</h3>
+
+<h4>Training: likelihood-based merges</h4>
+<p>WordPiece merges bottom-up like BPE, but scores a candidate pair by how much it increases corpus
+likelihood under a unigram model rather than by raw frequency:</p>
+<div class="math">\text{score}(a, b) = \frac{f(ab)}{f(a)\, f(b)}</div>
+<ul>
+  <li>The score favours pairs whose parts rarely occur apart. <code>"##ing"</code> pairs with many stems, so its individual score is lower than a pair such as <code>"q" "##u"</code>.</li>
+  <li>Word-internal pieces carry a <code>##</code> prefix. A word-initial piece and a continuation piece with the same characters are different tokens.</li>
+  <li>Google's original training code was never released <span class="evidence documented">Documented</span> (Wu et al. 2016 describe it only at a high level); the HF implementation is a reconstruction.</li>
+</ul>
+
+<h4>Encoding: greedy longest-match-first</h4>
+<ul>
+  <li>WordPiece does not store merges. At inference it scans left to right, taking the longest vocabulary entry that matches, then continues with <code>##</code>-prefixed pieces.</li>
+  <li>If any position cannot be matched, the <em>whole word</em> becomes <code>[UNK]</code>. BERT's vocabulary is character-based, not byte-based, so an unseen character (a rare emoji, say) triggers this.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>WordPiece greedy longest-match encoding, checked against the HF tokenizer of a BERT-family model.</figcaption>
+<pre><code># ---------- WordPiece: greedy longest-match-first ----------
+def wordpiece(word, vocab, unk="[UNK]", max_chars=100):
+    if len(word) &gt; max_chars:
+        return [unk]
+    out, start = [], 0
+    while start &lt; len(word):
+        end, cur = len(word), None
+        while start &lt; end:
+            piece = word[start:end] if start == 0 else "##" + word[start:end]
+            if piece in vocab:
+                cur = piece; break
+            end -= 1
+        if cur is None:
+            return [unk]                    # whole word becomes UNK
+        out.append(cur); start = end
+    return out
+
+hf = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+vocab = hf.get_vocab()
+print("bert vocab:", len(vocab))
+for w in ["tokenisation", "unaffable", "transformers", "gpt4o", "xqzv"]:
+    ours = wordpiece(w, vocab)
+    print(f"{w:14s} {ours}  match_hf={ours == hf.tokenize(w)}")</code></pre>
+</figure>
+<pre class="output">bert vocab: 30522
+tokenisation   ['token', '##isation']  match_hf=True
+unaffable      ['una', '##ffa', '##ble']  match_hf=True
+transformers   ['transformers']  match_hf=True
+gpt4o          ['gp', '##t', '##4', '##o']  match_hf=True
+xqzv           ['x', '##q', '##z', '##v']  match_hf=True</pre>
+
+<ul>
+  <li>Our 20-line encoder matches the Rust implementation on every probe, including splits into single characters.</li>
+  <li><code>unaffable</code> becomes <code>una ##ffa ##ble</code>: greedy longest match is not morphology. A likelihood-optimal segmenter might choose <code>un ##aff ##able</code>.</li>
+</ul>
+
+<h3>Unigram Language Model</h3>
+
+<div class="frame problem">
+  <p>BPE and WordPiece produce one deterministic segmentation chosen by a greedy procedure. We would like
+  (a) the <em>most probable</em> segmentation under an explicit model, and (b) the ability to sample
+  alternative segmentations during training so the model becomes robust to segmentation noise.</p>
+</div>
+
+<h4>The model</h4>
+<p>Unigram assumes each piece is drawn independently from a distribution <span class="math">p</span>
+over a vocabulary <span class="math">\mathcal{V}</span>. For a segmentation
+<span class="math">\mathbf{s} = (s_1, \dots, s_m)</span> of text <span class="math">x</span>:</p>
+<div class="math">P(\mathbf{s}) = \prod_{i=1}^{m} p(s_i), \qquad
+P(x) = \sum_{\mathbf{s} \in S(x)} P(\mathbf{s}), \qquad
+\mathbf{s}^{*} = \arg\max_{\mathbf{s} \in S(x)} \sum_i \log p(s_i)</div>
+<ul>
+  <li><span class="math">S(x)</span> is exponential in length, but both the sum and the max decompose over a lattice of positions, so dynamic programming solves them in <span class="math">O(n \cdot \ell_{\max})</span>.</li>
+  <li><strong>Viterbi</strong> computes <span class="math">\mathbf{s}^*</span>. <strong>Forward–backward</strong> computes the expected count of each piece, which is the E-step of EM.</li>
+</ul>
+
+<h4>Training: EM with pruning (top-down)</h4>
+<ol>
+  <li>Start from a large seed vocabulary (all frequent substrings, or a suffix-array extraction).</li>
+  <li>E-step: expected piece counts under the current <span class="math">p</span>, via forward–backward.</li>
+  <li>M-step: <span class="math">p(s) \propto \mathbb{E}[\text{count}(s)]</span>.</li>
+  <li>Prune: remove the pieces whose removal least reduces likelihood (Kudo uses the top 80% by loss). Always keep single characters so everything stays segmentable.</li>
+  <li>Repeat until the target size is reached.</li>
+</ol>
+<p>Unlike BPE, which grows the vocabulary bottom-up, Unigram shrinks it top-down.</p>
+
+<figure class="listing">
+<figcaption>Unigram LM: Viterbi segmentation, forward–backward expected counts, and a toy EM loop with pruning.</figcaption>
+<pre><code>import math, collections
+
+def lse(a, b):
+    if a == -math.inf: return b
+    if b == -math.inf: return a
+    m = max(a, b); return m + math.log(math.exp(a - m) + math.exp(b - m))
+from transformers import AutoTokenizer
+# ---------- Unigram: Viterbi segmentation ----------
+def viterbi(text, logp):
+    n = len(text)
+    best = [0.0] + [-math.inf] * n          # best[i] = best log-prob of text[:i]
+    back = [0] * (n + 1)
+    maxlen = max(map(len, logp))
+    for end in range(1, n + 1):
+        for start in range(max(0, end - maxlen), end):
+            piece = text[start:end]
+            if piece in logp and best[start] + logp[piece] &gt; best[end]:
+                best[end] = best[start] + logp[piece]; back[end] = start
+    pieces, i = [], n
+    while i &gt; 0:
+        pieces.append(text[back[i]:i]); i = back[i]
+    return pieces[::-1], best[n]
+# ---------- Unigram: EM on a toy corpus ----------
+def forward_backward(text, logp):
+    """Expected piece counts for one word, summing over all segmentations."""
+    n = len(text); maxlen = max(map(len, logp))
+    alpha = [-math.inf] * (n + 1); alpha[0] = 0.0
+    for e in range(1, n + 1):
+        for s in range(max(0, e - maxlen), e):
+            p = text[s:e]
+            if p in logp:
+                alpha[e] = lse(alpha[e], alpha[s] + logp[p])
+    beta = [-math.inf] * (n + 1); beta[n] = 0.0
+    for s in range(n - 1, -1, -1):
+        for e in range(s + 1, min(n, s + maxlen) + 1):
+            p = text[s:e]
+            if p in logp:
+                beta[s] = lse(beta[s], logp[p] + beta[e])
+    counts = collections.Counter()
+    for s in range(n):
+        for e in range(s + 1, min(n, s + maxlen) + 1):
+            p = text[s:e]
+            if p in logp:
+                counts[p] += math.exp(alpha[s] + logp[p] + beta[e] - alpha[n])
+    return counts, alpha[n]
+
+corpus = collections.Counter({"hug": 10, "pug": 5, "pun": 12, "bun": 4, "hugs": 5})
+chars = {c for w in corpus for c in w}
+subs = {w[i:j] for w in corpus for i in range(len(w)) for j in range(i + 1, len(w) + 1)}
+logp = {p: -math.log(len(subs)) for p in subs}        # uniform start
+for it in range(5):
+    tot, ll = collections.Counter(), 0.0
+    for w, c in corpus.items():
+        cnt, lw = forward_backward(w, logp)
+        for p, v in cnt.items(): tot[p] += c * v
+        ll += c * lw
+    z = sum(tot.values())
+    logp = {p: math.log(max(tot[p], 1e-3) / z) for p in logp}   # floor keeps chars alive
+    # prune: drop the 25% lowest-probability multi-char pieces (keep all chars)
+    multi = sorted((p for p in logp if len(p) &gt; 1), key=logp.get)
+    for p in multi[: len(multi) // 4]:
+        del logp[p]
+    print(f"iter {it}  loglik={ll:8.2f}  vocab={len(logp)}")
+for w in ["hugs", "pugs", "bunhug"]:
+    print(w, viterbi(w, logp))</code></pre>
+</figure>
+<pre class="output">iter 0  loglik= -102.05  vocab=16
+iter 1  loglik=  -61.71  vocab=14
+iter 2  loglik=  -54.78  vocab=13
+iter 3  loglik=  -54.54  vocab=12
+iter 4  loglik=  -54.53  vocab=11
+hugs (['hugs'], -1.9744126435663967)
+pugs (['pug', 's'], -12.089949648094503)
+bunhug (['b', 'u', 'n', 'hug'], -32.75477267953945)</pre>
+
+<ul>
+  <li>Log-likelihood rises monotonically while the vocabulary is pruned from 16 to 11 pieces: EM concentrates mass on useful pieces (<code>hug</code>, <code>pug</code>, <code>hugs</code>) and pruning discards the rest.</li>
+  <li><code>bunhug</code> reuses <code>hug</code> but falls back to characters for <code>bun</code>, which was pruned. Characters are the safety net, the equivalent of BPE's byte base.</li>
+  <li>The toy prune (drop 25% by probability) is cruder than Kudo's loss-based criterion; it is enough to show the mechanics. Production code works in log space throughout (the <code>lse</code> helper) to avoid underflow.</li>
+</ul>
+
+<h4>Subword regularisation</h4>
+<ul>
+  <li>At training time, sample a segmentation <span class="math">\mathbf{s} \sim P(\mathbf{s} \mid x)^{\alpha}</span> instead of taking the Viterbi path (Kudo 2018). The same word appears under several tokenisations, acting as data augmentation.</li>
+  <li>BPE-dropout (Provilkov et al. 2020) is the BPE analogue: randomly skip merges during encoding.</li>
+  <li>Use it for low-resource or noisy-input models (MT, speech transcripts). LLM pretraining at scale rarely uses it; data volume already provides robustness, and deterministic tokens simplify caching.</li>
+</ul>
+
+<h3>SentencePiece</h3>
+<ul>
+  <li>A library (Kudo &amp; Richardson 2018) implementing both BPE and Unigram over <em>raw</em> text, with no language-specific pre-tokeniser.</li>
+  <li>Whitespace is a normal symbol, escaped as <code>▁</code> (U+2581). <code>"Hello world"</code> becomes <code>▁Hello ▁world</code>, so decoding is concatenation plus replacing <code>▁</code> with a space: language-independent and lossless for whitespace.</li>
+  <li><strong>Byte fallback</strong> (used by Llama 1/2, Mistral): characters not in the vocabulary are emitted as <code>&lt;0xE6&gt;</code>-style byte tokens instead of <code>&lt;unk&gt;</code>, giving an open vocabulary with a character-level base.</li>
+  <li>Normalisation (NFKC by default) is part of the model file, so it travels with the tokeniser. That is good for reproducibility and bad for exact round-trip.</li>
+</ul>
+
+<table>
+  <caption>The three subword families compared.</caption>
+  <thead><tr><th></th><th>BPE</th><th>WordPiece</th><th>Unigram</th></tr></thead>
+  <tbody>
+    <tr><td>Vocabulary built</td><td>Bottom-up, merge most frequent pair</td><td>Bottom-up, merge highest likelihood gain</td><td>Top-down, prune lowest loss</td></tr>
+    <tr><td>Stored artefact</td><td>Ordered merge list + vocab</td><td>Vocab only</td><td>Vocab + log-probs</td></tr>
+    <tr><td>Inference</td><td>Apply merges by rank</td><td>Greedy longest match</td><td>Viterbi (or sampling)</td></tr>
+    <tr><td>Unknowns</td><td>None if byte-level</td><td>Whole word → <code>[UNK]</code></td><td>Byte fallback or <code>&lt;unk&gt;</code></td></tr>
+    <tr><td>Typical users</td><td>GPT-2/3/4, Llama 3, Qwen, SmolLM</td><td>BERT, DistilBERT, MiniLM</td><td>T5, mT5, ALBERT, XLNet, Gemma (SentencePiece)</td></tr>
+  </tbody>
+</table>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="special-tokens">Special Tokens, Chat Templates and Vocabulary Design</h2>
+<p class="chapter-lede">A tokeniser is not just a segmenter. It also defines control symbols that no
+user text can produce, and a template that maps a conversation to a token sequence. Those two
+artefacts are the interface between the training pipeline and every serving stack that will ever run
+the model.</p>
+
+<h3>Special Tokens</h3>
+<table>
+  <caption>Common special tokens and their jobs.</caption>
+  <thead><tr><th>Token</th><th>Purpose</th><th>Engineering note</th></tr></thead>
+  <tbody>
+    <tr><td>BOS</td><td>Start of sequence; attention sink for the first position</td><td>Some models (Llama) degrade badly without it; others (GPT-2) never used it. Check the template, do not guess.</td></tr>
+    <tr><td>EOS / end-of-text</td><td>Document separator in pretraining; stop signal in generation</td><td>If the chat model's end-of-turn token differs from EOS, the server must stop on both.</td></tr>
+    <tr><td>PAD</td><td>Fill batches to equal length</td><td>Must be masked in attention and in the loss. Reusing EOS as PAD and masking all EOS labels teaches the model never to stop.</td></tr>
+    <tr><td>UNK</td><td>Unknown symbol</td><td>Byte-level tokenisers have none (SmolLM2 maps it to end-of-text); WordPiece relies on it.</td></tr>
+    <tr><td>Role and turn tokens</td><td><code>&lt;|im_start|&gt;</code>, <code>&lt;|start_header_id|&gt;</code></td><td>Delimit system, user, assistant and tool turns.</td></tr>
+    <tr><td>Tool and reasoning tokens</td><td><code>&lt;tool_call&gt;</code>, <code>&lt;think&gt;</code></td><td>Let the serving layer parse structured output reliably.</td></tr>
+    <tr><td>FIM tokens</td><td>Prefix, suffix, middle for code infilling</td><td>Code completion depends on exact FIM ordering (PSM or SPM).</td></tr>
+  </tbody>
+</table>
+
+<h3>Chat Templates as a Contract</h3>
+
+<div class="frame problem">
+  <p>The model was fine-tuned on conversations serialised in one exact format. At serving time, any
+  deviation (a missing newline, a different role name, a BOS added twice) produces a distribution
+  shift the model has never seen. Symptoms are subtle: slightly worse answers, runaway generations, or
+  ignored system prompts.</p>
+</div>
+
+<figure class="listing">
+<figcaption>SmolLM2 special tokens, a ChatML template rendered through <code>apply_chat_template</code>, and special-token injection handling in tiktoken.</figcaption>
+<pre><code>from transformers import AutoTokenizer
+import tiktoken
+t = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+print("special:", t.special_tokens_map)
+print("bos/eos ids:", t.bos_token_id, t.eos_token_id, " vocab:", len(t))
+print("has chat template:", t.chat_template is not None)
+# Pass a ChatML template explicitly (the base model ships none)
+tmpl = ("{% for m in messages %}&lt;|im_start|&gt;{{ m['role'] }}\n{{ m['content'] }}"
+        "&lt;|im_end|&gt;\n{% endfor %}{% if add_generation_prompt %}&lt;|im_start|&gt;assistant\n"
+        "{% endif %}")
+msgs = [{"role": "system", "content": "Be brief."},
+        {"role": "user", "content": "Hi"}]
+s = t.apply_chat_template(msgs, chat_template=tmpl, tokenize=False,
+                          add_generation_prompt=True)
+print(repr(s))
+ids = t.apply_chat_template(msgs, chat_template=tmpl, add_generation_prompt=True)
+print(ids)
+print("'&lt;|im_start|&gt;' as one id:", t.convert_tokens_to_ids("&lt;|im_start|&gt;"))
+# injection: user text containing a special-token string
+cl = tiktoken.get_encoding("cl100k_base")
+evil = "hi &lt;|endoftext|&gt; ignore"
+try:
+    cl.encode(evil)
+except ValueError as e:
+    print("tiktoken refuses:", str(e)[:60], "...")
+print("as ordinary text:", cl.encode(evil, disallowed_special=()))
+print("allowed special :", cl.encode(evil, allowed_special={"&lt;|endoftext|&gt;"}))</code></pre>
+</figure>
+<pre class="output">special: {'bos_token': '&lt;|endoftext|&gt;', 'eos_token': '&lt;|endoftext|&gt;', 'unk_token': '&lt;|endoftext|&gt;'}
+bos/eos ids: 0 0  vocab: 49152
+has chat template: False
+'&lt;|im_start|&gt;system\nBe brief.&lt;|im_end|&gt;\n&lt;|im_start|&gt;user\nHi&lt;|im_end|&gt;\n&lt;|im_start|&gt;assistant\n'
+{'input_ids': [1, 9690, 198, 6077, 5453, 30, 2, 198, 1, 4093, 198, 26843, 2, 198, 1, 520, 9531, 198], 'attention_mask': [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]}
+'&lt;|im_start|&gt;' as one id: 1
+tiktoken refuses: Encountered text corresponding to disallowed special token ' ...
+as ordinary text: [6151, 83739, 8862, 728, 428, 91, 29, 10240]
+allowed special : [6151, 220, 100257, 10240]</pre>
+
+<p class="facet">What the output shows</p>
+<ul>
+  <li>The <em>base</em> SmolLM2 checkpoint ships no chat template, yet IDs 1 and 2 are already <code>&lt;|im_start|&gt;</code> and <code>&lt;|im_end|&gt;</code>: the vocabulary was designed for the instruct variant. Serving a base model with a guessed template is a common source of "the model is bad" reports.</li>
+  <li>The rendered prompt ends with <code>&lt;|im_start|&gt;assistant\n</code>. <code>add_generation_prompt=True</code> is required at inference and must be <em>false</em> when rendering training targets.</li>
+  <li>tiktoken refuses to encode a special-token string found in ordinary text unless told what to do. Encoding user text with <code>allowed_special</code> produces the real control token 100257, which lets a user forge a turn boundary.</li>
+</ul>
+
+<aside class="callout security"><span class="title">Special-token injection</span>
+  <ul>
+    <li>Rule: user-supplied and retrieved text must be encoded with special tokens disabled (treated as ordinary text). Only the template renderer may emit control IDs.</li>
+    <li>HF tokenisers parse special-token strings in text by default. Build prompts as ID lists (template IDs + <code>encode(user_text, split_special_tokens=True)</code>) or escape the strings before rendering.</li>
+    <li>Add a test: a user message containing every special-token string must not produce any special ID.</li>
+  </ul>
+</aside>
+
+<div class="frame checklist">
+  <p class="facet">Chat template checklist</p>
+  <ul>
+    <li>Version the template with the tokeniser and the weights as one artefact; hash all three.</li>
+    <li>Golden test: render a fixed conversation and compare IDs byte-for-byte across training code, the inference server and any client SDK.</li>
+    <li>Check BOS handling: template adds it, and <code>encode</code> must then be called with <code>add_special_tokens=False</code>, or BOS appears twice.</li>
+    <li>Configure stop tokens: EOS and the end-of-turn token.</li>
+    <li>Train only on assistant tokens (mask system and user tokens in the loss) unless you intend otherwise.</li>
+  </ul>
+</div>
+
+<h3>Vocabulary Size Trade-offs</h3>
+<p>Let <span class="math">V</span> be vocabulary size and <span class="math">d</span> model width.</p>
+<div class="math">\text{params}_{\text{emb}} = V d \;(\times 2 \text{ if untied}), \qquad
+\text{FLOPs}_{\text{head}} = 2 V d \text{ per token}, \qquad
+\text{logits memory} = B \cdot T \cdot V \cdot \text{bytes}</div>
+
+<table>
+  <caption>Embedding cost at d = 4096 (bf16), with compression measured on the English sample in Chapter 9.</caption>
+  <thead><tr><th>Tokeniser</th><th class="num">V</th><th class="num">V·d params</th><th class="num">bf16 size</th><th class="num">English bytes/token</th><th class="num">Hindi bytes/token</th></tr></thead>
+  <tbody>
+    <tr><td>gpt2</td><td class="num">50,257</td><td class="num">206M</td><td class="num">0.41 GB</td><td class="num">4.39</td><td class="num">1.68</td></tr>
+    <tr><td>cl100k_base</td><td class="num">100,277</td><td class="num">411M</td><td class="num">0.82 GB</td><td class="num">4.39</td><td class="num">2.33</td></tr>
+    <tr><td>o200k_base</td><td class="num">200,019</td><td class="num">819M</td><td class="num">1.64 GB</td><td class="num">4.39</td><td class="num">8.40</td></tr>
+  </tbody>
+</table>
+
+<ul>
+  <li><strong>English is saturated</strong>: quadrupling <span class="math">V</span> bought nothing on this sentence. The extra vocabulary pays off in code, other scripts and numerals.</li>
+  <li><strong>Small models pay disproportionately</strong>: SmolLM2-135M spends 28.3M of 134.5M parameters (21%) on its 49k tied embedding (Chapter 7). A 200k vocabulary at <span class="math">d = 576</span> would be 115M parameters, most of the model.</li>
+  <li><strong>Logit memory</strong>: at <span class="math">B = 8, T = 8192, V = 200\text{k}</span>, fp32 logits are 52 GB. Chunked or fused cross-entropy is mandatory at large <span class="math">V</span>.</li>
+  <li><strong>Rare-token under-training</strong>: each token's embedding is updated only when it appears. Larger vocabularies have more tokens seen a handful of times, which become glitch tokens (Chapter 6).</li>
+  <li><strong>Rule of thumb</strong> <span class="evidence inferred">Inferred</span>: 32k–64k for English-centric small models; 128k–256k for multilingual or code-heavy frontier models, where embedding cost is a small fraction.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="production">Production Tokenisers</h2>
+<p class="chapter-lede">Our BPE is correct but slow and featureless. Production libraries add speed
+(Rust, parallelism, caching), offsets for aligning tokens back to characters, configurable normalisers
+and pre-tokenisers, and serialised artefacts. This chapter proves our encoder matches
+<code>tiktoken</code> token-for-token and measures what the libraries buy.</p>
+
+<h3>Simple Version → Production Version</h3>
+<div class="frame simple">
+  <p class="facet">Simple Version</p>
+  <p>Our <code>ByteBPE</code>: regex split, per-chunk merge loop in Python, bytes vocabulary.</p>
+</div>
+<div class="frame production">
+  <p class="facet">Production Version</p>
+  <ul>
+    <li><strong>tiktoken</strong> (OpenAI): encode-only BPE in Rust with a Python wrapper; ships merge ranks for <code>gpt2</code>, <code>cl100k_base</code>, <code>o200k_base</code>. No training.</li>
+    <li><strong>HF tokenizers</strong>: a pipeline of Normalizer → PreTokenizer → Model (BPE, WordPiece, Unigram, WordLevel) → PostProcessor (adds special tokens) → Decoder. Trains and encodes in Rust, returns offsets, serialises to one <code>tokenizer.json</code>.</li>
+    <li><strong>SentencePiece</strong>: C++ trainer and encoder for BPE and Unigram, normaliser rules baked into a <code>.model</code> protobuf.</li>
+  </ul>
+</div>
+<div class="frame why-complex">
+  <p class="facet">Why It Is Complicated</p>
+  <ul>
+    <li>Throughput matters: tokenising a pretraining corpus of 10<sup>13</sup> bytes at 10 MB/s per core takes ~30 core-years.</li>
+    <li>Offsets must survive normalisation (which changes string lengths) for NER, highlighting and citations.</li>
+    <li>Serialised formats must be exactly reproducible across library versions; a changed default regex is a silent model-breaking change.</li>
+  </ul>
+</div>
+
+<h3>Parity Test Against tiktoken</h3>
+<p>Our encoder only needs a rank table. tiktoken exposes GPT-2's (<code>_mergeable_ranks</code>, a
+private attribute), so we reuse our regex and merge loop with GPT-2's ranks and compare IDs.</p>
+
+<figure class="listing">
+<figcaption>Rank-based BPE encoding with GPT-2's merge table, compared token-for-token with tiktoken.</figcaption>
+<pre><code>import time, tiktoken
+from bpe import GPT2_PAT, CORPUS
+
+enc = tiktoken.get_encoding("gpt2")
+ranks = enc._mergeable_ranks                # bytes -&gt; rank (= token id for gpt2)
+print("gpt2 vocab:", enc.n_vocab)
+
+def encode_chunk_ranks(chunk: bytes):
+    parts = [bytes([b]) for b in chunk]
+    while len(parts) &gt;= 2:
+        cands = [(ranks.get(parts[i] + parts[i + 1], 1 &lt;&lt; 60), i)
+                 for i in range(len(parts) - 1)]
+        r, i = min(cands)
+        if r == 1 &lt;&lt; 60:
+            break
+        parts[i:i + 2] = [parts[i] + parts[i + 1]]
+    return [ranks[p] for p in parts]
+
+def our_encode(text):
+    return [t for c in GPT2_PAT.findall(text) for t in encode_chunk_ranks(c.encode())]
+
+text = open(CORPUS).read()
+extra = "naïve café 東京 🙂 def f(x):\n    return x**2  # ok\n\n\n"
+for name, s in [("plan", text), ("mixed", extra * 50)]:
+    t0 = time.perf_counter(); a = our_encode(s); t1 = time.perf_counter()
+    b = enc.encode_ordinary(s); t2 = time.perf_counter()
+    print(f"{name:5s} tokens ours={len(a):6d} tiktoken={len(b):6d} "
+          f"equal={a == b}  ours {1e3*(t1-t0):7.1f} ms  tiktoken {1e3*(t2-t1):5.1f} ms")</code></pre>
+</figure>
+<pre class="output">gpt2 vocab: 50257
+plan  tokens ours= 27284 tiktoken= 27284 equal=True  ours    71.2 ms  tiktoken   8.9 ms
+mixed tokens ours=  1350 tiktoken=  1350 equal=True  ours     1.7 ms  tiktoken   0.5 ms</pre>
+
+<ul>
+  <li>27,284 identical IDs on the curriculum and on a mixed Unicode/code sample: the regex and rank-ordered merge loop are the entire algorithm.</li>
+  <li>tiktoken is ~8× faster single-threaded here, and it can batch across threads (<code>encode_ordinary_batch</code>).</li>
+  <li>The parity test is the template for Forge: whenever you change the tokeniser implementation, diff IDs on a fixed corpus that includes emoji, CJK, code, long digit runs and odd whitespace.</li>
+</ul>
+
+<h3>Hugging Face tokenizers</h3>
+<figure class="listing">
+<figcaption>Train a byte-level BPE with HF tokenizers on the same corpus; compare training speed, offsets and encoding speed with ours.</figcaption>
+<pre><code>import time
+from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
+from bpe import ByteBPE, CORPUS
+text = open(CORPUS).read()
+t = Tokenizer(models.BPE())
+t.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+t.decoder = decoders.ByteLevel()
+tr = trainers.BpeTrainer(vocab_size=1024, special_tokens=["&lt;|endoftext|&gt;"],
+                         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+                         show_progress=False)
+t0 = time.perf_counter(); t.train_from_iterator([text], tr); t1 = time.perf_counter()
+ours = ByteBPE(); ours.train(text, 1024); t2 = time.perf_counter()
+print(f"train: hf {1e3*(t1-t0):.0f} ms   ours {1e3*(t2-t1):.0f} ms")
+e = t.encode("Tokenisation shapes cost.")
+print(e.tokens)
+print(e.offsets)
+big = text * 5
+t0 = time.perf_counter(); n1 = len(t.encode(big).ids); t1 = time.perf_counter()
+n2 = len(ours.encode(big)); t2 = time.perf_counter()
+print(f"encode {len(big)/1e6:.2f} MB: hf {n1} tok {1e3*(t1-t0):.0f} ms | "
+      f"ours {n2} tok {1e3*(t2-t1):.0f} ms")
+print("hf round-trip:", t.decode(t.encode(big).ids) == big)</code></pre>
+</figure>
+<pre class="output">train: hf 61 ms   ours 495 ms
+['T', 'o', 'ken', 'isation', 'Ġsh', 'ap', 'es', 'Ġcost', '.']
+[(0, 1), (1, 2), (2, 5), (5, 12), (12, 15), (15, 17), (17, 19), (19, 24), (24, 25)]
+encode 0.47 MB: hf 188430 tok 208 ms | ours 188370 tok 502 ms
+hf round-trip: True</pre>
+
+<ul>
+  <li>Same corpus, same vocabulary size, same segmentation of the probe sentence: two independent implementations agree on the algorithm.</li>
+  <li>Token counts differ by 60 in 188k (0.03%). The HF <code>ByteLevel</code> pre-tokeniser uses the same GPT-2 regex; the gap most likely comes from tie-breaking between equal-count pairs, so a few late merges differ <span class="evidence inferred">Inferred</span>. Parity across implementations requires fixing tie-break rules, not just the algorithm.</li>
+  <li><code>offsets</code> map each token to a character span in the original string. Our implementation has none; adding them later is painful, so production code should carry them from the start.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">What to ship as the tokeniser artefact</span>
+  <ul>
+    <li><code>tokenizer.json</code> (or merges + vocab + regex), the chat template, the special-token map, and a version and content hash.</li>
+    <li>A golden file: 1,000 strings and their expected IDs. CI fails on any difference.</li>
+    <li>Pin library versions in the serving image; tokeniser libraries have changed defaults between minor releases.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="failures">Tokenisation Failure Modes</h2>
+<p class="chapter-lede">Many "the model cannot do X" reports are really "the tokeniser hides X". A model
+that sees <code>'123' '45'</code> cannot align digits by place value; a model that has never updated a
+token's embedding produces nonsense when it sees it; and a filter that looks at tokens can be walked
+around with characters the user cannot even see.</p>
+
+<figure class="listing">
+<figcaption>Probe digits, code whitespace, glitch tokens, boundary artefacts, homoglyphs and invisible characters with GPT-2 and cl100k.</figcaption>
+<pre><code>import tiktoken, unicodedata
+g2 = tiktoken.get_encoding("gpt2"); cl = tiktoken.get_encoding("cl100k_base")
+o2 = tiktoken.get_encoding("o200k_base")
+show = lambda e, s: [e.decode([t]) for t in e.encode_ordinary(s)]
+print("== digits ==")
+for s in ["1234567", "12345 + 67890 = 80235", "3.14159"]:
+    print(f"gpt2  {s!r:26} {show(g2, s)}")
+    print(f"cl100k{s!r:26} {show(cl, s)}")
+print("== code whitespace ==")
+code = "if x:\n        return y"
+for n, e in [("gpt2", g2), ("cl100k", cl)]:
+    print(n, len(e.encode_ordinary(code)), show(e, code))
+print("== glitch token ==")
+for s in [" SolidGoldMagikarp", " davidjl", " petertodd"]:
+    print(f"{s!r:22} gpt2={g2.encode_ordinary(s)}  cl100k={len(cl.encode_ordinary(s))} tokens")
+print("== boundary artefact ==")
+for s in ["https://", "https:/", "Hello", "Hello "]:
+    print(f"{s!r:12} {show(cl, s)}")
+print("== homoglyphs and invisible characters ==")
+for s in ["password", "pаssword", "pass\u200bword", "ｐａｓｓｗｏｒｄ"]:
+    nfkc = unicodedata.normalize("NFKC", s)
+    print(f"{s!r:22} cl100k_tokens={len(cl.encode_ordinary(s)):2d}  ==ascii:{s == 'password'}  "
+          f"NFKC==ascii:{nfkc == 'password'}")
+print([unicodedata.name(c) for c in "pаss"][:2])</code></pre>
+</figure>
+<pre class="output">== digits ==
+gpt2  '1234567'                  ['123', '45', '67']
+cl100k'1234567'                  ['123', '456', '7']
+gpt2  '12345 + 67890 = 80235'    ['123', '45', ' +', ' 6', '78', '90', ' =', ' 80', '235']
+cl100k'12345 + 67890 = 80235'    ['123', '45', ' +', ' ', '678', '90', ' =', ' ', '802', '35']
+gpt2  '3.14159'                  ['3', '.', '14', '159']
+cl100k'3.14159'                  ['3', '.', '141', '59']
+== code whitespace ==
+gpt2 13 ['if', ' x', ':', '\n', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' return', ' y']
+cl100k 6 ['if', ' x', ':\n', '       ', ' return', ' y']
+== glitch token ==
+' SolidGoldMagikarp'   gpt2=[43453]  cl100k=5 tokens
+' davidjl'             gpt2=[23282]  cl100k=1 tokens
+' petertodd'           gpt2=[37444]  cl100k=3 tokens
+== boundary artefact ==
+'https://'   ['https', '://']
+'https:/'    ['https', ':/']
+'Hello'      ['Hello']
+'Hello '     ['Hello', ' ']
+== homoglyphs and invisible characters ==
+'password'             cl100k_tokens= 1  ==ascii:True  NFKC==ascii:True
+'pаssword'             cl100k_tokens= 4  ==ascii:False  NFKC==ascii:False
+'pass\u200bword'       cl100k_tokens= 3  ==ascii:False  NFKC==ascii:False
+'ｐａｓｓｗｏｒｄ'             cl100k_tokens=16  ==ascii:False  NFKC==ascii:True
+['LATIN SMALL LETTER P', 'CYRILLIC SMALL LETTER A']</pre>
+
+<h3>Arithmetic and Digits</h3>
+<ul>
+  <li>GPT-2 splits <code>1234567</code> as <code>123|45|67</code>, while <code>80235</code> in a sum becomes <code> 80|235</code>. The same digit position lands in different tokens depending on the number, so the model cannot learn a consistent column-wise algorithm.</li>
+  <li>cl100k caps digit runs at three (<code>\p{N}{1,3}</code>) and splits left to right: <code>123|456|7</code>. Consistent, but left-aligned, whereas place value is right-aligned.</li>
+  <li>Llama 1/2, SmolLM and DeepSeek split every digit individually; Singh &amp; Strouse (2024) find right-to-left three-digit grouping helps arithmetic. <span class="evidence documented">Documented</span></li>
+  <li>Mitigation: choose the digit rule when designing the tokeniser. After training it cannot be changed without retraining the model.</li>
+</ul>
+
+<h3>Whitespace in Code</h3>
+<ul>
+  <li>GPT-2 has no multi-space tokens, so an 8-space indent costs 7 tokens. cl100k added whitespace runs: the same snippet drops from 13 to 6 tokens.</li>
+  <li>Python code in GPT-2 costs about 2 bytes per token versus 2.85 in cl100k (Chapter 9): 40% more tokens for the same file.</li>
+  <li>Tabs versus spaces, trailing whitespace, and CRLF all change token counts and sometimes model behaviour. Normalise code whitespace at the edge only if you can restore it exactly.</li>
+</ul>
+
+<h3>Multilingual Token Tax</h3>
+<ul>
+  <li>The same sentence costs 18 tokens in English and 100 in Hindi with GPT-2 (5.6×), and 20 with o200k (1.1×). Petrov et al. (2023) measured premiums above 10× for some languages. <span class="evidence documented">Documented</span></li>
+  <li>The tax compounds: higher API cost, less effective context, slower generation, and fewer training tokens per unit of meaning.</li>
+</ul>
+
+<h3>Glitch and Under-trained Tokens</h3>
+<ul>
+  <li><code> SolidGoldMagikarp</code> is a single GPT-2 token (43453), created because a Reddit username was frequent in the tokeniser's training data but nearly absent from the model's. Its embedding stayed near initialisation; GPT-3 behaved erratically when asked to repeat it.</li>
+  <li>cl100k splits it into 5 tokens, fixing that case, but every vocabulary has its own. Land &amp; Bartolo (2024) detect them by looking for embeddings close to the mean of known-unused tokens and by output-probability probes. <span class="evidence documented">Documented</span></li>
+  <li>Root cause: the tokeniser corpus and the model corpus differ. Mitigation: train the tokeniser on a sample of the pretraining mix, then audit tokens with low training frequency.</li>
+</ul>
+
+<h3>Token Boundary Artefacts</h3>
+<ul>
+  <li><code>https://</code> is <code>https|://</code>, but a prompt ending in <code>https:/</code> gives <code>https|:/</code>. The model rarely saw <code>:/</code> followed by <code>/</code>, so continuing the prompt is out of distribution.</li>
+  <li>A prompt ending in a trailing space leaves a lone <code>' '</code> token, while in training the space was attached to the next word. Completions after a trailing space are measurably worse.</li>
+  <li>Fix: <strong>token healing</strong>: back up the last token(s) and constrain generation to continuations whose bytes start with the removed text (as in Guidance).</li>
+</ul>
+
+<h3>Security</h3>
+
+<aside class="callout security"><span class="title">Tokenisation-based filter evasion</span>
+  <ul>
+    <li>A Cyrillic <code>а</code> in <code>pаssword</code> is visually identical and tokenises into 4 pieces instead of 1. Keyword, embedding and classifier filters that saw <code>password</code> in training may not fire; the LLM behind the filter often still understands the word.</li>
+    <li>A zero-width space (U+200B) splits the word into <code>pass|​|word</code> and is invisible in most UIs. Other invisible code points: U+200C/D, U+2060, U+FEFF, and the Unicode tag block (U+E0000–E007F), which can smuggle whole hidden instructions ("ASCII smuggling").</li>
+    <li>NFKC fixes full-width letters but <em>not</em> homoglyphs or zero-width characters. Normalisation alone is not a defence.</li>
+  </ul>
+</aside>
+
+<div class="frame checklist">
+  <p class="facet">Input hygiene for guardrails</p>
+  <ul>
+    <li>Apply NFKC, then strip or flag format characters (Unicode category <code>Cf</code>) and tag-block characters.</li>
+    <li>Map confusables to a skeleton (Unicode TS #39) before keyword matching, and flag mixed-script words.</li>
+    <li>Run safety classifiers on the normalised text <em>and</em> on the raw text the model will see.</li>
+    <li>Log the raw code points of flagged inputs; screenshots hide the attack.</li>
+  </ul>
+</div>
+
+<ul class="failure-modes">
+  <li><strong>Counting in the wrong unit</strong>: rate limits and context budgets in characters; bills and truncation in tokens.</li>
+  <li><strong>Tokeniser drift</strong>: a client estimates tokens with <code>cl100k</code> while the model uses <code>o200k</code>; budgets are off by up to 4× on non-English text.</li>
+  <li><strong>Spelling and character tasks</strong>: counting letters in <code>strawberry</code> is hard when the model sees <code>str|aw|berry</code>.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="embeddings">Embeddings</h2>
+<p class="chapter-lede">The tokeniser emits IDs; the embedding matrix turns each ID into a vector. That
+matrix is the model's entire knowledge of a token before context is applied, and in most decoders the
+same matrix is reused to produce logits. Its geometry is measurable, and it is not the tidy isotropic
+space that cosine similarity quietly assumes.</p>
+
+<h3>From One-hot to Dense</h3>
+<ul>
+  <li>A one-hot vector <span class="math">e_i \in \{0,1\}^V</span> carries no similarity: every pair of tokens is orthogonal.</li>
+  <li>An embedding matrix <span class="math">E \in \mathbb{R}^{V \times d}</span> maps <span class="math">e_i \mapsto E^\top e_i = E_{i,:}</span>, a lookup. Gradients update only rows that appear in the batch.</li>
+  <li><strong>word2vec</strong> (Mikolov et al. 2013) trains <span class="math">E</span> so that <span class="math">\sigma(u_c^\top v_w)</span> predicts context words (skip-gram with negative sampling), implicitly factorising a shifted PMI matrix (Levy &amp; Goldberg 2014).</li>
+  <li><strong>GloVe</strong> (Pennington et al. 2014) fits <span class="math">w_i^\top \tilde w_j + b_i + \tilde b_j \approx \log X_{ij}</span> directly on co-occurrence counts.</li>
+  <li>In an LLM, embeddings are learned end to end by next-token prediction. The distributional intuition still holds: tokens used in similar contexts get similar rows.</li>
+</ul>
+
+<h3>Weight Tying</h3>
+<p>The LM head computes logits <span class="math">z = W h</span> with <span class="math">W \in \mathbb{R}^{V \times d}</span>.
+Weight tying (Press &amp; Wolf 2017) sets <span class="math">W = E</span>:</p>
+<div class="math">z_i = E_{i,:}^{\top} h \quad\Rightarrow\quad p(i \mid h) \propto \exp\big(\lVert E_i \rVert \lVert h \rVert \cos(E_i, h)\big)</div>
+<ul>
+  <li>Saves <span class="math">V d</span> parameters. Matters for small models; negligible for 70B models, which usually untie (Llama 2/3 untie; Gemma and SmolLM2 tie).</li>
+  <li>Couples input and output semantics: a token's input vector is also its output prototype. Rare tokens get gradient from the softmax denominator on <em>every</em> step (pushed away from all hidden states), which shapes geometry.</li>
+  <li>The token norm <span class="math">\lVert E_i \rVert</span> acts as a per-token prior in the logits.</li>
+</ul>
+
+<h3>Geometry on a Real Model</h3>
+<figure class="listing">
+<figcaption>SmolLM2-135M: confirm weight tying, count embedding parameters, nearest neighbours by cosine, anisotropy and norms.</figcaption>
+<pre><code>import torch, torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModelForCausalLM
+torch.manual_seed(0)
+name = "HuggingFaceTB/SmolLM2-135M"
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).eval()
+E = model.get_input_embeddings().weight.detach()            # (V, d)
+W = model.get_output_embeddings().weight
+print("E shape:", tuple(E.shape), " tied:", E.data_ptr() == W.data_ptr())
+print(f"embedding params: {E.numel()/1e6:.1f}M of "
+      f"{sum(p.numel() for p in model.parameters())/1e6:.1f}M total")
+
+def neighbours(word, k=5):
+    i = tok.encode(word)[0]
+    sims = F.cosine_similarity(E[i:i+1], E)                  # (V,)
+    top = sims.topk(k + 1).indices[1:]
+    return [tok.decode([j]) for j in top]
+for w in [" king", " Paris", " Monday", " dog"]:
+    print(f"{w!r:10} -&gt; {neighbours(w)}")
+
+# anisotropy: mean cosine between random pairs, raw vs mean-centred
+idx = torch.randint(0, E.shape[0], (2000, 2))
+cos = lambda X: F.cosine_similarity(X[idx[:, 0]], X[idx[:, 1]]).mean().item()
+print(f"static E: mean cos={cos(E):.3f}  centred={cos(E - E.mean(0)):.3f}")
+norms = E.norm(dim=1)
+print(f"norms: min={norms.min():.2f} median={norms.median():.2f} max={norms.max():.2f}")
+
+# contextual: hidden states per layer on a few sentences
+text = ["The bank raised interest rates again this quarter.",
+        "We had a picnic on the river bank in the sun.",
+        "Tokenisers decide what the model can even see.",
+        "She deposited the cheque at the bank on Friday."]
+enc = tok(text, return_tensors="pt", padding=False) if False else None
+H = []
+with torch.no_grad():
+    for s in text:
+        out = model(**tok(s, return_tensors="pt"), output_hidden_states=True)
+        H.append([h[0] for h in out.hidden_states])           # L+1 x (T, d)
+L = len(H[0])
+for layer in [0, 1, L // 2, L - 2, L - 1]:
+    X = torch.cat([h[layer][1:] for h in H])                  # skip first position
+    i = torch.triu_indices(len(X), len(X), 1)
+    m = F.cosine_similarity(X[i[0]], X[i[1]]).mean().item()
+    print(f"layer {layer:2d}: mean pairwise cos={m:.3f}")
+# polysemy: ' bank' in finance vs river vs finance
+def vec(si, layer):
+    ids = tok.encode(text[si]); j = ids.index(tok.encode(" bank")[0])
+    return H[si][layer][j]
+for layer in [0, L // 2, L - 1]:
+    a, b, c = vec(0, layer), vec(1, layer), vec(3, layer)
+    print(f"layer {layer:2d}: cos(fin,river)={F.cosine_similarity(a,b,0):.3f} "
+          f"cos(fin,fin)={F.cosine_similarity(a,c,0):.3f}")</code></pre>
+</figure>
+<pre class="output">E shape: (49152, 576)  tied: True
+embedding params: 28.3M of 134.5M total
+' king'    -&gt; [' King', 'King', ' kings', ' queen', ' Queen']
+' Paris'   -&gt; ['Paris', ' London', ' Berlin', ' Montreal', ' France']
+' Monday'  -&gt; [' Tuesday', ' Wednesday', ' Thursday', ' Saturday', ' Friday']
+' dog'     -&gt; [' Dog', ' dogs', 'Dog', 'dog', ' Dogs']
+static E: mean cos=0.449  centred=0.000
+norms: min=1.76 median=3.13 max=7.47</pre>
+
+<p class="facet">What the output shows</p>
+<ul>
+  <li>Input and output matrices share storage: tied. The embedding is 21% of the model's parameters.</li>
+  <li>Neighbours are semantically sensible (<code>' Paris'</code> → capitals, <code>' Monday'</code> → weekdays) but dominated by <strong>surface variants</strong>: <code>' King'</code>, <code>'King'</code>, <code>' kings'</code>. A byte-level vocabulary stores case and leading-space variants as unrelated IDs, and the model spends capacity re-learning that they are the same word.</li>
+  <li><strong>Anisotropy</strong>: two random token rows have mean cosine 0.449, not ~0. Subtracting the mean vector brings it to 0.000: a single shared direction dominates. Cosine similarity without centring mostly measures alignment with that direction.</li>
+  <li>Norms vary 4× (1.76 to 7.47). Under tying, norm is part of the logit, so frequent tokens tend to sit at different norms from rare ones.</li>
+</ul>
+
+<h4>Anisotropy defined</h4>
+<div class="math">\text{aniso}(X) = \mathbb{E}_{i \neq j}\big[\cos(x_i, x_j)\big], \qquad
+\cos(u, v) = \frac{u^\top v}{\lVert u \rVert \lVert v \rVert}</div>
+<ul>
+  <li>Isotropic vectors give ≈0. Ethayarajh (2019) found contextual representations of GPT-2 and BERT occupy a narrow cone, with anisotropy rising in upper layers.</li>
+  <li>Causes include the softmax pushing rare tokens in a common direction, frequency bias, and a few outlier dimensions with very large magnitude.</li>
+  <li>Remedies for retrieval use: mean-centring, whitening (BERT-whitening), or contrastive fine-tuning (SimCSE, sentence-transformers), which is why you should not use raw LLM hidden states as sentence embeddings.</li>
+</ul>
+
+<ul class="failure-modes">
+  <li><strong>Raw cosine thresholds</strong>: a "0.8 means similar" rule tuned on one model is meaningless on another with different anisotropy.</li>
+  <li><strong>Dot product versus cosine</strong>: ranking by dot product on un-normalised vectors favours high-norm (often frequent or generic) items.</li>
+  <li><strong>Under-trained rows</strong>: tokens that never appeared keep near-initial embeddings clustered together; they show up as a tight cluster far from real tokens, which is also how you detect them.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="contextual">Contextual Representations</h2>
+<p class="chapter-lede">A static embedding gives <em>bank</em> one vector whether it is a river bank
+or a savings bank. Every Transformer layer rewrites each position's vector using its context, so the
+hidden state at layer <span class="math">\ell</span> is a contextual representation. This chapter
+measures how that happens on SmolLM2 and how to pool token vectors into one sentence vector.</p>
+
+<h3>From Static to Contextual</h3>
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  A["word2vec / GloVe (2013-14): one vector per word type"] --> B["ELMo (2018): biLSTM layers, weighted sum per task"]
+  B --> C["BERT (2018): bidirectional Transformer, masked LM"]
+  C --> D["GPT-style decoders: causal hidden states"]
+  C --> E["Sentence encoders: contrastive fine-tuning (SBERT, SimCSE)"]
+  D --> F["LLM-based embedders (E5-Mistral, GTE-Qwen)"]
+  E --> F</pre>
+<figcaption>Lineage of representations used in production systems.</figcaption>
+</figure>
+<ul>
+  <li><strong>ELMo</strong> (Peters et al. 2018): concatenated forward and backward LSTM states, combined with learned per-layer weights. Showed that different layers carry different information.</li>
+  <li><strong>BERT</strong>: bidirectional attention, so every token sees both sides. Best for encoding and classification; cannot generate left to right.</li>
+  <li><strong>Decoder hidden states</strong>: causal, so position <span class="math">t</span> only knows <span class="math">x_{\le t}</span>. The last token is the only one that has seen the whole input, which matters for pooling.</li>
+</ul>
+
+<h3>Layer-wise Behaviour on SmolLM2</h3>
+<p>The second half of the Chapter 7 listing runs four sentences through the model and collects all 31
+hidden states (embedding output plus 30 layers).</p>
+<pre class="output">layer  0: mean pairwise cos=0.095
+layer  1: mean pairwise cos=0.262
+layer 15: mean pairwise cos=0.632
+layer 29: mean pairwise cos=0.711
+layer 30: mean pairwise cos=0.403
+layer  0: cos(fin,river)=1.000 cos(fin,fin)=1.000
+layer 15: cos(fin,river)=0.793 cos(fin,fin)=0.910
+layer 30: cos(fin,river)=0.618 cos(fin,fin)=0.734</pre>
+
+<ul>
+  <li><strong>Anisotropy grows with depth</strong>: mean pairwise cosine between token vectors rises from 0.10 at the embedding layer to 0.71 at layer 29, matching Ethayarajh's finding. The final layer drops to 0.40 because the last norm and LM head reshape it for prediction.</li>
+  <li><strong>Contextualisation</strong>: at layer 0, <code>bank</code> is identical in all sentences (cosine 1.000). By the middle layer, two financial uses (0.910) are closer than financial and river (0.793). By the last layer both have drifted, but the gap persists.</li>
+  <li>Absolute cosines stay high even for different senses: use relative comparisons, not thresholds.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Position Is Part of the Representation</span>
+  <ul>
+    <li>RoPE, ALiBi and absolute embeddings (Volume 2) are not tokeniser features. They live in the model and shape every contextual vector.</li>
+    <li>When you pool or probe hidden states, you are measuring a mixture of content and position. For sentence embeddings, contrastive training usually learns to ignore absolute position; for LM probing, position effects are a confound to control for.</li>
+  </ul>
+</aside>
+
+<h3>Probing</h3>
+<ul>
+  <li>A <strong>probe</strong> is a small classifier (usually linear) trained on frozen hidden states to predict a property: part of speech, syntactic depth, sentiment, factual truth.</li>
+  <li>Typical pattern: surface and lexical features peak early, syntax in the middle, task- and prediction-specific features late. Middle layers often give the best general features.</li>
+  <li>Caveat: a high probe accuracy shows information is <em>linearly decodable</em>, not that the model uses it. Compare against control tasks (Hewitt &amp; Liang 2019) and random-weight baselines.</li>
+</ul>
+
+<h3>Pooling Strategies for Sentence Embeddings</h3>
+<div class="math">\text{mean}(H, m) = \frac{\sum_t m_t h_t}{\sum_t m_t}, \qquad
+\text{cls}(H) = h_0, \qquad \text{last}(H, m) = h_{\max\{t : m_t = 1\}}</div>
+
+<figure class="listing">
+<figcaption>Pooling choices on all-MiniLM-L6-v2 (trained with mean pooling): paraphrase versus unrelated similarity.</figcaption>
+<pre><code>import torch, torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModel
+name = "sentence-transformers/all-MiniLM-L6-v2"
+tok = AutoTokenizer.from_pretrained(name); m = AutoModel.from_pretrained(name).eval()
+S = ["How do I reset my password?",
+     "I forgot my login credentials and need to change them.",
+     "What is the capital of France?"]
+b = tok(S, padding=True, return_tensors="pt")
+with torch.no_grad():
+    h = m(**b).last_hidden_state                              # (B, T, d)
+mask = b["attention_mask"].unsqueeze(-1).float()              # (B, T, 1)
+pools = {
+    "cls":  h[:, 0],
+    "mean": (h * mask).sum(1) / mask.sum(1),
+    "max":  h.masked_fill(mask == 0, -1e9).max(1).values,
+    "mean_nomask": h.mean(1),
+}
+for k, v in pools.items():
+    v = F.normalize(v, dim=-1); s = v @ v.T
+    print(f"{k:12s} sim(q,para)={s[0,1]:.3f}  sim(q,unrelated)={s[0,2]:.3f}  "
+          f"gap={s[0,1]-s[0,2]:.3f}")</code></pre>
+</figure>
+<pre class="output">cls          sim(q,para)=0.901  sim(q,unrelated)=0.699  gap=0.203
+mean         sim(q,para)=0.634  sim(q,unrelated)=0.075  gap=0.559
+max          sim(q,para)=0.833  sim(q,unrelated)=0.643  gap=0.190
+mean_nomask  sim(q,para)=0.589  sim(q,unrelated)=0.219  gap=0.371</pre>
+
+<ul>
+  <li>The model was trained with masked mean pooling, and that pooling gives the largest separation (0.559) between a paraphrase and an unrelated question.</li>
+  <li>CLS and max pooling rate the unrelated question at 0.70 and 0.64: high absolute similarity, weak separation. <strong>Pooling is part of the model</strong>; use the one it was trained with.</li>
+  <li>Forgetting the attention mask pulls padding vectors into the mean and cuts the gap from 0.559 to 0.371. This is a common silent bug in batched embedding services, and it makes results depend on batch composition.</li>
+  <li>For decoder-based embedders, use last-token pooling (with left padding or careful indexing) or the pooling the model card specifies; mean pooling over causal states over-weights early tokens that have seen little context.</li>
+</ul>
+
+<h3>Positional Information as Part of the Representation</h3>
+<ul>
+  <li>Position is not a tokeniser concern: the tokeniser emits the same ID for <code>the</code> at every position. Position enters the representation inside the model.</li>
+  <li>Absolute learned or sinusoidal embeddings are <em>added</em> to token embeddings (GPT-2, BERT), so every hidden state mixes "what" and "where".</li>
+  <li>RoPE (Volume 2) rotates queries and keys and never touches the residual stream directly; position appears in hidden states only through attention patterns. This is one reason RoPE models extrapolate and interpolate more gracefully.</li>
+  <li>Implication for pooling and caching: identical text at different offsets yields different hidden states, so embedding caches must key on the exact input, not a substring.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 9 -->
+<section class="chapter">
+<h2 id="evaluation">Evaluating Tokenisers</h2>
+<p class="chapter-lede">A tokeniser is chosen once and lived with for the life of the model. The decision
+deserves numbers: how well it compresses each language and domain you care about, whether it is
+exactly reversible, how fast it is, and how unequally it charges users of different languages.</p>
+
+<h3>Metrics</h3>
+<table>
+  <caption>Tokeniser evaluation metrics.</caption>
+  <thead><tr><th>Metric</th><th>Definition</th><th>Why it matters</th></tr></thead>
+  <tbody>
+    <tr><td>Bytes per token</td><td><span class="math">\sum |x|_{\text{bytes}} / \sum |\text{enc}(x)|</span></td><td>Tokeniser-independent compression; directly scales cost and effective context.</td></tr>
+    <tr><td>Fertility</td><td>Tokens per word (or per character for unsegmented scripts)</td><td>Intuitive per-language comparison; undefined without word boundaries.</td></tr>
+    <tr><td>Parity / premium</td><td>Tokens for a translation ÷ tokens for the English original</td><td>Fairness across languages on parallel text (Petrov et al. 2023).</td></tr>
+    <tr><td>Coverage</td><td>Fraction of characters encoded without UNK or byte fallback</td><td>Quality proxy for scripts the tokeniser was not built for.</td></tr>
+    <tr><td>Round-trip exactness</td><td><span class="math">\Pr[\text{dec}(\text{enc}(x)) = x]</span></td><td>Must be 1.0 for code and structured output.</td></tr>
+    <tr><td>Throughput</td><td>MB/s per core, batched</td><td>Data-pipeline and serving latency.</td></tr>
+    <tr><td>Vocabulary utilisation</td><td>Fraction of IDs seen ≥ k times in the model's corpus</td><td>Predicts under-trained and glitch tokens.</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout warning"><span class="title">Perplexity is not comparable across tokenisers</span>
+  <p>Per-token loss depends on how much text a token covers. Compare models with different tokenisers
+  using bits per byte: <span class="math">\text{BPB} = \frac{T \cdot \mathcal{L}_{\text{token}}}{B \ln 2}</span>,
+  where <span class="math">T</span> is the token count and <span class="math">B</span> the byte count of the same text.</p>
+</aside>
+
+<h3>A Small Multilingual Evaluation</h3>
+<figure class="listing">
+<figcaption>Bytes per token and token premium on one parallel sentence in five languages plus a Python snippet, for five tokenisers.</figcaption>
+<pre><code>import tiktoken, time
+from transformers import AutoTokenizer
+from bpe import ByteBPE, CORPUS
+samples = {
+ "English": "The weather is lovely today, so we will walk to the market and buy fresh bread.",
+ "German": "Das Wetter ist heute schön, also gehen wir zum Markt und kaufen frisches Brot.",
+ "Hindi": "आज मौसम बहुत अच्छा है, इसलिए हम बाज़ार जाकर ताज़ी रोटी खरीदेंगे।",
+ "Chinese": "今天天气很好，所以我们走路去市场买新鲜的面包。",
+ "Arabic": "الطقس جميل اليوم، لذلك سنمشي إلى السوق ونشتري خبزاً طازجاً.",
+ "Python": "def add(a, b):\n    return a + b\n\nfor i in range(10):\n    print(add(i, i))\n",
+}
+toks = {}
+for name in ["gpt2", "cl100k_base", "o200k_base"]:
+    try:
+        e = tiktoken.get_encoding(name); toks[name] = e.encode_ordinary
+    except Exception as ex:
+        print("could not load", name, type(ex).__name__)
+smol = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+toks["smollm2"] = lambda s: smol.encode(s, add_special_tokens=False)
+ours = ByteBPE().train(open(CORPUS).read(), 1024)
+toks["ours-1k"] = ours.encode
+eng_words = len(samples["English"].split())
+print(f"{'':8s}" + "".join(f"{k:&gt;12s}" for k in toks))
+for lang, s in samples.items():
+    row = [len(s.encode()) / len(f(s)) for f in toks.values()]
+    print(f"{lang:8s}" + "".join(f"{v:12.2f}" for v in row))
+print("-- tokens per sentence (parallel text; premium vs English) --")
+for lang, s in samples.items():
+    if lang == "Python": continue
+    row = [(len(f(s)), len(f(s)) / len(f(samples['English']))) for f in toks.values()]
+    print(f"{lang:8s}" + "".join(f"{n:6d} x{r:4.1f}" for n, r in row))</code></pre>
+</figure>
+<pre class="output">                gpt2 cl100k_base  o200k_base     smollm2     ours-1k
+English         4.39        4.39        4.39        4.39        1.98
+German          2.63        4.16        4.65        2.72        1.76
+Hindi           1.68        2.33        8.40        2.10        1.00
+Chinese         1.47        2.46        4.06        1.57        1.00
+Arabic          1.64        2.25        4.70        1.69        1.00
+Python          2.00        2.85        2.85        2.31        1.51
+-- tokens per sentence (parallel text; premium vs English) --
+English     18 x 1.0    18 x 1.0    18 x 1.0    18 x 1.0    40 x 1.0
+German      30 x 1.7    19 x 1.1    17 x 0.9    29 x 1.6    45 x 1.1
+Hindi      100 x 5.6    72 x 4.0    20 x 1.1    80 x 4.4   168 x 4.2
+Chinese     47 x 2.6    28 x 1.6    17 x 0.9    44 x 2.4    69 x 1.7
+Arabic      66 x 3.7    48 x 2.7    23 x 1.3    64 x 3.6   108 x 2.7</pre>
+
+<p class="facet">Reading the numbers</p>
+<ul>
+  <li>English is saturated at 4.39 bytes/token for every production tokeniser. Differences appear elsewhere.</li>
+  <li>GPT-2 charges Hindi 5.6× and Arabic 3.7× the English token count. o200k brings every language within 1.3×; Hindi goes from 100 tokens to 20. Vocabulary size was spent on non-English scripts.</li>
+  <li>SmolLM2 (49k, English-centric data) behaves like GPT-2 on non-Latin scripts but better on code (2.31), reflecting its training mix.</li>
+  <li>Our 1k-vocabulary BPE trained on 94 KB of English reaches 1.0 byte/token on Hindi, Chinese and Arabic: no merges exist for those bytes, so it is a byte-level model there. The tokeniser corpus determines who pays.</li>
+  <li>This is one sentence. Real evaluations use thousands of parallel sentences (FLORES-200) and report confidence intervals; single sentences can mislead by ±20%.</li>
+</ul>
+
+<h3>Evaluation Harness Design</h3>
+<figure class="diagram">
+<pre class="ascii">                +-------------------------------+
+ corpora ------&gt;| per-domain samples (bytes)    |  web, code, maths, 20+ languages,
+                +---------------+---------------+  parallel set (FLORES)
+                                |
+        +-----------------------+------------------------+
+        v                       v                        v
+  compression             exactness                  speed
+  bytes/token, fertility  round-trip on fuzzed       MB/s single + batched,
+  premium vs English      Unicode, special-token     p99 per request
+                          injection test
+        \                       |                        /
+         +----------------------+-----------------------+
+                                v
+                  report + golden IDs (CI regression gate)</pre>
+<figcaption>Tokeniser evaluation suite for the Forge project.</figcaption>
+</figure>
+
+<div class="frame checklist">
+  <p class="facet">Decision checklist</p>
+  <ul>
+    <li>Compression measured on <em>your</em> traffic mix, not on English web text.</li>
+    <li>Maximum language premium you will accept (for example ≤ 2× for supported languages).</li>
+    <li>Digit rule and whitespace handling chosen deliberately for maths and code.</li>
+    <li>Round-trip = 1.0 on a fuzz set; special-token injection test passes.</li>
+    <li>Embedding cost <span class="math">V d</span> acceptable at your model size.</li>
+    <li>Tokeniser corpus sampled from the pretraining mix, to avoid glitch tokens.</li>
+  </ul>
+</div>
+</section>
+
+<!-- ================================================================ REVIEW -->
+<section class="review">
+<h1>Volume Review</h1>
+
+<h2>What You Learned</h2>
+<ul>
+  <li>Tokenisation trades sequence length against vocabulary size; compression <span class="math">c</span> divides attention FLOPs by <span class="math">c^2</span> and KV cache by <span class="math">c</span>.</li>
+  <li>UTF-8 costs 1–4 bytes per code point; NFC is safe, NFKC is lossy; graphemes can span tokens.</li>
+  <li>BPE merges greedily by frequency and encodes by merge rank; GPT-2's regex keeps merges within word-like chunks with leading spaces.</li>
+  <li>WordPiece scores merges by likelihood gain and encodes by greedy longest match; Unigram trains top-down with EM and encodes with Viterbi.</li>
+  <li>Special tokens and chat templates are a contract that must be versioned and tested byte-for-byte.</li>
+  <li>Digit splitting, whitespace handling and tokeniser corpus choice cause arithmetic, code, fairness and glitch-token problems.</li>
+  <li>Homoglyphs and invisible characters evade token-level filters; normalisation alone does not stop them.</li>
+  <li>Embeddings are anisotropic; tying couples input and output; contextual states separate word senses by the middle layers.</li>
+  <li>Pooling is part of an embedding model; masked mean pooling beat CLS and max pooling on a mean-trained encoder.</li>
+  <li>Position encodings live in the model, not the tokeniser; Forge ships the tokeniser stack as <code>forge.tokenizers</code>.</li>
+</ul>
+
+<h2>What You Built</h2>
+<ul>
+  <li><code>forge.tokenizers.bpe</code>: byte-level BPE trainer with incremental pair updates, encoder and decoder, with a 2,000-case round-trip property test.</li>
+  <li>A rank-based encoder with exact token parity against tiktoken's GPT-2 encoding.</li>
+  <li><code>forge.tokenizers.wordpiece</code>: encoder matching the HF BERT tokenizer.</li>
+  <li><code>forge.tokenizers.unigram</code>: Viterbi segmenter and forward–backward EM trainer with pruning.</li>
+  <li>A special-token injection check and a ChatML template rendering.</li>
+  <li>A multilingual tokeniser evaluation (bytes/token and premium) across five tokenisers.</li>
+  <li>An embedding analysis tool: tying check, neighbours, anisotropy, layer-wise contextualisation and pooling comparison.</li>
+</ul>
+
+<h2>Important Code</h2>
+<table>
+  <caption>Listings to keep; Volume 4 reuses them inside <code>src/forge/</code>.</caption>
+  <thead><tr><th>Listing</th><th>Forge module</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td><code>bpe.py</code></td><td><code>forge.tokenizers.bpe</code></td><td>Byte-level BPE with GPT-2 regex.</td></tr>
+    <tr><td><code>parity.py</code></td><td><code>forge.tokenizers</code></td><td>Token-for-token parity harness against a reference encoder.</td></tr>
+    <tr><td><code>wp_uni.py</code></td><td><code>forge.tokenizers.wordpiece</code> / <code>.unigram</code></td><td>WordPiece encoding; Unigram Viterbi and EM.</td></tr>
+    <tr><td><code>special.py</code></td><td><code>forge.tokenizers</code></td><td>Chat template rendering and injection test.</td></tr>
+    <tr><td><code>evalt.py</code></td><td><code>forge.tokenizers.eval</code></td><td>Multilingual compression and premium evaluation.</td></tr>
+    <tr><td><code>emb.py</code>, <code>pool.py</code></td><td><code>forge.tokenizers.embed</code></td><td>Embedding geometry and pooling analysis.</td></tr>
+  </tbody>
+</table>
+
+<h2>Important Architecture</h2>
+<figure class="diagram">
+<pre class="ascii">text --&gt; [normaliser] --&gt; [pre-tokeniser regex] --&gt; [BPE/WordPiece/Unigram]
+                                                         |
+     chat template + special tokens (control IDs only) --+--&gt; IDs
+                                                         |
+IDs --&gt; embedding E (V x d) --&gt; L blocks (+ position) --&gt; h --&gt; E^T h (tied) --&gt; logits
+                                        |
+                                        +--&gt; pooled sentence vector (mean / last / cls)</pre>
+<figcaption>The text-to-vector path and where each component of this volume sits.</figcaption>
+</figure>
+
+<h2>Failure Modes</h2>
+<ul class="failure-modes">
+  <li>Encoding merges out of rank order; parity breaks only on rare strings.</li>
+  <li>Normaliser or cleanup step breaking round-trip exactness.</li>
+  <li>Chat template mismatch between training and serving; double BOS; missing stop token.</li>
+  <li>Special-token strings in user text encoded as control tokens.</li>
+  <li>Inconsistent digit chunking harming arithmetic; missing whitespace tokens inflating code cost.</li>
+  <li>Glitch tokens from a tokeniser corpus that differs from the model corpus.</li>
+  <li>Homoglyph and zero-width evasion of filters.</li>
+  <li>Unmasked mean pooling; raw cosine thresholds on anisotropic spaces.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<ul>
+  <li>Bytes per token per language and domain; premium versus English on parallel text.</li>
+  <li>Round-trip exactness on fuzzed Unicode; golden-ID regression tests in CI.</li>
+  <li>Throughput single-threaded and batched.</li>
+  <li>Bits per byte, not perplexity, when comparing models with different tokenisers.</li>
+  <li>For embeddings: separation between related and unrelated pairs, not absolute cosine.</li>
+</ul>
+
+<h2>Practical Project</h2>
+<div class="frame exercise">
+  <p class="facet">Train the Forge tokeniser</p>
+  <ol>
+    <li>Train a byte-level BPE (your <code>bpe.py</code>, then HF <code>tokenizers</code> for speed) on a sample of the Volume 4 corpus at <span class="math">V \in \{8\text{k}, 16\text{k}, 32\text{k}\}</span>. Use cl100k-style three-digit chunks.</li>
+    <li>Evaluate bytes/token and premium against <code>tiktoken</code> (cl100k, o200k) and a SentencePiece Unigram model trained on the same data.</li>
+    <li>Add special tokens (<code>&lt;|endoftext|&gt;</code>, <code>&lt;|im_start|&gt;</code>, <code>&lt;|im_end|&gt;</code>) and a ChatML template.</li>
+    <li>Ship <code>tokenizer.json</code>, template, manifest with hashes, golden IDs, and the injection and round-trip tests.</li>
+  </ol>
+</div>
+
+<h2>Exercises</h2>
+<ol>
+  <li>Replace the linear max scan in <code>ByteBPE.train</code> with a heap with lazy deletion. Measure speed-up at 8k merges on 10 MB.</li>
+  <li>Change the digit rule to <code>\p{N}{1,3}</code> and to single digits; retrain and compare bytes/token on a maths corpus.</li>
+  <li>Implement BPE-dropout in <code>_encode_chunk</code> and verify <code>decode</code> is unchanged.</li>
+  <li>Add character offsets to <code>ByteBPE.encode</code>, handling tokens that split a multi-byte character.</li>
+  <li>Implement Kudo's loss-based pruning in the Unigram EM loop and compare with probability pruning.</li>
+  <li>Find the 50 SmolLM2 tokens closest to the mean embedding. Are they under-trained? Test by prompting the model to repeat them.</li>
+  <li>Write a normaliser that defeats the four evasion strings in Chapter 6 while keeping legitimate Russian text intact.</li>
+</ol>
+
+<h2>Research Papers</h2>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Neural Machine Translation of Rare Words with Subword Units</span>
+    <span class="paper-meta">Sennrich, Haddow &amp; Birch, 2015 · ACL · arXiv:1508.07909</span></div>
+  <dl>
+    <dt>Problem</dt><dd>NMT with fixed word vocabularies cannot translate rare and unseen words.</dd>
+    <dt>Previous limitation</dt><dd>Back-off dictionaries and UNK replacement heuristics.</dd>
+    <dt>Approach</dt><dd>Adapt byte-pair encoding compression to learn subword merges.</dd>
+    <dt>Contribution</dt><dd>Open-vocabulary translation with a compact vocabulary.</dd>
+    <dt>Practical impact</dt><dd>BPE became the default tokeniser for LLMs via GPT-2's byte-level variant.</dd>
+    <dt>Limitations</dt><dd>Greedy, frequency-driven segmentation; uneven across languages.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Subword Regularization</span>
+    <span class="paper-meta">Kudo, 2018 · ACL · arXiv:1804.10959</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Deterministic segmentation makes models brittle to segmentation noise.</dd>
+    <dt>Previous limitation</dt><dd>BPE offers one segmentation and no probabilistic model.</dd>
+    <dt>Approach</dt><dd>Unigram LM tokeniser trained with EM; sample segmentations during training.</dd>
+    <dt>Contribution</dt><dd>Principled segmentation lattice, Viterbi decoding and regularisation.</dd>
+    <dt>Practical impact</dt><dd>Default in SentencePiece; used by T5, mT5, ALBERT and others.</dd>
+    <dt>Limitations</dt><dd>Regularisation gains shrink at large data scale.</dd>
+  </dl>
+</section>
+<table>
+  <caption>Further papers.</caption>
+  <thead><tr><th>Paper</th><th>Key point</th></tr></thead>
+  <tbody>
+    <tr><td>Schuster &amp; Nakajima 2012; Wu et al. 2016</td><td>WordPiece for Japanese/Korean voice search and GNMT.</td></tr>
+    <tr><td>Kudo &amp; Richardson 2018 (SentencePiece)</td><td>Language-independent tokenisation on raw text with <code>▁</code>.</td></tr>
+    <tr><td>Mikolov et al. 2013; Pennington et al. 2014</td><td>word2vec and GloVe static embeddings.</td></tr>
+    <tr><td>Peters et al. 2018 (ELMo)</td><td>Deep contextual representations; layer-wise mixing.</td></tr>
+    <tr><td>Ethayarajh 2019</td><td>Contextual representations are anisotropic; more so in upper layers.</td></tr>
+    <tr><td>Xue et al. 2021 (ByT5)</td><td>Token-free byte-level models are competitive and more robust to noise.</td></tr>
+    <tr><td>Petrov et al. 2023</td><td>Tokeniser unfairness: premiums over 10× between languages.</td></tr>
+    <tr><td>Land &amp; Bartolo 2024</td><td>Detecting under-trained (glitch) tokens across open models.</td></tr>
+    <tr><td>Pagnoni et al. 2024 (Byte Latent Transformer)</td><td>Dynamic byte patches replace a fixed vocabulary.</td></tr>
+  </tbody>
+</table>
+
+<h2>Interview Questions</h2>
+<ol>
+  <li>Why does byte-level BPE never produce an unknown token, and why can a single token be invalid UTF-8?</li>
+  <li>Why must BPE encoding apply merges in rank order rather than by longest match?</li>
+  <li>Compare BPE, WordPiece and Unigram in training direction and inference algorithm.</li>
+  <li>How does vocabulary size affect parameters, FLOPs, memory and rare-token quality?</li>
+  <li>A user's message contains <code>&lt;|im_end|&gt;</code>. What can go wrong and how do you prevent it?</li>
+  <li>Why do LLMs struggle with multi-digit arithmetic, and what tokeniser choice helps?</li>
+  <li>What is a glitch token and how would you find them in a new model?</li>
+  <li>Why is perplexity not comparable across tokenisers? What do you use instead?</li>
+  <li>What is anisotropy, and how does it affect cosine-similarity search?</li>
+  <li>Why does mean pooling without the attention mask give batch-dependent embeddings?</li>
+</ol>
+
+<h2>Next Volume</h2>
+<p>Volume 4 builds a small LLM end to end: data pipeline, the Forge tokeniser from this volume, a
+decoder-only Transformer, the training loop, evaluation in bits per byte, and sampling.</p>
+<p class="facet">Prerequisites from this volume</p>
+<ul>
+  <li>A trained, versioned tokeniser artefact with golden tests (Practical Project).</li>
+  <li>Weight tying and embedding cost at small scale (Chapters 4 and 7).</li>
+  <li>Bits per byte as the tokeniser-independent loss (Chapter 9).</li>
+</ul>
+</section>
+
+</body>
+</html>

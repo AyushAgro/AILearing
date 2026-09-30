@@ -1,0 +1,2072 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 6 · LLM Pretraining and Distributed Training</title>
+<meta name="volume" content="Volume 6 · LLM Pretraining and Distributed Training">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 6</p>
+  <h1 class="no-toc">LLM Pretraining and Distributed Training</h1>
+  <p class="tp-subtitle">Scaling Laws, Precision, Parallelism and Checkpointing</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Plan a pretraining run quantitatively: compute budget, model size, token count and cost.</li>
+  <li>Fit and distrust scaling laws; pick batch size, learning rate and schedule at scale.</li>
+  <li>Understand numerical formats well enough to predict where a run will overflow, underflow or drift.</li>
+  <li>Implement every major parallelism strategy at toy scale on CPU processes and verify each against a single-process reference.</li>
+  <li>Choose a parallel layout for a real model on a real cluster, and keep a multi-week run alive.</li>
+  <li>Grow Forge: <code>forge.scaling</code> and <code>forge.train.distributed</code> (DDP, ZeRO, TP, PP, checkpoints).</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>Volume 4 (a working GPT training loop / <code>forge.train</code>), Volume 5 (data pipelines and manifests), and Volume 1's FLOP and memory arithmetic.</li>
+  <li>Distributed-systems background: collectives, bandwidth versus latency, failure domains.</li>
+</ul>
+
+<p class="facet">How to read the code</p>
+<ul>
+  <li>Every listing was executed on an Apple M2 laptop (Python 3.12, PyTorch 2.10, NumPy 2.3, SciPy 1.16). Printed output is real.</li>
+  <li>Listings seed <code>src/forge/scaling/</code> and <code>src/forge/train/distributed/</code>; the algorithms are the same on NCCL and GPUs.</li>
+  <li>Distributed listings use <code>torch.distributed</code> with the <code>gloo</code> backend and 2–4 CPU processes via <code>torch.multiprocessing</code>. The algorithms are identical on NCCL and GPUs; only the speeds differ.</li>
+  <li>Toy-scale numbers illustrate mechanisms. Figures about real clusters and models are marked approximate (≈) and should be checked against the cited source.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1   Economics            C ~ 6ND, cost, inference-aware sizing
+Chapter 2   Scaling laws         Kaplan vs Chinchilla, fitting, extrapolation risk
+Chapter 3   Hyperparameters      critical batch, LR scaling, muP, WSD
+Chapter 4   Precision            FP32/TF32/BF16/FP16/FP8, loss scaling
+Chapter 5   Memory               activation checkpointing, offload
+Chapter 6   Data parallelism     DDP from scratch, ring all-reduce
+Chapter 7   Sharded DP           ZeRO 1-3, mini ZeRO-1, FSDP
+Chapter 8   Tensor parallelism   Megatron column/row linear, sequence parallel
+Chapter 9   Pipeline             GPipe vs 1F1B, schedule simulator
+Chapter 10  3D/4D layouts        70B on 64 GPUs, worked through
+Chapter 11  Long runs            checkpoints, spikes, recovery, monitoring</pre>
+<figcaption>Map of Volume 6.</figcaption>
+</figure>
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="economics">The Economics of Pretraining</h2>
+<p class="chapter-lede">Pretraining is a capital allocation problem. A fixed pile of FLOPs must be
+split between parameters and tokens, and the answer changes once you count the cost of serving the
+model afterwards.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>You have a budget: say 2,000 H100s for 30 days. You must commit, before the run starts, to a
+  model size, a token count, a data mixture and a cluster layout. Mistakes are discovered weeks in,
+  after millions of dollars are spent. The job of this chapter is to make that commitment with
+  arithmetic rather than instinct.</p>
+</div>
+
+<h3>The Compute Budget: C ≈ 6ND</h3>
+<ul>
+  <li>For a dense decoder with <span class="math">N</span> non-embedding parameters trained on <span class="math">D</span> tokens, training FLOPs are approximately
+  <div class="math">C \approx 6ND</div></li>
+  <li><strong>Forward:</strong> each parameter participates in one multiply-add per token, so <span class="math">2N</span> FLOPs per token.</li>
+  <li><strong>Backward:</strong> gradients with respect to activations (<span class="math">2N</span>) and with respect to weights (<span class="math">2N</span>), so <span class="math">4N</span>.</li>
+  <li><strong>Ignored:</strong> attention score FLOPs, roughly <span class="math">6 \cdot 2 \, n_{layer} \, n_{ctx} \, d_{model}</span> per token (Kaplan et al. 2020). This is small when <span class="math">d_{model} \gg n_{ctx}/12</span> but matters for long-context training.</li>
+  <li><strong>Activation recomputation</strong> (Chapter 5) adds another forward: <span class="math">8ND</span> of work for the same <span class="math">6ND</span> of useful FLOPs. MFU counts only the 6ND.</li>
+</ul>
+
+<div class="math">\text{wall-clock days} = \frac{6ND}{n_{GPU} \cdot \text{peak FLOP/s} \cdot \text{MFU} \cdot 86400}</div>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Model FLOPs Utilisation (MFU) = achieved useful FLOP/s ÷ hardware peak. Good large dense runs reach ≈ 35–45 % on H100 in BF16; Llama 3 405B reported 38–43 % (Dubey et al. 2024).</li>
+    <li>Every inefficiency in later chapters (pipeline bubbles, exposed communication, recomputation, restarts) is a direct multiplier on the bill.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption>Training FLOPs, tokens per parameter and GPU-days for public models; Chinchilla-rule allocation; lifetime cost including inference.</figcaption>
+<pre><code># Compute budgets: C = 6ND, Chinchilla-optimal allocation, inference-aware training.
+def flops(n_params, n_tokens):
+    return 6 * n_params * n_tokens
+
+models = [  # (name, params, training tokens) -- public figures, approximate
+    ("GPT-3 175B", 175e9, 300e9),
+    ("Chinchilla 70B", 70e9, 1.4e12),
+    ("Llama 2 70B", 70e9, 2e12),
+    ("Llama 3 8B", 8e9, 15e12),
+    ("Llama 3.1 405B", 405e9, 15.6e12),
+]
+print(f"{'model':16s} {'C (FLOPs)':&gt;10s} {'tokens/param':&gt;12s} {'H100-days@40%':&gt;14s}")
+H100_BF16 = 989e12          # dense BF16 peak, FLOP/s
+for name, n, d in models:
+    c = flops(n, d)
+    days = c / (H100_BF16 * 0.40) / 86400
+    print(f"{name:16s} {c:10.2e} {d / n:12.0f} {days:14,.0f}")
+
+# Chinchilla rule of thumb: D ~ 20 N  -&gt;  C = 6 N (20 N) = 120 N^2
+print("\nbudget C      N_opt        D_opt")
+for c in [1e21, 1e23, 1e24, 3.8e25]:
+    n = (c / 120) ** 0.5
+    print(f"{c:9.1e} {n / 1e9:8.2f} B {20 * n / 1e12:8.2f} T")
+
+# Inference-aware: lifetime FLOPs = 6ND (train) + 2N * tokens_served
+served = 2e13                      # 20T tokens served over the model's lifetime
+print("\nfixed quality target, two ways to reach it (same loss under the Approach 3 fit)")
+for name, n, d in [("compute-optimal 70B", 70e9, 1.4e12), ("over-trained 30B", 30e9, 2.73e12)]:
+    train, infer = flops(n, d), 2 * n * served
+    print(f"{name:20s} train={train:.2e} infer={infer:.2e} total={train + infer:.2e}")</code></pre>
+</figure>
+<pre class="output">model             C (FLOPs) tokens/param  H100-days@40%
+GPT-3 175B         3.15e+23            2          9,216
+Chinchilla 70B     5.88e+23           20         17,203
+Llama 2 70B        8.40e+23           29         24,576
+Llama 3 8B         7.20e+23         1875         21,065
+Llama 3.1 405B     3.79e+25           39      1,109,075
+
+budget C      N_opt        D_opt
+  1.0e+21     2.89 B     0.06 T
+  1.0e+23    28.87 B     0.58 T
+  1.0e+24    91.29 B     1.83 T
+  3.8e+25   562.73 B    11.25 T
+
+fixed quality target, two ways to reach it (same loss under the Approach 3 fit)
+compute-optimal 70B  train=5.88e+23 infer=2.80e+24 total=3.39e+24
+over-trained 30B     train=4.91e+23 infer=1.20e+24 total=1.69e+24</pre>
+
+<p class="facet">Reading the output</p>
+<ul>
+  <li>The 405B estimate, 3.79e25 FLOPs, matches the ≈ 3.8e25 reported in the Llama 3 paper; ≈ 1.1 M H100-days at 40 % MFU is consistent with the ≈ 31 M GPU-hours Meta reported.</li>
+  <li>Llama 3 8B was trained at ≈ 1,875 tokens per parameter, almost 100× the Chinchilla ratio. That is deliberate (next section).</li>
+  <li>The 30B token count (2.73T) comes from solving the Chinchilla parametric loss in Chapter 2 for equal loss. Under that fit the 30B model is cheaper to train <em>and</em> to serve, because Approach 3 prefers more tokens per parameter than the 20:1 rule.</li>
+</ul>
+
+<h3>Tokens Versus Parameters</h3>
+<table>
+  <caption>What each lever buys and costs.</caption>
+  <thead><tr><th>Lever</th><th>Training cost</th><th>Inference cost</th><th>Hidden constraint</th></tr></thead>
+  <tbody>
+    <tr><td>More parameters</td><td>Linear in N per token</td><td>Linear in N per token, plus memory (KV cache, weights)</td><td>Parallelism complexity; serving hardware</td></tr>
+    <tr><td>More tokens</td><td>Linear in D</td><td>None</td><td>Unique high-quality data; repeated epochs give diminishing returns (≈ 4 epochs is nearly as good as fresh data, Muennighoff et al. 2023)</td></tr>
+    <tr><td>Longer context</td><td>Attention FLOPs grow with <span class="math">n_{ctx}</span></td><td>KV cache grows</td><td>Usually a late-stage phase, not the whole run</td></tr>
+  </tbody>
+</table>
+
+<h3>Inference-Aware Training</h3>
+<ul>
+  <li>Chinchilla minimises <em>training</em> compute for a target loss. A deployed model's lifetime cost is <span class="math">6ND + 2N D_{inf}</span>, where <span class="math">D_{inf}</span> is tokens served.</li>
+  <li>When <span class="math">D_{inf} \gg D</span>, the optimum shifts to a smaller model trained on more tokens (Sardana and Frankle 2023). Llama 3 8B and most "small but strong" models follow this.</li>
+  <li>Over-training is not free: the loss curve flattens, so each extra token buys less. The trade is worthwhile only if the model is served at volume.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>Over-training small models needs more unique data. Volume 5's dedup and quality filters decide whether 15T tokens exist that are worth training on.</li>
+    <li>Heavily over-trained models may be harder to fine-tune and quantise (anecdotal and model-specific; measure).</li>
+  </ul>
+</aside>
+
+<h3>Evaluation and When to Use</h3>
+<ul>
+  <li>Sanity-check any plan with three numbers: C, tokens per parameter, and GPU-days at a <em>measured</em> MFU from a short benchmark on the target cluster.</li>
+  <li>Budget 10–20 % extra for restarts, evaluation and ablations (≈; Llama 3 reported 419 unexpected interruptions in 54 days of 405B pretraining).</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="scaling-laws">Scaling Laws</h2>
+<p class="chapter-lede">Scaling laws let you run cheap experiments and predict an expensive one. They are
+empirical curve fits, not physics, and their extrapolation error is the main risk they carry.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>You can afford dozens of runs at 1e17–1e20 FLOPs and exactly one at 1e24. You must choose the
+  1e24 model's size and token count from the small runs, and predict its loss well enough to know
+  whether the run is healthy when it starts.</p>
+</div>
+
+<h3>Kaplan et al. 2020</h3>
+<ul>
+  <li>Loss as separate power laws in parameters, data and compute when the other factors are not bottlenecks:
+  <div class="math">L(N) = \left(\frac{N_c}{N}\right)^{\alpha_N},\quad L(D) = \left(\frac{D_c}{D}\right)^{\alpha_D},\quad \alpha_N \approx 0.076,\ \alpha_D \approx 0.095</div></li>
+  <li>Compute-efficient allocation: <span class="math">N_{opt} \propto C^{0.73}</span>, <span class="math">D_{opt} \propto C^{0.27}</span>. Most extra compute goes to parameters; train large models and stop early.</li>
+  <li>This drove GPT-3's shape: 175B parameters on 300B tokens (≈ 1.7 tokens per parameter).</li>
+</ul>
+
+<h3>Hoffmann et al. 2022 (Chinchilla)</h3>
+<ul>
+  <li>Three approaches (fixed model sizes with varied tokens; IsoFLOP profiles; a parametric fit) agree that parameters and tokens should scale roughly equally:
+  <div class="math">N_{opt} \propto C^{a},\ D_{opt} \propto C^{b},\quad a \approx b \approx 0.5</div></li>
+  <li>Parametric form (Approach 3):
+  <div class="math">L(N, D) = E + \frac{A}{N^{\alpha}} + \frac{B}{D^{\beta}},\quad E=1.69,\ A=406.4,\ B=410.7,\ \alpha=0.34,\ \beta=0.28</div></li>
+  <li>Result: ≈ 20 tokens per parameter. Chinchilla (70B, 1.4T tokens) beat Gopher (280B, 300B tokens) at the same compute.</li>
+</ul>
+
+<p class="facet">Why Kaplan and Chinchilla disagree</p>
+<ul>
+  <li>Kaplan used a fixed learning-rate schedule length regardless of tokens, so short runs were not properly annealed and looked worse; this biased towards bigger models.</li>
+  <li>Kaplan counted non-embedding parameters and used smaller models; later analyses (Porian et al. 2024; Pearce and Song 2024) attribute much of the gap to embedding counting, last-layer compute and warmup/schedule choices.</li>
+  <li>Besiroglu et al. (2024) re-fitted Approach 3 from the paper's data and found the published parameters inconsistent with Approaches 1 and 2; treat Approach 3 constants as approximate.</li>
+</ul>
+
+<table>
+  <caption>Kaplan versus Chinchilla at a glance.</caption>
+  <thead><tr><th></th><th>Kaplan et al. 2020</th><th>Hoffmann et al. 2022</th></tr></thead>
+  <tbody>
+    <tr><td>Exponent for <span class="math">N_{opt}</span></td><td class="num">≈ 0.73</td><td class="num">≈ 0.50</td></tr>
+    <tr><td>Exponent for <span class="math">D_{opt}</span></td><td class="num">≈ 0.27</td><td class="num">≈ 0.50</td></tr>
+    <tr><td>Tokens per parameter at ≈ 1e23 FLOPs</td><td class="num">≈ 2–5</td><td class="num">≈ 20</td></tr>
+    <tr><td>LR schedule</td><td>Fixed length</td><td>Cosine matched to run length</td></tr>
+    <tr><td>Model range</td><td>Up to ≈ 1.5B</td><td>70M to 16B (plus 70B validation)</td></tr>
+  </tbody>
+</table>
+
+<h3>Fitting a Scaling Law to Your Own Runs</h3>
+<ul>
+  <li>We simulate "small runs" by evaluating the Chinchilla parametric loss at the compute-optimal <span class="math">N</span> for budgets 1e17–1e20, adding 1 % run-to-run noise. Real runs would come from Volume 4's trainer.</li>
+  <li>We fit <span class="math">L(C) = a\,C^{-b} + L_\infty</span>, then extrapolate to 1e21–1e25 with uncertainty from the fit covariance.</li>
+  <li>We also fit a pure power law without <span class="math">L_\infty</span> to show how the functional form alone changes the forecast.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Fit L(C) = a·C^-b + L_inf on seven small budgets and extrapolate with a 90 % band.</figcaption>
+<pre><code>import numpy as np
+from scipy.optimize import curve_fit, brentq
+
+# Hoffmann et al. (2022) parametric fit (Approach 3), used as a "ground truth" simulator.
+E, A, B, alpha, beta = 1.69, 406.4, 410.7, 0.34, 0.28
+def L_true(N, D):
+    return E + A / N**alpha + B / D**beta
+
+def optimal_split(C):
+    """Minimise L(N, C/6N) over N for a fixed compute budget."""
+    Ns = np.logspace(6, 13, 4000)
+    Ls = L_true(Ns, C / (6 * Ns))
+    i = Ls.argmin()
+    return Ns[i], C / (6 * Ns[i]), Ls[i]
+
+rng = np.random.default_rng(0)
+budgets = np.logspace(17, 20, 7)             # our "small runs": 1e17..1e20 FLOPs
+obs = []
+for C in budgets:
+    N, D, L = optimal_split(C)
+    obs.append(L * np.exp(rng.normal(0, 0.01)))  # 1% multiplicative run-to-run noise
+    print(f"C={C:8.1e}  N*={N:9.3e}  D*={D:9.3e}  D/N={D / N:5.1f}  L={obs[-1]:.4f}")
+obs = np.array(obs)
+
+def law(logC, a, b, Linf):                  # L(C) = a * C^-b + L_inf, fitted in log C
+    return a * np.exp(-b * (logC - np.log(1e17))) + Linf
+
+p, cov = curve_fit(law, np.log(budgets), obs, p0=[1.0, 0.1, 1.7], maxfev=20000)
+print(f"\nfit: a={p[0]:.3f} b={p[1]:.4f} L_inf={p[2]:.3f}  (true E={E})")
+
+# Extrapolation with parameter uncertainty (sample from the fit covariance)
+samples = rng.multivariate_normal(p, cov, size=2000)
+print(f"\n{'target C':&gt;9s} {'true L':&gt;7s} {'pred L':&gt;7s} {'90% band':&gt;16s}")
+for C in [1e21, 1e23, 1e25]:
+    true = optimal_split(C)[2]
+    preds = np.array([law(np.log(C), *s) for s in samples])
+    lo, hi = np.percentile(preds, [5, 95])
+    print(f"{C:9.0e} {true:7.3f} {law(np.log(C), *p):7.3f} [{lo:6.3f}, {hi:6.3f}]")
+
+# Same fit without the irreducible term: a pure power law extrapolates too optimistically
+def pure(logC, a, b):
+    return a * np.exp(-b * (logC - np.log(1e17)))
+q, _ = curve_fit(pure, np.log(budgets), obs, p0=[4.0, 0.03])
+print(f"\npure power law (no L_inf): b={q[1]:.4f}")
+for C in [1e21, 1e23, 1e25]:
+    print(f"C={C:.0e}: pred={pure(np.log(C), *q):.3f} true={optimal_split(C)[2]:.3f}")
+
+# Inference-aware: how many tokens does a 30B model need to match Chinchilla 70B @ 1.4T?
+target = L_true(70e9, 1.4e12)
+D30 = brentq(lambda d: L_true(30e9, d) - target, 1e11, 1e15)
+print(f"\nL(70B, 1.4T)={target:.4f}; 30B needs D={D30:.2e} tokens "
+      f"({D30 / 30e9:.0f} tokens/param)")</code></pre>
+</figure>
+<pre class="output">C= 1.0e+17  N*=2.848e+07  D*=5.851e+08  D/N= 20.5  L=4.3234
+C= 3.2e+17  N*=4.791e+07  D*=1.100e+09  D/N= 23.0  L=3.8870
+C= 1.0e+18  N*=8.058e+07  D*=2.068e+09  D/N= 25.7  L=3.5580
+C= 3.2e+18  N*=1.355e+08  D*=3.889e+09  D/N= 28.7  L=3.2397
+C= 1.0e+19  N*=2.279e+08  D*=7.312e+09  D/N= 32.1  L=2.9698
+C= 3.2e+19  N*=3.834e+08  D*=1.375e+10  D/N= 35.9  L=2.7858
+C= 1.0e+20  N*=6.448e+08  D*=2.585e+10  D/N= 40.1  L=2.6340
+
+fit: a=2.511 b=0.1643 L_inf=1.815  (true E=1.69)
+
+ target C  true L  pred L         90% band
+    1e+21   2.329   2.368 [ 2.334,  2.433]
+    1e+23   2.005   2.074 [ 1.997,  2.189]
+    1e+25   1.845   1.937 [ 1.820,  2.084]
+
+pure power law (no L_inf): b=0.0744
+C=1e+21: pred=2.146 true=2.329
+C=1e+23: pred=1.524 true=2.005
+C=1e+25: pred=1.082 true=1.845
+
+L(70B, 1.4T)=1.9366; 30B needs D=2.73e+12 tokens (91 tokens/param)</pre>
+
+<p class="facet">What the output shows</p>
+<ul>
+  <li>With only 1 % noise over three decades, the fitted <span class="math">L_\infty</span> is 1.815 against a true 1.69: the irreducible term is poorly identified from small runs.</li>
+  <li>The point forecast at 1e25 is off by ≈ 0.09 nats, and the 90 % band is ≈ 0.26 nats wide. That band is larger than the gap between many successive model generations.</li>
+  <li>Dropping <span class="math">L_\infty</span> is catastrophic: the pure power law predicts 1.08 at 1e25 versus a true 1.85.</li>
+  <li>Even the exact Approach 3 constants give <span class="math">D/N</span> rising from 20 to 40 over this range, not a constant 20. "20 tokens per parameter" is a rule of thumb for ≈ 1e23 budgets.</li>
+</ul>
+
+<h3>Limits and Extrapolation Risk</h3>
+<ul class="failure-modes">
+  <li><strong>Range:</strong> extrapolating 5 decades from 3 decades of data. Fit on as wide a range as budget allows and hold out the largest run for validation.</li>
+  <li><strong>Functional form:</strong> the choice between power law, power law plus constant, and broken power laws dominates the forecast (see above).</li>
+  <li><strong>Hyperparameters:</strong> each small run must be tuned (or μP-transferred, Chapter 3). A mis-tuned small run bends the curve.</li>
+  <li><strong>Data:</strong> laws are specific to the data mixture and tokeniser. Changing the mixture invalidates the fit; repeated data changes the <span class="math">D</span> term.</li>
+  <li><strong>Loss is not capability:</strong> downstream metrics can move abruptly while loss moves smoothly. Fit laws for task-level proxies separately and expect more noise.</li>
+  <li><strong>Architecture changes:</strong> MoE, long context and different attention variants each need their own fit.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Production Practice</span>
+  <ul>
+    <li>Use IsoFLOP profiles (Chinchilla Approach 2): for each of 5–8 budgets, train 5–9 model sizes; fit a parabola in <span class="math">\log N</span> to find each minimum; fit a line through the minima. Llama 3 did this from 6e18 to 1e22 FLOPs to pick 405B for 3.8e25.</li>
+    <li>Llama 3 also mapped loss to downstream accuracy in a second fit, predicting ARC-Challenge accuracy for the 405B model from smaller runs (Dubey et al. 2024).</li>
+    <li>Use WSD schedules (Chapter 3) so one run with several cooldown branches yields several points on the curve.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="hyperparameters">Hyperparameters at Scale</h2>
+<p class="chapter-lede">At scale you cannot grid-search. Batch size is set by the gradient noise and
+the cluster, learning rate by a parameterisation that transfers from small models, and the schedule
+by how many times you want to stop.</p>
+
+<h3>Batch Size and the Critical Batch Size</h3>
+<ul>
+  <li>McCandlish et al. (2018): below a critical batch size <span class="math">B_{crit}</span>, doubling the batch nearly halves the steps (perfect data parallelism); above it, extra batch is wasted compute.</li>
+  <li>The simple noise scale estimates it from per-example gradients <span class="math">g_i</span> with mean <span class="math">G</span> and covariance <span class="math">\Sigma</span>:
+  <div class="math">B_{simple} = \frac{\operatorname{tr}(\Sigma)}{\lVert G \rVert^2}</div></li>
+  <li>Trade-off curve: <span class="math">\left(\frac{S}{S_{min}} - 1\right)\left(\frac{E}{E_{min}} - 1\right) = 1</span>, where <span class="math">S</span> is steps and <span class="math">E</span> is examples processed. At <span class="math">B = B_{crit}</span> you pay 2× the minimum of each.</li>
+  <li>Key property: <span class="math">B_{crit}</span> <em>grows as loss falls</em>, because <span class="math">\lVert G \rVert</span> shrinks while the per-example noise stays. This is why large runs ramp the batch size (Llama 3 405B: 4M tokens, then 8M, then 16M).</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Estimating B_simple from per-example gradients at three points in training (logistic regression).</figcaption>
+<pre><code>import math, torch
+torch.manual_seed(0); torch.set_num_threads(2)
+
+# 1) Gradient noise scale (McCandlish et al. 2018): B_simple = tr(Sigma) / |G|^2
+#    Estimated from per-example gradients of a small logistic-regression problem.
+n, d = 20000, 64
+X = torch.randn(n, d); w_true = torch.randn(d)
+y = (X @ w_true + 2.0 * torch.randn(n) &gt; 0).float()
+def per_example_grads(w):
+    p = torch.sigmoid(X @ w)
+    return (p - y)[:, None] * X                     # (n, d)
+
+for step_name, w in [("init", torch.zeros(d)), ("mid-training", 0.5 * w_true),
+                     ("near optimum", 0.95 * w_true)]:
+    g = per_example_grads(w)
+    G = g.mean(0)
+    tr_sigma = g.var(0, unbiased=True).sum()
+    print(f"{step_name:13s} |G|^2={G.pow(2).sum():.4f} tr(Sigma)={tr_sigma:.3f} "
+          f"B_simple={tr_sigma / G.pow(2).sum():8.1f}")</code></pre>
+</figure>
+<pre class="output">init          |G|^2=0.1495 tr(Sigma)=15.838 B_simple=   106.0
+mid-training  |G|^2=0.0007 tr(Sigma)=3.823 B_simple=  5455.4
+near optimum  |G|^2=0.0002 tr(Sigma)=3.558 B_simple= 21792.3</pre>
+
+<ul>
+  <li>The noise scale rises ≈ 200× from initialisation to near the optimum. A batch that is wasteful at step 0 is efficient late in training.</li>
+  <li>In practice, estimate <span class="math">B_{simple}</span> cheaply from gradient norms at two batch sizes (McCandlish et al. Appendix A) rather than per-example gradients.</li>
+</ul>
+
+<h3>Learning-Rate Scaling</h3>
+<table>
+  <caption>Common LR scaling rules (heuristics, not laws).</caption>
+  <thead><tr><th>Rule</th><th>Statement</th><th>Where it holds</th></tr></thead>
+  <tbody>
+    <tr><td>Linear (Goyal et al. 2017)</td><td><span class="math">\eta \propto B</span></td><td>SGD, below <span class="math">B_{crit}</span>, with warmup</td></tr>
+    <tr><td>Square root</td><td><span class="math">\eta \propto \sqrt{B}</span></td><td>Adam-type optimisers, roughly (Malladi et al. 2022)</td></tr>
+    <tr><td>Width</td><td>Optimal <span class="math">\eta</span> shrinks as width grows under standard parameterisation</td><td>Why small-model LR does not transfer</td></tr>
+    <tr><td>μP</td><td>Hidden-layer Adam LR <span class="math">\propto 1/\text{width}</span>; optimum transfers across width</td><td>Yang et al. 2022</td></tr>
+  </tbody>
+</table>
+
+<h3>μP Intuition</h3>
+<ul>
+  <li>Under standard parameterisation (SP), the change in a layer's output after one Adam step grows with width, because the update <span class="math">\Delta W</span> is correlated with the input <span class="math">x</span> and <span class="math">\Delta W x</span> sums <span class="math">\text{width}</span> aligned terms.</li>
+  <li>μP (Maximal Update Parameterisation) rescales initialisation, per-layer LRs and the output multiplier so every layer's activations and updates stay <span class="math">\Theta(1)</span> as width grows. The optimal LR, found on a small proxy, then transfers to the large model ("μTransfer").</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Size of the output change after one Adam-like step as width grows: SP versus a μP-style 1/width LR.</figcaption>
+<pre><code>print("\nwidth  |dW x| SP(lr fixed)  |dW x| muP(lr ~ 1/width)")
+for width in [128, 512, 2048, 8192]:
+    x = torch.randn(width)                          # activations, entries O(1)
+    W = torch.randn(width, width) / math.sqrt(width)
+    delta_out = torch.randn(width)                  # backprop signal at the layer output
+    grad = torch.outer(delta_out, x)                # dL/dW = delta x^T: correlated with x
+    upd = grad.sign()                               # Adam's first step ~ sign(grad)
+    for tag, lr in [("sp", 1e-3), ("mup", 1e-3 * 128 / width)]:
+        delta = (lr * upd) @ x                      # (width,)
+        if tag == "sp": sp = delta.abs().mean().item()
+        else: mup = delta.abs().mean().item()
+    print(f"{width:5d}  {sp:18.4f}  {mup:22.4f}")</code></pre>
+</figure>
+<pre class="output">width  |dW x| SP(lr fixed)  |dW x| muP(lr ~ 1/width)
+  128              0.1114                  0.1114
+  512              0.4087                  0.1022
+ 2048              1.6230                  0.1014
+ 8192              6.5193                  0.1019</pre>
+
+<ul>
+  <li>With a fixed LR, the output change grows linearly with width (64× wider, ≈ 58× larger update): a small-model LR would blow up the large model.</li>
+  <li>With LR ∝ 1/width the update stays constant. Full μP also changes the output-logit multiplier, attention scaling (<span class="math">1/d</span> rather than <span class="math">1/\sqrt{d}</span>) and embedding LR; use the <code>mup</code> package or a published table rather than hand-rolling it.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Limits of μP</span>
+  <ul>
+    <li>μP transfers across <em>width</em>. Transfer across depth needs extra scaling (e.g. depth-μP / residual branch scaling) and is less settled.</li>
+    <li>It does not transfer batch size, schedule length or weight decay. Those still need their own small sweeps.</li>
+  </ul>
+</aside>
+
+<h3>Warmup-Stable-Decay (WSD)</h3>
+<ul>
+  <li>Cosine decay requires fixing the total step count in advance; stopping early leaves the model un-annealed, continuing requires re-warming.</li>
+  <li>WSD holds the peak LR constant after warmup and decays (linearly, or to zero via <span class="math">1-\sqrt{t}</span>) over the last ≈ 10–20 % of steps. Hägele et al. (2024) show it matches cosine at equal compute.</li>
+  <li>Engineering benefit: fork cooldown branches from any stable-phase checkpoint. One long run yields a model at many token counts, which is exactly what a scaling-law fit needs.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Cosine versus WSD schedules at a 10 % warmup.</figcaption>
+<pre><code>def cosine(t, T, peak, warm):
+    if t &lt; warm: return peak * t / warm
+    return peak * 0.5 * (1 + math.cos(math.pi * (t - warm) / (T - warm)))
+def wsd(t, T, peak, warm, decay_frac=0.2):
+    decay_start = int(T * (1 - decay_frac))
+    if t &lt; warm: return peak * t / warm
+    if t &lt; decay_start: return peak
+    return peak * (1 - (t - decay_start) / (T - decay_start))   # linear to 0
+T = 10000
+print("\nstep    cosine      wsd")
+for t in [0, 500, 1000, 3000, 5000, 7000, 8000, 9000, 9500, 10000]:
+    print(f"{t:5d} {cosine(t, T, 3e-4, 1000):8.2e} {wsd(t, T, 3e-4, 1000):8.2e}")</code></pre>
+</figure>
+<pre class="output">step    cosine      wsd
+    0 0.00e+00 0.00e+00
+  500 1.50e-04 1.50e-04
+ 1000 3.00e-04 3.00e-04
+ 3000 2.65e-04 3.00e-04
+ 5000 1.76e-04 3.00e-04
+ 7000 7.50e-05 3.00e-04
+ 8000 3.51e-05 3.00e-04
+ 9000 9.05e-06 1.50e-04
+ 9500 2.28e-06 7.50e-05
+10000 0.00e+00 0.00e+00</pre>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Batch size: start below <span class="math">B_{crit}</span> and ramp as loss falls; the cluster's DP degree sets a floor.</li>
+    <li>LR: tune on small proxies under μP (or re-tune at a few widths and fit a trend).</li>
+    <li>Schedule: WSD for flexibility; the loss drop during cooldown is large, so never compare a stable-phase checkpoint with a cooled-down one.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="precision">Numerical Precision</h2>
+<p class="chapter-lede">Precision is the cheapest speed-up in training: halving the bits roughly
+doubles tensor-core throughput and halves memory traffic. It is also the easiest way to lose a run
+silently.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>FP32 training is numerically safe but leaves most of the hardware idle: H100 dense BF16 tensor
+  throughput is ≈ 989 TFLOP/s versus ≈ 67 TFLOP/s for FP32 non-tensor maths (≈ 495 for TF32 tensor cores).
+  You want low precision in the matmuls and full precision exactly where it matters.</p>
+</div>
+
+<h3>Formats</h3>
+<table>
+  <caption>Floating-point formats used in training. Range values are from <code>torch.finfo</code> (below).</caption>
+  <thead><tr><th>Format</th><th class="num">Sign</th><th class="num">Exponent</th><th class="num">Mantissa</th><th class="num">Max</th><th class="num">Min normal</th><th class="num">Machine eps</th><th>Typical use</th></tr></thead>
+  <tbody>
+    <tr><td>FP32</td><td class="num">1</td><td class="num">8</td><td class="num">23</td><td class="num">3.4e38</td><td class="num">1.2e-38</td><td class="num">1.2e-7</td><td>Master weights, optimiser state, reductions</td></tr>
+    <tr><td>TF32</td><td class="num">1</td><td class="num">8</td><td class="num">10</td><td class="num">≈ 3.4e38</td><td class="num">1.2e-38</td><td class="num">9.8e-4</td><td>Tensor-core matmul input for FP32 code (Ampere+); stored as FP32</td></tr>
+    <tr><td>BF16</td><td class="num">1</td><td class="num">8</td><td class="num">7</td><td class="num">3.4e38</td><td class="num">1.2e-38</td><td class="num">7.8e-3</td><td>Default training activations/weights</td></tr>
+    <tr><td>FP16</td><td class="num">1</td><td class="num">5</td><td class="num">10</td><td class="num">65,504</td><td class="num">6.1e-5</td><td class="num">9.8e-4</td><td>Older mixed precision (V100); needs loss scaling</td></tr>
+    <tr><td>FP8 E4M3</td><td class="num">1</td><td class="num">4</td><td class="num">3</td><td class="num">448</td><td class="num">1.6e-2</td><td class="num">0.125</td><td>Forward activations and weights (Hopper+)</td></tr>
+    <tr><td>FP8 E5M2</td><td class="num">1</td><td class="num">5</td><td class="num">2</td><td class="num">57,344</td><td class="num">6.1e-5</td><td class="num">0.25</td><td>Gradients (more range, less precision)</td></tr>
+  </tbody>
+</table>
+
+<ul>
+  <li><strong>Exponent bits set range; mantissa bits set precision.</strong> BF16 keeps FP32's range with 3 significant decimal digits, so it rarely overflows and needs no loss scaling.</li>
+  <li>FP16 has more precision but a tiny range: values above 65,504 become <code>inf</code>, values below ≈ 6e-8 (subnormal limit) become zero.</li>
+  <li>FP8 needs <em>per-tensor (or per-block) scaling factors</em> to map each tensor into its narrow range (Micikevicius et al. 2022). DeepSeek-V3 used fine-grained block scaling for FP8 training.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Format limits, FP16 overflow and underflow, softmax overflow and low-precision accumulation.</figcaption>
+<pre><code>import torch
+torch.manual_seed(0)
+
+print(f"{'dtype':16s} {'max':&gt;10s} {'min normal':&gt;11s} {'eps':&gt;9s}")
+for dt in [torch.float32, torch.bfloat16, torch.float16,
+           torch.float8_e4m3fn, torch.float8_e5m2]:
+    fi = torch.finfo(dt)
+    print(f"{str(dt):16s} {fi.max:10.3e} {fi.tiny:11.3e} {fi.eps:9.2e}")
+
+# Overflow and underflow in FP16
+x = torch.tensor([70000.0, 1e-8, 3e-5, 1.0 + 1e-4])
+print("\nfp32 -&gt; fp16:", x.half().tolist())
+print("fp32 -&gt; bf16:", x.bfloat16().tolist())
+
+# Softmax in half precision: logits of 12 overflow exp() in fp16
+logits = torch.tensor([12.0, 11.0, 10.0])
+print("\nexp(logits) fp16:", torch.exp(logits.half()).tolist())
+print("naive fp16 softmax:",
+      (torch.exp(logits.half()) / torch.exp(logits.half()).sum()).tolist())
+print("stable (max-sub) fp16:", torch.softmax(logits.half(), dim=0).tolist())
+
+# Accumulation: summing 10k values of 0.01 in low precision
+v = torch.full((10000,), 0.01)
+for dt in [torch.float32, torch.bfloat16, torch.float16]:
+    acc = torch.zeros((), dtype=dt)
+    for chunk in v.to(dt).split(1):                 # sequential accumulation
+        acc = acc + chunk[0]
+    print(f"sequential sum in {str(dt):15s} = {acc.item():.3f} (exact 100)")</code></pre>
+</figure>
+<pre class="output">dtype                   max  min normal       eps
+torch.float32     3.403e+38   1.175e-38  1.19e-07
+torch.bfloat16    3.390e+38   1.175e-38  7.81e-03
+torch.float16     6.550e+04   6.104e-05  9.77e-04
+torch.float8_e4m3fn  4.480e+02   1.562e-02  1.25e-01
+torch.float8_e5m2  5.734e+04   6.104e-05  2.50e-01
+
+fp32 -&gt; fp16: [inf, 0.0, 2.9981136322021484e-05, 1.0]
+fp32 -&gt; bf16: [70144.0, 1.0011717677116394e-08, 3.0040740966796875e-05, 1.0]
+
+exp(logits) fp16: [inf, 59872.0, 22032.0]
+naive fp16 softmax: [nan, 0.0, 0.0]
+stable (max-sub) fp16: [0.6650390625, 0.2447509765625, 0.09002685546875]
+sequential sum in torch.float32   = 100.003 (exact 100)
+sequential sum in torch.bfloat16  = 4.000 (exact 100)
+sequential sum in torch.float16   = 32.000 (exact 100)</pre>
+
+<ul>
+  <li>A logit of 12 overflows <code>exp</code> in FP16 and the naive softmax returns NaN. Fused kernels subtract the max and compute in FP32 internally.</li>
+  <li>The accumulation result is the most important line: a BF16 running sum stalls at 4.0, because adding 0.01 to 4 is below half an ulp (<span class="math">4 \times 2^{-8} = 0.0156</span>). This is why matmul accumulators, norms, loss reductions and gradient all-reduce buckets stay in FP32.</li>
+  <li><code>1.0 + 1e-4</code> rounds to 1.0 in both half formats: small weight updates to a BF16 weight vanish. Hence FP32 master weights.</li>
+</ul>
+
+<h3>Mixed Precision and Loss Scaling</h3>
+<ul>
+  <li>Micikevicius et al. (2017): keep an FP32 master copy of the weights; run forward and backward in FP16; scale the loss by <span class="math">S</span> before backward so small gradients stay representable; unscale in FP32 before the optimiser step; skip steps with <code>inf</code>/<code>NaN</code>.</li>
+  <li>Dynamic scaling: start with a large <span class="math">S</span>, halve on overflow, double after <span class="math">k</span> clean steps. This is <code>torch.amp.GradScaler</code>.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Loss scaling rescues gradients that underflow in FP16; a dynamic scaler (the GradScaler algorithm).</figcaption>
+<pre><code># Loss scaling: tiny gradients underflow in fp16 unless the loss is scaled up
+torch.manual_seed(0)
+w = torch.randn(256, 256) * 0.02
+g_true = torch.randn(256, 256) * 1e-8               # realistic late-layer gradient scale
+for scale in [1.0, 1024.0, 65536.0, 2.0**24]:
+    g16 = (g_true * scale).half()                   # gradient as computed in fp16
+    zero = (g16 == 0).float().mean().item()
+    inf = torch.isinf(g16).any().item()
+    rec = g16.float() / scale                       # unscale in fp32 master copy
+    err = ((rec - g_true).norm() / g_true.norm()).item()
+    print(f"scale={scale:10.0f} zeros={zero:6.1%} inf={inf!s:5s} rel.err={err:.3e}")
+
+# Dynamic loss scaler (the algorithm behind torch.amp.GradScaler)
+class DynamicScaler:
+    def __init__(self, init=2.0**16, growth=2.0, backoff=0.5, interval=2000):
+        self.scale, self.growth, self.backoff = init, growth, backoff
+        self.interval, self.good_steps = interval, 0
+    def update(self, found_inf: bool) -&gt; bool:      # returns True if step is applied
+        if found_inf:
+            self.scale *= self.backoff; self.good_steps = 0
+            return False
+        self.good_steps += 1
+        if self.good_steps % self.interval == 0:
+            self.scale *= self.growth
+        return True
+
+s = DynamicScaler(init=2.0**20, interval=3)
+peaks = [1e-2, 1e-2, 1e-3, 1e-3, 1e-3, 1e-3, 5e-2, 1e-3]  # max |grad| per step
+for step, gmax in enumerate(peaks):
+    found_inf = gmax * s.scale &gt; torch.finfo(torch.float16).max
+    applied = s.update(found_inf)
+    print(f"step {step}: max|g|={gmax:.0e} applied={applied!s:5s} next scale={s.scale:.0f}")</code></pre>
+</figure>
+<pre class="output">scale=         1 zeros= 99.7% inf=False rel.err=9.946e-01
+scale=      1024 zeros=  0.3% inf=False rel.err=1.671e-03
+scale=     65536 zeros=  0.0% inf=False rel.err=2.076e-04
+scale=  16777216 zeros=  0.0% inf=False rel.err=2.075e-04
+step 0: max|g|=1e-02 applied=True  next scale=1048576
+step 1: max|g|=1e-02 applied=True  next scale=1048576
+step 2: max|g|=1e-03 applied=True  next scale=2097152
+step 3: max|g|=1e-03 applied=True  next scale=2097152
+step 4: max|g|=1e-03 applied=True  next scale=2097152
+step 5: max|g|=1e-03 applied=True  next scale=4194304
+step 6: max|g|=5e-02 applied=False next scale=2097152
+step 7: max|g|=1e-03 applied=True  next scale=2097152</pre>
+
+<ul>
+  <li>Without scaling, 99.7 % of gradients of size ≈ 1e-8 flush to zero in FP16. A scale of 65,536 recovers them to FP16's precision limit (≈ 2e-4 relative error).</li>
+  <li>The scaler skips step 6 (overflow), backs off, and continues. Skipped steps are normal; a <em>stream</em> of skipped steps means divergence, not bad luck.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>A BF16 mixed-precision trainer with <code>torch.autocast</code>: FP32 parameters and optimiser state, BF16 matmuls, FP32 loss.</figcaption>
+<pre><code>import time, torch, torch.nn as nn
+torch.set_num_threads(2)
+
+def run(dtype, steps=200):
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(128, 512), nn.GELU(), nn.LayerNorm(512),
+                          nn.Linear(512, 10))
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)   # fp32 params + fp32 state
+    g = torch.Generator().manual_seed(1)
+    X = torch.randn(4096, 128, generator=g); y = (X[:, :10].argmax(1))
+    t0 = time.perf_counter()
+    for step in range(steps):
+        idx = torch.randint(0, 4096, (256,), generator=g)
+        with torch.autocast("cpu", dtype=dtype, enabled=dtype is not torch.float32):
+            logits = model(X[idx])                           # matmuls in bf16
+            loss = nn.functional.cross_entropy(logits.float(), y[idx])  # fp32 loss
+        opt.zero_grad(); loss.backward(); opt.step()
+    dts = {p.grad.dtype for p in model.parameters()}
+    return loss.item(), logits.dtype, dts, time.perf_counter() - t0
+
+for dt in [torch.float32, torch.bfloat16]:
+    loss, ldt, gdt, sec = run(dt)
+    print(f"{str(dt):15s} final loss={loss:.4f} logits={ldt} grads={gdt} {sec:.1f}s")</code></pre>
+</figure>
+<pre class="output">torch.float32   final loss=0.0689 logits=torch.float32 grads={torch.float32} 0.3s
+torch.bfloat16  final loss=0.0688 logits=torch.bfloat16 grads={torch.float32} 1.0s</pre>
+<ul>
+  <li>Same final loss; gradients land in FP32 because parameters are FP32. On CPU BF16 is slower (no tensor cores); on H100 the matmuls run ≈ 2× faster than TF32.</li>
+</ul>
+
+<h3>Where Precision Matters</h3>
+<table>
+  <caption>Components and the precision they need.</caption>
+  <thead><tr><th>Component</th><th>Precision</th><th>Reason</th></tr></thead>
+  <tbody>
+    <tr><td>Matmul inputs</td><td>BF16 / FP8</td><td>Throughput; tolerant of rounding</td></tr>
+    <tr><td>Matmul accumulator</td><td>FP32</td><td>Long dot products stall in BF16 (listing above)</td></tr>
+    <tr><td>LayerNorm/RMSNorm statistics</td><td>FP32</td><td>Variance of large activations; mean subtraction cancels digits</td></tr>
+    <tr><td>Softmax, logsumexp, loss</td><td>FP32</td><td>Exponentials overflow; large-vocab reductions</td></tr>
+    <tr><td>Attention logits</td><td>FP32 inside fused kernels</td><td>Logit growth is a known instability (Wortsman et al. 2023; QK-norm mitigates)</td></tr>
+    <tr><td>Optimiser state (m, v) and master weights</td><td>FP32</td><td>Small updates vanish in BF16; <span class="math">v</span> spans many orders of magnitude</td></tr>
+    <tr><td>Gradient all-reduce</td><td>BF16 or FP32</td><td>BF16 halves bandwidth but sums across many ranks lose bits; FP32 reduce is safer</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout advanced"><span class="title">FP8 Training</span>
+  <ul>
+    <li>Per-tensor delayed scaling (Transformer Engine) keeps an amax history per tensor and chooses the scale from it; the first/last layers and attention softmax usually stay in BF16.</li>
+    <li>Llama 3 405B was trained in BF16; FP8 was used for inference. DeepSeek-V3 (2024) reported FP8 pretraining at scale with 1×128 / 128×128 block scaling and FP32 accumulation promotion.</li>
+    <li>Failure mode: outlier channels saturate E4M3's 448 maximum; block scaling contains the damage to one block.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="memory">Memory and Activation Management</h2>
+<p class="chapter-lede">Parameters are rarely what fills a GPU during training. Activations saved for
+backward grow with batch, sequence length and depth, and they are the first thing to trade for
+compute.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>A 70B model at sequence length 4,096 stores ≈ 1 GB of activations per layer per sequence in
+  BF16 (Korthikanti et al. 2022 formula, below). Eighty layers do not fit on any GPU. Model-state
+  sharding (Chapter 7) does not help: activations belong to the micro-batch, not the parameters.</p>
+</div>
+
+<h3>Where the Memory Goes</h3>
+<ul>
+  <li><strong>Model states:</strong> BF16 weights (2 B/param), gradients (2 or 4 B/param), FP32 master + Adam <span class="math">m, v</span> (12 B/param). ≈ 16–18 bytes per parameter before sharding.</li>
+  <li><strong>Activations</strong> per transformer layer, sequence length <span class="math">s</span>, micro-batch <span class="math">b</span>, hidden <span class="math">h</span>, heads <span class="math">a</span>, tensor-parallel size <span class="math">t</span> (Korthikanti et al. 2022, BF16):
+  <div class="math">M_{act} = s\,b\,h\left(34 + \frac{5\,a\,s}{h}\right)\ \text{bytes (no parallelism)},\qquad \frac{s\,b\,h}{t}\left(34 + \frac{5\,a\,s}{h}\right)\ \text{with TP + sequence parallelism}</div></li>
+  <li>The <span class="math">5as/h</span> term is the attention score matrix; FlashAttention does not materialise it, leaving ≈ <span class="math">34\,sbh/t</span>.</li>
+  <li><strong>Transient:</strong> communication buffers, allocator fragmentation, temporary workspace. Budget ≈ 5–10 % of HBM.</li>
+</ul>
+
+<h3>Activation Checkpointing</h3>
+<ul>
+  <li>Chen et al. (2016): save only some activations (checkpoints) and recompute the rest during backward. With <span class="math">\sqrt{L}</span> segments, memory drops from <span class="math">O(L)</span> to <span class="math">O(\sqrt{L})</span> for one extra forward.</li>
+  <li><strong>Full recompute</strong> per layer: store only each layer's input (<span class="math">2sbh</span> bytes); cost ≈ +33 % FLOPs (one extra forward on top of forward + 2× backward).</li>
+  <li><strong>Selective recompute</strong> (Korthikanti et al. 2022): recompute only the attention core (cheap FLOPs, big memory). Removes the <span class="math">5as/h</span> term for ≈ 2–4 % overhead; obsolete if FlashAttention already recomputes it.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Measure the bytes autograd saves for backward with and without <code>torch.utils.checkpoint</code>, using saved-tensor hooks.</figcaption>
+<pre><code>import time, torch, torch.nn as nn
+from torch.utils.checkpoint import checkpoint
+torch.manual_seed(0); torch.set_num_threads(2)
+
+class Block(nn.Module):                            # pre-norm transformer-style MLP block
+    def __init__(self, d):
+        super().__init__()
+        self.ln = nn.LayerNorm(d)
+        self.fc1, self.fc2 = nn.Linear(d, 4 * d), nn.Linear(4 * d, d)
+    def forward(self, x):
+        return x + self.fc2(torch.nn.functional.gelu(self.fc1(self.ln(x))))
+
+class Net(nn.Module):
+    def __init__(self, d, L, mode):
+        super().__init__()
+        self.blocks, self.mode = nn.ModuleList(Block(d) for _ in range(L)), mode
+    def forward(self, x):
+        for i, b in enumerate(self.blocks):
+            ckpt = self.mode == "all" or (self.mode == "every2" and i % 2 == 0)
+            x = checkpoint(b, x, use_reentrant=False) if ckpt else b(x)
+        return x
+
+def saved_bytes(model, x):
+    """Count bytes of tensors autograd saves for backward (exact, device-independent)."""
+    total, seen = 0, set()
+    def pack(t):
+        nonlocal total
+        key = (t.untyped_storage().data_ptr(), t.dtype)
+        if key not in seen:                        # params and shared storages once
+            seen.add(key); total += t.untyped_storage().nbytes()
+        return t
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+        out = model(x)
+    return total, out
+
+B, T, d, L = 8, 256, 256, 8
+x = torch.randn(B, T, d, requires_grad=True)
+param_bytes = sum(p.numel() * 4 for p in Net(d, L, "none").parameters())
+print(f"params: {param_bytes / 2**20:.1f} MiB   input: {x.numel() * 4 / 2**20:.1f} MiB")
+ref = None
+for mode in ["none", "every2", "all"]:
+    torch.manual_seed(1); m = Net(d, L, mode)
+    nbytes, out = saved_bytes(m, x)
+    t0 = time.perf_counter()
+    for _ in range(3):
+        m.zero_grad(); x.grad = None
+        m(x).square().mean().backward()
+    dt = (time.perf_counter() - t0) / 3
+    g = m.blocks[0].fc1.weight.grad.clone()
+    ref = g if ref is None else ref
+    print(f"{mode:7s} saved={nbytes / 2**20:7.1f} MiB  step={dt * 1e3:6.0f} ms  "
+          f"grad match={torch.allclose(g, ref, atol=1e-6)}")</code></pre>
+</figure>
+<pre class="output">params: 16.1 MiB   input: 2.0 MiB
+none    saved=  176.1 MiB  step=   246 ms  grad match=True
+every2  saved=   96.1 MiB  step=   268 ms  grad match=True
+all     saved=   16.0 MiB  step=   325 ms  grad match=True</pre>
+
+<ul>
+  <li>Without checkpointing: 176 MiB saved = 16 MiB of weights referenced by the graph + ≈ 20 MiB activations per block (LayerNorm output, fc1 output, GELU output, residual) × 8.</li>
+  <li>Checkpointing every block keeps only the 8 block inputs (8 × 2 MiB = 16 MiB): an 11× reduction for ≈ 32 % more step time, close to the theoretical +33 %.</li>
+  <li>Gradients are identical: recomputation is exact when the block is deterministic. Dropout needs RNG-state replay (PyTorch does this by default with <code>preserve_rng_state=True</code>).</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Saved-tensor hooks as a profiler</span>
+  <ul>
+    <li><code>torch.autograd.graph.saved_tensors_hooks</code> sees exactly what backward will need. The same hook pair can offload tensors to CPU (<code>pack</code> copies to pinned host memory, <code>unpack</code> copies back): this is how <code>torch.autograd.graph.save_on_cpu</code> works.</li>
+    <li>On GPU, confirm with <code>torch.cuda.max_memory_allocated()</code> and the memory snapshot tool (<code>torch.cuda.memory._record_memory_history</code>).</li>
+  </ul>
+</aside>
+
+<h3>CPU Offload</h3>
+<table>
+  <caption>Offload options and their costs (bandwidths approximate, per GPU).</caption>
+  <thead><tr><th>What moves</th><th>Traffic per step</th><th>Bottleneck</th><th>When it pays</th></tr></thead>
+  <tbody>
+    <tr><td>Optimiser state + update (ZeRO-Offload)</td><td>Grads down, params up: ≈ 4 B/param</td><td>PCIe ≈ 25–50 GB/s; CPU Adam speed</td><td>Few GPUs, model states dominate, large batch</td></tr>
+    <tr><td>Parameters (ZeRO-Infinity)</td><td>Every layer every step</td><td>PCIe / NVMe</td><td>Fine-tuning huge models on tiny clusters</td></tr>
+    <tr><td>Activations</td><td>2× activations per step</td><td>PCIe; must overlap with compute</td><td>Long context where recompute is expensive</td></tr>
+  </tbody>
+</table>
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>HBM bandwidth (≈ 3.3 TB/s on H100) is ≈ 50–100× PCIe. Offload that is not fully overlapped with compute usually costs more than recomputation. Large pretraining runs rarely offload; they shard and recompute.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="data-parallel">Data Parallelism</h2>
+<p class="chapter-lede">Data parallelism replicates the model, splits the batch, and averages gradients.
+It is the outermost layer of every parallel layout, and its all-reduce is the collective that the
+rest of the volume builds on.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>One H100 processes ≈ 9,000 tokens/s for a 7B model at 40 % MFU (<span class="math">0.4 \times 989\text{e}12 / (6 \times 7\text{e}9)</span>). Fifteen trillion tokens would
+  take about fifty years. You need thousands of workers computing one mathematically identical SGD step.</p>
+</div>
+
+<h3>How DDP Works</h3>
+<ul>
+  <li>Every rank holds the full model and optimiser; initial weights are identical (broadcast from rank 0 or same seed).</li>
+  <li>Each rank computes the loss on its <span class="math">B/N</span> shard and backpropagates.</li>
+  <li>Gradients are summed with <strong>all-reduce</strong> and divided by <span class="math">N</span>. Because the loss is a mean, the averaged gradient equals the full-batch gradient.</li>
+  <li>Each rank applies the same optimiser step, so replicas stay identical without communicating weights.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>DDP from scratch on 4 gloo processes, with a hand-written ring all-reduce; verified against a single-process full-batch gradient.</figcaption>
+<pre><code>import os, time, torch, torch.nn as nn, torch.distributed as dist, torch.multiprocessing as mp
+
+WORLD, GLOBAL_BATCH, D_IN = 4, 64, 32
+
+def make_model():
+    torch.manual_seed(0)                           # identical init on every rank
+    return nn.Sequential(nn.Linear(D_IN, 64), nn.GELU(), nn.Linear(64, 1))
+
+def make_data():
+    g = torch.Generator().manual_seed(123)
+    X = torch.randn(GLOBAL_BATCH, D_IN, generator=g)
+    return X, X.sum(1, keepdim=True).sin()
+
+def ring_all_reduce(t: torch.Tensor):
+    """Ring all-reduce (reduce-scatter then all-gather) with point-to-point sends."""
+    rank, world = dist.get_rank(), dist.get_world_size()
+    chunks = list(t.view(-1).chunk(world))        # views into t
+    right, left = (rank + 1) % world, (rank - 1) % world
+    buf = torch.empty_like(chunks[0])
+    for step in range(world - 1):                 # reduce-scatter
+        send_i, recv_i = (rank - step) % world, (rank - step - 1) % world
+        req = dist.isend(chunks[send_i].contiguous(), right)
+        dist.recv(buf[: chunks[recv_i].numel()], left)
+        req.wait()
+        chunks[recv_i] += buf[: chunks[recv_i].numel()]
+    for step in range(world - 1):                 # all-gather
+        send_i, recv_i = (rank + 1 - step) % world, (rank - step) % world
+        req = dist.isend(chunks[send_i].contiguous(), right)
+        dist.recv(buf[: chunks[recv_i].numel()], left)
+        req.wait()
+        chunks[recv_i].copy_(buf[: chunks[recv_i].numel()])
+    return t
+
+def worker(rank, world, q):
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT="29511", GLOO_SOCKET_IFNAME="lo0")
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", rank=rank, world_size=world)
+    model, (X, y) = make_model(), make_data()
+    per = GLOBAL_BATCH // world
+    Xl, yl = X[rank * per:(rank + 1) * per], y[rank * per:(rank + 1) * per]  # shard
+    nn.functional.mse_loss(model(Xl), yl).backward()     # local mean over `per`
+    # --- DDP: bucket all grads into one flat buffer, all-reduce, average ---
+    grads = [p.grad for p in model.parameters()]
+    flat = torch.cat([g.view(-1) for g in grads])
+    flat_ring = flat.clone()
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM); flat /= world
+    ring_all_reduce(flat_ring); flat_ring /= world
+    if rank == 0:
+        q.put((flat.numpy(), flat_ring.numpy()))  # plain arrays, not shm
+    dist.destroy_process_group()
+
+if __name__ == "__main__":
+    t0 = time.perf_counter()
+    q = mp.get_context("spawn").SimpleQueue()
+    mp.spawn(worker, args=(WORLD, q), nprocs=WORLD, join=True)
+    ddp_grad, ring_grad = map(torch.from_numpy, q.get())
+    model, (X, y) = make_model(), make_data()     # single process, full batch
+    nn.functional.mse_loss(model(X), y).backward()
+    ref = torch.cat([p.grad.view(-1) for p in model.parameters()])
+    print(f"world={WORLD} params={ref.numel()} per-rank batch={GLOBAL_BATCH // WORLD}")
+    print("max |DDP - single|      =", (ddp_grad - ref).abs().max().item())
+    print("max |ring - all_reduce| =", (ring_grad - ddp_grad).abs().max().item())
+    print(f"wall time {time.perf_counter() - t0:.1f}s")</code></pre>
+</figure>
+<pre class="output">world=4 params=2177 per-rank batch=16
+max |DDP - single|      = 3.725290298461914e-08
+max |ring - all_reduce| = 1.4901161193847656e-08
+wall time 36.1s</pre>
+
+<ul>
+  <li>The DDP gradient equals the single-process gradient to FP32 rounding (≈ 4e-8): summation order differs, so bitwise equality is not expected.</li>
+  <li>The hand-written ring matches <code>dist.all_reduce</code>. Wall time is dominated by spawning four Python processes and importing PyTorch on a shared CPU, not by communication.</li>
+  <li>Ranks send and receive with <code>isend</code> before <code>recv</code> so that the ring does not deadlock when every rank sends first.</li>
+</ul>
+
+<h3>All-Reduce Algorithms and Cost</h3>
+<ul>
+  <li>Alpha-beta model: sending <span class="math">n</span> bytes costs <span class="math">\alpha + n\beta</span> (latency plus inverse bandwidth). <span class="math">p</span> ranks, message size <span class="math">n</span>.</li>
+  <li><strong>Ring:</strong> reduce-scatter (<span class="math">p-1</span> steps of <span class="math">n/p</span>) then all-gather (<span class="math">p-1</span> steps):
+  <div class="math">T_{ring} = 2(p-1)\,\alpha + 2\frac{p-1}{p}\,n\,\beta</div>
+  The bandwidth term is ≈ <span class="math">2n\beta</span>, <em>independent of p</em>: each rank sends and receives ≈ 2× the buffer. Latency grows linearly in <span class="math">p</span>.</li>
+  <li><strong>Tree / double binary tree</strong> (NCCL): <span class="math">O(\log p)\,\alpha</span> latency with near-ring bandwidth; better for small messages and very large <span class="math">p</span>.</li>
+  <li><strong>Hierarchical:</strong> reduce-scatter inside the node over NVLink, all-reduce across nodes over InfiniBand, all-gather inside the node. Cross-node traffic shrinks by the GPUs per node.</li>
+  <li><strong>Bus bandwidth</strong> (NCCL tests): <span class="math">\text{busbw} = \text{algbw} \cdot 2(p-1)/p</span>. Compare busbw against link speed to judge efficiency.</li>
+</ul>
+
+<table>
+  <caption>Collectives used in this volume. Bytes sent per rank for an n-byte buffer, ring algorithm.</caption>
+  <thead><tr><th>Collective</th><th>Result</th><th class="num">Bytes sent per rank</th><th>Used by</th></tr></thead>
+  <tbody>
+    <tr><td>All-reduce</td><td>Every rank has the sum</td><td class="num"><span class="math">2\frac{p-1}{p}n</span></td><td>DDP gradients, TP activations</td></tr>
+    <tr><td>Reduce-scatter</td><td>Rank <span class="math">i</span> has the sum of shard <span class="math">i</span></td><td class="num"><span class="math">\frac{p-1}{p}n</span></td><td>ZeRO-2/3 gradients, sequence parallel</td></tr>
+    <tr><td>All-gather</td><td>Every rank has every shard</td><td class="num"><span class="math">\frac{p-1}{p}n</span></td><td>ZeRO-3/FSDP parameters, sequence parallel</td></tr>
+    <tr><td>Point-to-point</td><td>One rank to its neighbour</td><td class="num"><span class="math">n</span></td><td>Pipeline activations, ring attention</td></tr>
+  </tbody>
+</table>
+
+<h3>Gradient Bucketing and Overlap</h3>
+<ul>
+  <li>One all-reduce per parameter tensor pays <span class="math">\alpha</span> hundreds of times; one all-reduce of everything after backward cannot overlap with compute.</li>
+  <li>PyTorch DDP (Li et al. 2020) groups gradients into ≈ 25 MB buckets in reverse layer order. An autograd hook fires when every gradient in a bucket is ready and launches an asynchronous all-reduce while backward continues on earlier layers.</li>
+  <li>Gradient accumulation: use <code>no_sync()</code> on all but the last micro-batch, otherwise you all-reduce every micro-batch.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">time --------------------------------------------------------------&gt;
+compute:  [fwd........][bwd L8 L7][bwd L6 L5][bwd L4 L3][bwd L2 L1][opt]
+comm:                            [AR bucket3][AR bucket2][AR bucket1][AR b0]
+                                  ^ bucket of L8,L7 ready -&gt; launch async
+exposed communication = only the last bucket's all-reduce</pre>
+<figcaption>Bucketed all-reduce overlapped with backward.</figcaption>
+</figure>
+
+<ul class="failure-modes">
+  <li>Unused parameters (conditional branches, MoE experts not selected) never fire their hook; DDP hangs unless <code>find_unused_parameters=True</code>.</li>
+  <li>Different ranks take different control flow and issue collectives in a different order: deadlock. Collective order must be identical on every rank.</li>
+  <li>Data shards overlap because the sampler was not seeded per epoch: silent effective-batch reduction.</li>
+  <li>DP degree beyond <span class="math">B_{crit}/b_{micro}</span> wastes compute (Chapter 3); DP alone cannot fit a model that does not fit on one GPU.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="zero">Sharded Data Parallelism</h2>
+<p class="chapter-lede">DDP keeps N identical copies of every byte of model state. ZeRO removes the
+redundancy by sharding optimiser state, gradients and finally parameters across data-parallel
+ranks, while keeping DDP's programming model.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>With mixed-precision Adam, a 7.5B model needs ≈ 120 GB of model states (16 bytes per parameter)
+  before a single activation is stored. DDP replicates all 120 GB on every GPU. Tensor and pipeline
+  parallelism can split it, but at the cost of code changes and communication on the critical path.</p>
+</div>
+
+<h3>ZeRO Stages</h3>
+<p>Rajbhandari et al. (2019). <span class="math">\Psi</span> parameters, <span class="math">N_d</span> data-parallel ranks, <span class="math">K = 12</span> bytes of optimiser state per parameter (FP32 master, <span class="math">m</span>, <span class="math">v</span>), BF16/FP16 weights and gradients.</p>
+
+<table>
+  <caption>Model-state memory per GPU. The last column is the paper's example: Ψ = 7.5B, N_d = 64 (computed by the listing below).</caption>
+  <thead><tr><th>Stage</th><th>Shards</th><th>Bytes per GPU</th><th class="num">Example</th><th>Communication vs DDP</th></tr></thead>
+  <tbody>
+    <tr><td>DDP (0)</td><td>Nothing</td><td><span class="math">(2+2+K)\Psi</span></td><td class="num">120.0 GB</td><td>1× (all-reduce)</td></tr>
+    <tr><td>ZeRO-1 (<span class="math">P_{os}</span>)</td><td>Optimiser state</td><td><span class="math">4\Psi + \frac{K\Psi}{N_d}</span></td><td class="num">31.4 GB</td><td>1× (reduce-scatter + all-gather)</td></tr>
+    <tr><td>ZeRO-2 (<span class="math">P_{os+g}</span>)</td><td>+ gradients</td><td><span class="math">2\Psi + \frac{(2+K)\Psi}{N_d}</span></td><td class="num">16.6 GB</td><td>1×</td></tr>
+    <tr><td>ZeRO-3 (<span class="math">P_{os+g+p}</span>)</td><td>+ parameters</td><td><span class="math">\frac{(2+2+K)\Psi}{N_d}</span></td><td class="num">1.9 GB</td><td>1.5× (params all-gathered in fwd and bwd)</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>ZeRO model-state memory per GPU (reproduces the paper's Figure 1 numbers).</figcaption>
+<pre><code>GB = 1e9
+# ZeRO memory per GPU for model states (Rajbhandari et al. 2019), mixed-precision Adam:
+# 2 bytes bf16 params + 2 bytes grads + K=12 bytes fp32 (master, m, v)
+def zero_bytes(psi, n, stage, K=12):
+    return {0: (4 + K) * psi, 1: 4 * psi + K * psi / n,
+            2: 2 * psi + (2 + K) * psi / n, 3: (4 + K) * psi / n}[stage]
+print("ZeRO model-state memory, psi=7.5B, N_d=64 (paper's example)")
+for st in range(4):
+    print(f"  stage {st}: {zero_bytes(7.5e9, 64, st) / GB:6.1f} GB")</code></pre>
+</figure>
+<pre class="output">ZeRO model-state memory, psi=7.5B, N_d=64 (paper's example)
+  stage 0:  120.0 GB
+  stage 1:   31.4 GB
+  stage 2:   16.6 GB
+  stage 3:    1.9 GB</pre>
+
+<p class="facet">Why stages 1 and 2 are free in bandwidth</p>
+<ul>
+  <li>An all-reduce is a reduce-scatter followed by an all-gather (Chapter 6). ZeRO-2 stops after the reduce-scatter: each rank gets only the summed gradient shard it owns, updates that shard of the parameters, then all-gathers the updated parameters. Same bytes as DDP.</li>
+  <li>ZeRO-3 must all-gather parameters before each layer's forward <em>and</em> again for backward (they were freed), plus reduce-scatter gradients: ≈ <span class="math">3\Psi</span> versus <span class="math">2\Psi</span>, i.e. 1.5×.</li>
+</ul>
+
+<h3>A Mini ZeRO-1</h3>
+<ul>
+  <li>Flatten all parameters into one padded buffer of <span class="math">N_d \times \text{shard}</span> elements.</li>
+  <li>Each rank owns one shard: its FP32 master weights and Adam <span class="math">m, v</span> exist only for that slice.</li>
+  <li>Step: average gradients; update own shard; all-gather shards to rebuild full parameters.</li>
+  <li>gloo lacks an efficient reduce-scatter for this, so the sketch uses all-reduce and slices; NCCL implementations use <code>reduce_scatter_tensor</code>.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>ZeRO-1 optimiser-state sharding on 4 gloo processes, verified against <code>torch.optim.Adam</code> after 5 steps.</figcaption>
+<pre><code>import os, torch, torch.nn as nn, torch.distributed as dist, torch.multiprocessing as mp
+
+WORLD, STEPS, LR = 4, 5, 1e-2
+
+def make_model():
+    torch.manual_seed(0)
+    return nn.Sequential(nn.Linear(32, 64), nn.Tanh(), nn.Linear(64, 1))
+
+def batch(step, rank=None, world=1):
+    g = torch.Generator().manual_seed(1000 + step)
+    X = torch.randn(64, 32, generator=g); y = X[:, :4].sum(1, keepdim=True)
+    if rank is None: return X, y
+    per = 64 // world
+    return X[rank * per:(rank + 1) * per], y[rank * per:(rank + 1) * per]
+
+class ZeRO1Adam:
+    """Adam whose m, v and fp32 master weights exist only for this rank's shard."""
+    def __init__(self, params, lr, betas=(0.9, 0.999), eps=1e-8):
+        self.params = list(params)
+        self.rank, self.world = dist.get_rank(), dist.get_world_size()
+        n = sum(p.numel() for p in self.params)
+        self.shard = -(-n // self.world)                       # ceil
+        self.n, self.lr, (self.b1, self.b2), self.eps, self.t = n, lr, betas, eps, 0
+        flat = self._flat([p.data for p in self.params])
+        lo = self.rank * self.shard
+        self.master = flat[lo:lo + self.shard].clone()         # (shard,)
+        self.m = torch.zeros_like(self.master); self.v = torch.zeros_like(self.master)
+
+    def _flat(self, ts):                                       # pad to world * shard
+        f = torch.cat([t.reshape(-1) for t in ts])
+        return torch.cat([f, f.new_zeros(self.world * self.shard - self.n)])
+
+    def step(self):
+        g = self._flat([p.grad for p in self.params])
+        dist.all_reduce(g); g /= self.world    # real ZeRO: reduce_scatter (half the bytes)
+        lo = self.rank * self.shard
+        g = g[lo:lo + self.shard]
+        self.t += 1
+        self.m.mul_(self.b1).add_(g, alpha=1 - self.b1)
+        self.v.mul_(self.b2).addcmul_(g, g, value=1 - self.b2)
+        mh, vh = self.m / (1 - self.b1 ** self.t), self.v / (1 - self.b2 ** self.t)
+        self.master -= self.lr * mh / (vh.sqrt() + self.eps)
+        full = [torch.empty_like(self.master) for _ in range(self.world)]
+        dist.all_gather(full, self.master)                     # rebuild full params
+        flat, off = torch.cat(full), 0
+        for p in self.params:
+            p.data.copy_(flat[off:off + p.numel()].view_as(p)); off += p.numel()
+
+    def state_bytes(self):
+        return 4 * (self.master.numel() + self.m.numel() + self.v.numel())
+
+def worker(rank, world, q):
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT="29512",
+                      GLOO_SOCKET_IFNAME="lo0")
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", rank=rank, world_size=world)
+    model = make_model(); opt = ZeRO1Adam(model.parameters(), LR)
+    for s in range(STEPS):
+        for p in model.parameters(): p.grad = None
+        X, y = batch(s, rank, world)
+        nn.functional.mse_loss(model(X), y).backward()
+        opt.step()
+    if rank == 0:
+        q.put((torch.cat([p.data.view(-1) for p in model.parameters()]).numpy(),
+               opt.state_bytes()))
+    dist.destroy_process_group()
+
+if __name__ == "__main__":
+    q = mp.get_context("spawn").SimpleQueue()
+    mp.spawn(worker, args=(WORLD, q), nprocs=WORLD, join=True)
+    zero_params, zero_state = q.get()
+    model = make_model(); opt = torch.optim.Adam(model.parameters(), lr=LR)
+    for s in range(STEPS):
+        opt.zero_grad(); X, y = batch(s)
+        nn.functional.mse_loss(model(X), y).backward(); opt.step()
+    ref = torch.cat([p.data.view(-1) for p in model.parameters()])
+    full_state = 4 * 3 * ref.numel()       # fp32 master + m + v, unsharded
+    print(f"params={ref.numel()}  world={WORLD}  steps={STEPS}")
+    print("max |ZeRO-1 - torch.optim.Adam| =",
+          (torch.from_numpy(zero_params) - ref).abs().max().item())
+    print(f"optimiser state per rank: {zero_state} B vs unsharded {full_state} B "
+          f"({zero_state / full_state:.2f}x)")</code></pre>
+</figure>
+<pre class="output">params=2177  world=4  steps=5
+max |ZeRO-1 - torch.optim.Adam| = 2.9802322387695312e-08
+optimiser state per rank: 6540 B vs unsharded 26124 B (0.25x)</pre>
+
+<ul>
+  <li>Five sharded Adam steps match PyTorch's Adam to 3e-8, and each rank holds a quarter of the optimiser state.</li>
+  <li>Here model parameters are FP32, so the "master" copy duplicates them; in a real run the model holds BF16 weights and only the shard owner keeps FP32.</li>
+  <li>Gradient clipping must compute the <em>global</em> norm: each rank computes the squared norm of its shard, then all-reduce the scalar. Clipping by a local norm is a classic ZeRO bug.</li>
+</ul>
+
+<h3>PyTorch FSDP</h3>
+<ul>
+  <li>Zhao et al. (2023): FSDP is ZeRO-3 as a PyTorch-native wrapper. Each wrapped unit (typically one transformer block) owns a <code>FlatParameter</code> sharded across ranks.</li>
+  <li><strong>Forward:</strong> all-gather the unit's parameters, compute, free the unsharded copy. <strong>Backward:</strong> all-gather again, compute gradients, reduce-scatter them, free.</li>
+  <li><strong>Prefetch:</strong> issue the next unit's all-gather while the current unit computes (forward and backward prefetch), hiding communication.</li>
+  <li><strong>Hybrid sharding (HSDP):</strong> shard within a node (fast NVLink), replicate across nodes, and all-reduce across replicas. Limits all-gather traffic to NVLink.</li>
+  <li><strong>FSDP2</strong> (<code>fully_shard</code>) represents each parameter as a DTensor sharded on dim 0 instead of a flat buffer, which composes with tensor parallelism and makes per-parameter state dicts natural.</li>
+  <li>Mixed precision policy: parameters all-gathered in BF16, gradients reduced in FP32 or BF16, sharded master weights in FP32.</li>
+</ul>
+
+<div class="frame simple"><p class="facet">Simple Version</p>
+  <p>ZeRO-1 via <code>torch.distributed.optim.ZeroRedundancyOptimizer</code> around a DDP model. No model changes; ≈ 4× less optimiser memory at 4 ranks.</p></div>
+<div class="frame production"><p class="facet">Production Version</p>
+  <p>FSDP2 per transformer block, HSDP across nodes, BF16 all-gather, FP32 reduce, prefetch, activation checkpointing per block, sharded distributed checkpoints (Chapter 11), and TP inside the node through the same DTensor device mesh.</p></div>
+<div class="frame why-complex"><p class="facet">Why It Is Complicated</p>
+  <p>Wrapping granularity trades memory against the number of collectives; prefetch depth trades memory against overlap; any rank-dependent control flow in a wrapped module deadlocks; and state dicts must be gathered or saved sharded without OOM on rank 0.</p></div>
+
+<aside class="callout warning"><span class="title">When ZeRO-3/FSDP is not enough</span>
+  <ul>
+    <li>Activations are not sharded by ZeRO. At long sequence lengths they dominate, and you need TP/SP or context parallelism.</li>
+    <li>At thousands of GPUs, per-layer all-gathers across the whole DP group become latency-bound. Keep the sharding group small (HSDP) and add TP/PP.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="tensor-parallel">Tensor and Sequence Parallelism</h2>
+<p class="chapter-lede">Tensor parallelism splits individual matrix multiplications across GPUs. It
+shrinks parameters, gradients and most activations per GPU, at the price of collectives inside
+every layer.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>A single transformer layer of a 70B model has ≈ 0.86B parameters and gigabytes of activations.
+  Sharding across data-parallel ranks does not reduce per-micro-batch activation memory, and one GPU's
+  matmul throughput caps per-layer speed. You want one layer to run on several GPUs at once.</p>
+</div>
+
+<h3>Megatron-LM Column and Row Parallelism</h3>
+<ul>
+  <li>Shoeybi et al. (2019). For the MLP <span class="math">Y = \text{GeLU}(XA)\,B</span>:</li>
+  <li><strong>Column-parallel <span class="math">A</span>:</strong> <span class="math">A = [A_1, A_2]</span>. Each rank computes <span class="math">\text{GeLU}(XA_i)</span> independently: GeLU is elementwise, so no communication is needed between the two matmuls.</li>
+  <li><strong>Row-parallel <span class="math">B</span>:</strong> <span class="math">B = [B_1; B_2]</span>. Each rank computes a partial <span class="math">Y_i = \text{GeLU}(XA_i)B_i</span>; <span class="math">Y = \sum_i Y_i</span> needs one all-reduce.</li>
+  <li>Two conjugate operators: <span class="math">f</span> is identity in forward and all-reduce in backward (at the block input); <span class="math">g</span> is all-reduce in forward and identity in backward (at the block output).</li>
+  <li>Attention is split the same way by heads: Q, K, V projections column-parallel, output projection row-parallel.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  X["X (replicated)"] --> F["f: identity fwd / all-reduce bwd"]
+  F --> A1["rank 0: GeLU(X A1)"]
+  F --> A2["rank 1: GeLU(X A2)"]
+  A1 --> B1["rank 0: partial Y1 = H1 B1"]
+  A2 --> B2["rank 1: partial Y2 = H2 B2"]
+  B1 --> G["g: all-reduce fwd / identity bwd"]
+  B2 --> G
+  G --> Y["Y (replicated)"]</pre>
+<figcaption>Megatron MLP with TP = 2: one all-reduce in forward and one in backward.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption>Column-parallel then row-parallel MLP on 2 gloo processes, with Megatron's f and g operators; outputs and all gradients verified against the unsharded MLP.</figcaption>
+<pre><code>import os, torch, torch.nn.functional as F, torch.distributed as dist
+import torch.multiprocessing as mp
+
+TP, B, T, D = 2, 4, 8, 16                         # hidden 4D = 64 split across TP ranks
+
+class CopyToTP(torch.autograd.Function):          # Megatron "f": id fwd, all-reduce bwd
+    @staticmethod
+    def forward(ctx, x): return x
+    @staticmethod
+    def backward(ctx, g):
+        g = g.clone(); dist.all_reduce(g); return g
+
+class ReduceFromTP(torch.autograd.Function):      # Megatron "g": all-reduce fwd, id bwd
+    @staticmethod
+    def forward(ctx, x):
+        x = x.clone(); dist.all_reduce(x); return x
+    @staticmethod
+    def backward(ctx, g): return g
+
+def full_weights():
+    torch.manual_seed(0)
+    return torch.randn(D, 4 * D) * 0.1, torch.randn(4 * D, D) * 0.1   # A, B
+
+def worker(rank, world, q):
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT="29513",
+                      GLOO_SOCKET_IFNAME="lo0")
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", rank=rank, world_size=world)
+    A, Bw = full_weights()
+    cols = slice(rank * 4 * D // world, (rank + 1) * 4 * D // world)
+    A_loc = A[:, cols].clone().requires_grad_()   # column-parallel: (D, 4D/TP)
+    B_loc = Bw[cols, :].clone().requires_grad_()  # row-parallel:    (4D/TP, D)
+    x = torch.randn(B, T, D, generator=torch.Generator().manual_seed(7)).requires_grad_()
+    h = F.gelu(CopyToTP.apply(x) @ A_loc)         # (B, T, 4D/TP): no comm needed
+    y = ReduceFromTP.apply(h @ B_loc)             # (B, T, D): partial sums all-reduced
+    y.square().sum().backward()
+    q.put((rank, y.detach().numpy(), x.grad.numpy(),
+           A_loc.grad.numpy(), B_loc.grad.numpy()))
+    dist.destroy_process_group()
+
+if __name__ == "__main__":
+    q = mp.get_context("spawn").SimpleQueue()
+    mp.spawn(worker, args=(TP, q), nprocs=TP, join=True)
+    res = dict((r[0], r[1:]) for r in (q.get() for _ in range(TP)))
+    A, Bw = full_weights(); A.requires_grad_(); Bw.requires_grad_()
+    x = torch.randn(B, T, D, generator=torch.Generator().manual_seed(7)).requires_grad_()
+    y = F.gelu(x @ A) @ Bw
+    y.square().sum().backward()
+    t = torch.from_numpy
+    dA = torch.cat([t(res[r][2]) for r in range(TP)], dim=1)    # column shards
+    dB = torch.cat([t(res[r][3]) for r in range(TP)], dim=0)    # row shards
+    for name, a, b in [("output y", t(res[0][0]), y), ("output y (rank 1)", t(res[1][0]), y),
+                       ("dL/dx", t(res[0][1]), x.grad),
+                       ("dL/dA", dA, A.grad), ("dL/dB", dB, Bw.grad)]:
+        print(f"{name:18s} max abs diff = {(a - b.detach()).abs().max().item():.2e}")
+    act = B * T * D * 4
+    print(f"comm per MLP: fwd 1 all-reduce of {act} B, bwd 1 all-reduce of {act} B")</code></pre>
+</figure>
+<pre class="output">output y           max abs diff = 1.19e-07
+output y (rank 1)  max abs diff = 1.19e-07
+dL/dx              max abs diff = 1.19e-07
+dL/dA              max abs diff = 9.54e-07
+dL/dB              max abs diff = 4.77e-07
+comm per MLP: fwd 1 all-reduce of 2048 B, bwd 1 all-reduce of 2048 B</pre>
+
+<ul>
+  <li>Both ranks hold the full output; the concatenated weight-gradient shards equal the unsharded gradients to FP32 rounding.</li>
+  <li>Without the <span class="math">f</span> operator, <code>dL/dx</code> on each rank would only include its own half of the hidden units: the most common hand-written TP bug.</li>
+</ul>
+
+<h3>Communication Cost</h3>
+<ul>
+  <li>Per layer (attention + MLP), TP needs 2 all-reduces in forward and 2 in backward, each of the full activation <span class="math">sbh</span> elements (BF16: <span class="math">2sbh</span> bytes).</li>
+  <li>For a 70B layer (<span class="math">h = 8192</span>, <span class="math">s = 4096</span>, <span class="math">b = 1</span>): one activation is 64 MiB; ring all-reduce over <span class="math">t = 8</span> sends ≈ <span class="math">2 \cdot \frac{7}{8} \cdot 64 \approx 112</span> MiB per rank. Four per layer ≈ 450 MiB, 80 layers ≈ 35 GiB per step per micro-batch.</li>
+  <li>At NVLink ≈ 450 GB/s per direction (H100 NVLink 4) this is ≈ 0.08 s; over ≈ 50 GB/s InfiniBand per GPU it would be ≈ 0.7 s and fully on the critical path. <strong>Keep TP inside the NVLink domain.</strong></li>
+  <li>TP communication cannot be hidden by bucketing: each all-reduce blocks the next matmul. Overlap needs collective-matmul decomposition (e.g. async TP / "TP comm overlap").</li>
+</ul>
+
+<h3>Sequence Parallelism</h3>
+<ul>
+  <li>Korthikanti et al. (2022): LayerNorm and dropout regions are replicated under TP, so their activations (≈ <span class="math">10sbh</span> of the 34) are not sharded.</li>
+  <li>Split those regions along the sequence dimension. Replace each all-reduce with a <strong>reduce-scatter</strong> (into sequence shards) and an <strong>all-gather</strong> (before the next TP region). Same total bytes, since all-reduce = reduce-scatter + all-gather.</li>
+  <li>Result: all activations divided by <span class="math">t</span>, giving the <span class="math">34sbh/t</span> term used in Chapter 10.</li>
+</ul>
+
+<h3>Context Parallelism and Ring Attention</h3>
+<ul>
+  <li>For 128K+ context, even <span class="math">sbh/t</span> is too large. Context parallelism (CP) shards the sequence across ranks for <em>all</em> layers, including attention.</li>
+  <li>Attention needs every key/value: ring attention (Liu et al. 2023) passes K/V blocks around a ring while each rank computes blockwise attention with online softmax, overlapping transfer with compute.</li>
+  <li>Llama 3 used CP = 16 with an all-gather of K/V (not a ring) during the 128K long-context phase (Dubey et al. 2024).</li>
+  <li>Causal masking unbalances work across sequence shards; assign each rank two chunks (one early, one late) to balance.</li>
+</ul>
+
+<table>
+  <caption>What each intra-layer strategy shards.</caption>
+  <thead><tr><th>Strategy</th><th>Weights</th><th>Activations</th><th>Collectives</th><th>Scope</th></tr></thead>
+  <tbody>
+    <tr><td>TP</td><td>÷ t</td><td>Most ÷ t (not norms)</td><td>All-reduce ×4 per layer</td><td>Inside node</td></tr>
+    <tr><td>TP + SP</td><td>÷ t</td><td>All ÷ t</td><td>RS + AG ×4 per layer</td><td>Inside node</td></tr>
+    <tr><td>CP</td><td>Replicated (or with FSDP)</td><td>÷ cp</td><td>K/V ring or all-gather per layer</td><td>Inside or across nodes</td></tr>
+  </tbody>
+</table>
+</section>
+
+<!-- ================================================================ CHAPTER 9 -->
+<section class="chapter">
+<h2 id="pipeline">Pipeline Parallelism</h2>
+<p class="chapter-lede">Pipeline parallelism splits the model by layers into stages on different GPUs.
+Its communication is tiny and point-to-point, so it crosses slow links well; its cost is idle time,
+the bubble.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>TP must stay inside an 8-GPU node, and a 405B model does not fit in 8 GPUs even with ZeRO-1.
+  You need to split the model across nodes, over InfiniBand, without an all-reduce on every layer.</p>
+</div>
+
+<h3>Naive Pipelining and Micro-Batches</h3>
+<ul>
+  <li>With <span class="math">p</span> stages and one batch, only one stage works at a time: utilisation <span class="math">1/p</span>.</li>
+  <li>GPipe (Huang et al. 2018) splits the batch into <span class="math">m</span> micro-batches, runs all forwards, then all backwards, and applies one synchronous update. Bubble fraction (idle over total, with <span class="math">t_f, t_b</span> per micro-batch per stage):
+  <div class="math">\text{bubble} = \frac{(p-1)(t_f + t_b)}{(m + p - 1)(t_f + t_b)} = \frac{p-1}{m+p-1}</div></li>
+  <li>GPipe's flaw: every stage stores activations for all <span class="math">m</span> micro-batches before the first backward. Memory grows with <span class="math">m</span>, and <span class="math">m</span> must be large to shrink the bubble.</li>
+  <li><strong>1F1B</strong> (PipeDream-Flush; Narayanan et al. 2021): after <span class="math">p - s - 1</span> warm-up forwards, stage <span class="math">s</span> alternates one forward with one backward. Same bubble, but at most <span class="math">p - s</span> micro-batches in flight: memory bounded by <span class="math">p</span>, not <span class="math">m</span>.</li>
+  <li><strong>Interleaved 1F1B</strong> (Narayanan et al. 2021): each GPU holds <span class="math">v</span> non-contiguous chunks of layers; bubble becomes <span class="math">\frac{1}{v}\frac{p-1}{m}</span> (relative to ideal time) at the cost of <span class="math">v\times</span> more point-to-point messages.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>A dependency-driven pipeline simulator for GPipe and 1F1B (t_f = 1, t_b = 2); prints the timeline, bubble and peak in-flight micro-batches per stage.</figcaption>
+<pre><code>def schedule(kind, p, m):
+    """Per-stage ordered op lists: ('F', i) or ('B', i)."""
+    orders = []
+    for s in range(p):
+        if kind == "gpipe":
+            ops = [("F", i) for i in range(m)] + [("B", i) for i in reversed(range(m))]
+        else:                                          # 1F1B (PipeDream-Flush)
+            warm = min(p - s - 1, m)
+            ops = [("F", i) for i in range(warm)]
+            f, b = warm, 0
+            while b &lt; m:
+                if f &lt; m: ops.append(("F", f)); f += 1
+                ops.append(("B", b)); b += 1
+        orders.append(ops)
+    return orders
+
+def simulate(kind, p, m, tf=1, tb=2):
+    orders, done, t_free = schedule(kind, p, m), {}, [0] * p
+    ptr, grid = [0] * p, [[] for _ in range(p)]
+    live, peak = [0] * p, [0] * p
+    while any(ptr[s] &lt; len(orders[s]) for s in range(p)):
+        progressed = False
+        for s in range(p):
+            if ptr[s] == len(orders[s]): continue
+            op, i = orders[s][ptr[s]]
+            deps = [("F", s - 1, i)] if op == "F" and s &gt; 0 else []
+            if op == "B":
+                deps = [("F", s, i)] + ([("B", s + 1, i)] if s &lt; p - 1 else [])
+            if all(d in done for d in deps):
+                start = max([t_free[s]] + [done[d] for d in deps])
+                dur = tf if op == "F" else tb
+                grid[s] += ["."] * (start - len(grid[s]))
+                grid[s] += [f"{op}{i}" if k == 0 else op.lower() for k in range(dur)]
+                done[(op, s, i)] = t_free[s] = start + dur
+                live[s] += 1 if op == "F" else -1; peak[s] = max(peak[s], live[s])
+                ptr[s] += 1; progressed = True
+        assert progressed, "deadlock"
+    T = max(t_free)
+    busy = p * m * (tf + tb)
+    return grid, T, 1 - busy / (p * T), peak
+
+for kind in ["gpipe", "1f1b"]:
+    grid, T, bubble, peak = simulate(kind, p=4, m=8)
+    print(f"{kind}: p=4 m=8 makespan={T} bubble={bubble:.1%} "
+          f"theory={(4 - 1) / (8 + 4 - 1):.1%} peak in-flight micro-batches={peak}")
+    for s, row in enumerate(grid):
+        print(f"  stage {s}: " + "".join(c[:2].ljust(2) for c in row))
+print("\nbubble vs micro-batches (p=8):")
+for m in [8, 16, 32, 64]:
+    g1, T1, b1, pk1 = simulate("gpipe", 8, m); g2, T2, b2, pk2 = simulate("1f1b", 8, m)
+    print(f"  m={m:3d} gpipe bubble={b1:5.1%} peak={max(pk1):3d} | "
+          f"1f1b bubble={b2:5.1%} peak={max(pk2):2d}")</code></pre>
+</figure>
+<pre class="output">gpipe: p=4 m=8 makespan=33 bubble=27.3% theory=27.3% peak in-flight micro-batches=[8, 8, 8, 8]
+  stage 0: F0F1F2F3F4F5F6F7. . . . . . . . . B7b B6b B5b B4b B3b B2b B1b B0b 
+  stage 1: . F0F1F2F3F4F5F6F7. . . . . . B7b B6b B5b B4b B3b B2b B1b B0b 
+  stage 2: . . F0F1F2F3F4F5F6F7. . . B7b B6b B5b B4b B3b B2b B1b B0b 
+  stage 3: . . . F0F1F2F3F4F5F6F7B7b B6b B5b B4b B3b B2b B1b B0b 
+1f1b: p=4 m=8 makespan=33 bubble=27.3% theory=27.3% peak in-flight micro-batches=[4, 3, 2, 1]
+  stage 0: F0F1F2F3. . . . . . B0b F4B1b F5B2b F6B3b F7B4b . B5b . B6b . B7b 
+  stage 1: . F0F1F2. . . . B0b F3B1b F4B2b F5B3b F6B4b F7B5b . B6b . B7b 
+  stage 2: . . F0F1. . B0b F2B1b F3B2b F4B3b F5B4b F6B5b F7B6b . B7b 
+  stage 3: . . . F0B0b F1B1b F2B2b F3B3b F4B4b F5B5b F6B6b F7B7b 
+
+bubble vs micro-batches (p=8):
+  m=  8 gpipe bubble=46.7% peak=  8 | 1f1b bubble=46.7% peak= 8
+  m= 16 gpipe bubble=30.4% peak= 16 | 1f1b bubble=30.4% peak= 8
+  m= 32 gpipe bubble=17.9% peak= 32 | 1f1b bubble=17.9% peak= 8
+  m= 64 gpipe bubble= 9.9% peak= 64 | 1f1b bubble= 9.9% peak= 8</pre>
+
+<p class="facet">Reading the timeline</p>
+<ul>
+  <li>Each two-character column is one time unit. <code>F3</code> is the forward of micro-batch 3; <code>B3b</code> is its backward, which takes two units; <code>.</code> is idle.</li>
+  <li>The simulated bubble equals <span class="math">(p-1)/(m+p-1)</span> exactly for both schedules: 1F1B does not reduce the bubble.</li>
+  <li>What 1F1B changes is memory: stage 0 holds 4 micro-batches (= <span class="math">p</span>) instead of 8 (= <span class="math">m</span>). At <span class="math">m = 64</span>, GPipe needs 8× the activation memory of 1F1B for the same bubble.</li>
+  <li>Stage 0 holds the most activations under 1F1B. Its memory, not the average stage's, decides whether a layout fits (Chapter 10).</li>
+</ul>
+
+<h3>Practical Issues</h3>
+<ul class="failure-modes">
+  <li><strong>Imbalanced stages:</strong> the embedding and the output projection plus loss (large vocabulary) make the first and last stages heavier. Llama 3 removed one layer from each (Dubey et al. 2024); others place fewer layers there.</li>
+  <li><strong>Batch-size coupling:</strong> <span class="math">m = \text{global batch} / (\text{DP} \times b_{micro})</span>. Increasing DP shrinks <span class="math">m</span> and grows the bubble; early in training, when the batch is small, pipelines are least efficient.</li>
+  <li><strong>Tied embeddings</strong> live on the first and last stages; their gradients must be all-reduced between those two stages.</li>
+  <li><strong>Deadlocks:</strong> blocking <code>send</code>/<code>recv</code> must be ordered consistently or batched (<code>batch_isend_irecv</code>).</li>
+</ul>
+
+<aside class="callout advanced"><span class="title">Zero-bubble schedules</span>
+  <ul>
+    <li>Splitting backward into input-gradient (B) and weight-gradient (W) computation lets W fill bubbles, since W is not on the critical path to the previous stage (Qi et al. 2023, "Zero Bubble Pipeline Parallelism"). DeepSeek-V3's DualPipe also overlaps forward and backward communication.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 10 -->
+<section class="chapter">
+<h2 id="layout">3D/4D Parallelism and Topology</h2>
+<p class="chapter-lede">No single strategy scales to thousands of GPUs. Real runs combine data,
+tensor, pipeline and context parallelism, and map each onto the part of the network that can carry
+its traffic.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>You have 64 H100 80 GB GPUs in 8 nodes (8 GPUs per node, NVLink inside, InfiniBand between)
+  and a 70B dense model to pretrain at sequence length 4,096 with a 4M-token global batch. Choose
+  TP, PP, DP, sharding and recomputation so that it fits and runs fast.</p>
+</div>
+
+<h3>Topology</h3>
+<table>
+  <caption>Interconnects (approximate per-GPU figures for an H100 SXM cluster).</caption>
+  <thead><tr><th>Link</th><th class="num">Bandwidth per GPU</th><th>Latency</th><th>Carries</th></tr></thead>
+  <tbody>
+    <tr><td>HBM3</td><td class="num">≈ 3,350 GB/s</td><td>—</td><td>Kernels</td></tr>
+    <tr><td>NVLink 4 via NVSwitch (intra-node)</td><td class="num">≈ 450 GB/s per direction</td><td>≈ µs</td><td>TP, SP, EP; intra-node DP/FSDP</td></tr>
+    <tr><td>InfiniBand NDR 400 Gb/s (inter-node)</td><td class="num">≈ 50 GB/s per direction</td><td>≈ few µs</td><td>DP, PP, CP</td></tr>
+    <tr><td>PCIe Gen5 x16</td><td class="num">≈ 64 GB/s per direction</td><td>≈ µs</td><td>Host offload, data loading</td></tr>
+  </tbody>
+</table>
+
+<h3>Rules of Thumb for Ordering</h3>
+<ol>
+  <li><strong>TP</strong> inside the node (highest traffic, blocking). Rarely beyond 8.</li>
+  <li><strong>PP</strong> across nodes when model states + activations still do not fit. Low traffic, costs bubble.</li>
+  <li><strong>CP</strong> when sequence length makes activations too large even with TP + SP + recompute.</li>
+  <li><strong>DP</strong> (with ZeRO-1 or FSDP) over everything else. Communication overlaps with backward; limited by critical batch size.</li>
+  <li>Prefer less recomputation over more parallelism when memory allows; prefer ZeRO-1 over ZeRO-3 when parameters fit, because it avoids per-layer all-gathers.</li>
+</ol>
+<div class="math">\text{world} = TP \times CP \times PP \times DP</div>
+
+<h3>Worked Example: 70B on 64 GPUs</h3>
+<ul>
+  <li>Llama-2-70B-like shape: 80 layers, <span class="math">h = 8192</span>, GQA with 8 KV heads, SwiGLU FFN 28,672, vocabulary 32,000.</li>
+  <li>Model states per GPU: BF16 weights (2 B) + FP32 gradient accumulation (4 B) over <span class="math">\Psi/(TP \cdot PP)</span>, plus ZeRO-1 optimiser state <span class="math">12\Psi/(TP \cdot PP \cdot DP)</span>.</li>
+  <li>Activations on stage 0 under 1F1B: <span class="math">p</span> micro-batches in flight × <span class="math">L/p</span> layers = <span class="math">L</span> layers' worth, independent of <span class="math">p</span>. Per layer <span class="math">34sbh/t</span> (TP + SP, FlashAttention) or <span class="math">2sbh/t</span> with full recompute.</li>
+  <li>Budget: 90 % of 80 GB, with 4 GB reserved for workspace and fragmentation (an assumption; measure it).</li>
+  <li>Ignored for brevity: embedding/LM head on the end stages, communication buffers, and the extra FLOPs of recompute. These are real and change the answer at the margin.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Enumerate TP × PP × DP layouts for a 70B model on 64 × 80 GB GPUs; keep the ones that fit (same script as the ZeRO memory listing, so <code>GB = 1e9</code>).</figcaption>
+<pre><code># 70B dense decoder, Llama-2-70B-like shape
+L, h, ffn, V, s, gbs_tokens = 80, 8192, 28672, 32000, 4096, 4 * 2**20
+kv = h // 8                                        # GQA: 8 KV heads of 64
+per_layer = h * h * 2 + h * kv * 2 + 3 * h * ffn   # q,o + k,v + SwiGLU
+P = L * per_layer + 2 * V * h
+print(f"\nparams = {P / 1e9:.1f} B   global batch = {gbs_tokens // s} seqs x {s} tokens")
+
+def mem_per_gpu(tp, pp, dp, recompute, mb=1):
+    psi = P / (tp * pp)                            # params held by this GPU
+    states = 2 * psi + 4 * psi + 12 * psi / dp     # bf16 w, fp32 grad acc, ZeRO-1 opt
+    sbh = s * mb * h
+    per_layer_act = (34 * sbh / tp) if not recompute else (2 * sbh / tp)  # SP on
+    # 1F1B: stage 0 holds pp micro-batches of (L/pp) layers =&gt; ~L layers of activations
+    acts = L * per_layer_act
+    return states, acts
+
+rows = []
+for tp in [1, 2, 4, 8]:
+    for pp in [1, 2, 4, 8, 16]:
+        if 64 % (tp * pp) or L % pp: continue
+        dp = 64 // (tp * pp)
+        for rc in [False, True]:
+            st, ac = mem_per_gpu(tp, pp, dp, rc)
+            m = gbs_tokens // s // dp              # micro-batches per pipeline (mb=1)
+            bubble = (pp - 1) / (m + pp - 1)
+            total = (st + ac) / GB + 4             # +4 GB workspace/fragmentation (guess)
+            if total &lt;= 80 * 0.9:
+                rows.append((tp, pp, dp, rc, st / GB, ac / GB, total, bubble))
+print(f"\n{'TP':&gt;2} {'PP':&gt;3} {'DP':&gt;3} {'recomp':&gt;6} {'states':&gt;7} {'acts':&gt;6} "
+      f"{'total':&gt;6} {'bubble':&gt;7}")
+for tp, pp, dp, rc, st, ac, tot, bub in rows:
+    print(f"{tp:2d} {pp:3d} {dp:3d} {'full' if rc else 'none':&gt;6} {st:6.1f}G {ac:5.1f}G "
+          f"{tot:5.1f}G {bub:7.1%}")</code></pre>
+</figure>
+<pre class="output">params = 69.0 B   global batch = 1024 seqs x 4096 tokens
+
+TP  PP  DP recomp  states   acts  total  bubble
+ 1  16   4   full   38.8G   5.4G  48.2G    5.5%
+ 2   4   8   full   64.7G   2.7G  71.3G    2.3%
+ 2   8   4   full   38.8G   2.7G  45.5G    2.7%
+ 2  16   2   full   25.9G   2.7G  32.6G    2.8%
+ 4   2   8   full   64.7G   1.3G  70.0G    0.8%
+ 4   4   4   none   38.8G  22.8G  65.6G    1.2%
+ 4   4   4   full   38.8G   1.3G  44.1G    1.2%
+ 4   8   2   none   25.9G  22.8G  52.7G    1.3%
+ 4   8   2   full   25.9G   1.3G  31.2G    1.3%
+ 4  16   1   none   19.4G  22.8G  46.2G    1.4%
+ 4  16   1   full   19.4G   1.3G  24.7G    1.4%
+ 8   1   8   full   64.7G   0.7G  69.3G    0.0%
+ 8   2   4   none   38.8G  11.4G  54.2G    0.4%
+ 8   2   4   full   38.8G   0.7G  43.5G    0.4%
+ 8   4   2   none   25.9G  11.4G  41.3G    0.6%
+ 8   4   2   full   25.9G   0.7G  30.5G    0.6%
+ 8   8   1   none   19.4G  11.4G  34.8G    0.7%
+ 8   8   1   full   19.4G   0.7G  24.1G    0.7%</pre>
+
+<p class="facet">Choosing among the feasible layouts</p>
+<ol>
+  <li><strong>Drop layouts with full recompute if a no-recompute layout fits.</strong> Full recompute costs ≈ 33 % more FLOPs; the bubble differences here are ≈ 1 %.</li>
+  <li><strong>Prefer larger TP inside the node to deeper PP across nodes.</strong> Every TP ≤ 8 stays on NVLink, but TP = 4 leaves 22.8 GB of activations and needs PP ≥ 4 across InfiniBand.</li>
+  <li><strong>Remaining candidates without recompute:</strong> (TP 8, PP 2, DP 4) at 54 GB; (TP 8, PP 4, DP 2) at 41 GB; (TP 4, PP 4, DP 4) at 66 GB.</li>
+  <li><strong>Pick TP 8, PP 2, DP 4.</strong> TP on NVLink; one pipeline boundary over InfiniBand; 256 micro-batches per pipeline per step give a 0.4 % bubble; DP = 4 keeps the ZeRO-1 gather/scatter small; ≈ 18 GB headroom for the end-stage embedding and LM head, buffers and a <span class="math">b_{micro} = 2</span> experiment.</li>
+  <li><strong>Fallbacks:</strong> if the measured peak exceeds the budget, move to PP 4 (41 GB) or turn on selective recompute before full recompute.</li>
+</ol>
+
+<aside class="callout core"><span class="title">Sanity check: time</span>
+  <ul>
+    <li>Chinchilla-optimal 1.4T tokens: <span class="math">6 \times 69\text{e}9 \times 1.4\text{e}12 = 5.8\text{e}23</span> FLOPs. At 40 % MFU on 64 H100s: <span class="math">5.8\text{e}23 / (64 \times 989\text{e}12 \times 0.4) \approx 2.3\text{e}7</span> s ≈ 265 days.</li>
+    <li>The layout fits; the cluster is too small for the schedule. The next decision is 512+ GPUs (DP 32) or a smaller model. Memory feasibility and time feasibility are separate checks.</li>
+  </ul>
+</aside>
+
+<h3>A Reference Point: Llama 3 405B</h3>
+<table>
+  <caption>Llama 3 405B layouts, from Dubey et al. 2024 (Table 4); figures approximate.</caption>
+  <thead><tr><th class="num">GPUs</th><th class="num">TP</th><th class="num">CP</th><th class="num">PP</th><th class="num">DP</th><th class="num">Seq len</th><th class="num">MFU</th></tr></thead>
+  <tbody>
+    <tr><td class="num">8,192</td><td class="num">8</td><td class="num">1</td><td class="num">16</td><td class="num">64</td><td class="num">8,192</td><td class="num">≈ 43 %</td></tr>
+    <tr><td class="num">16,384</td><td class="num">8</td><td class="num">1</td><td class="num">16</td><td class="num">128</td><td class="num">8,192</td><td class="num">≈ 41 %</td></tr>
+    <tr><td class="num">16,384</td><td class="num">8</td><td class="num">16</td><td class="num">16</td><td class="num">8</td><td class="num">131,072</td><td class="num">≈ 38 %</td></tr>
+  </tbody>
+</table>
+<ul>
+  <li>The ordering is the same as ours: TP 8 in the node, PP across nodes, DP (with FSDP-style sharding) outermost, CP added only for the long-context phase.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">          node 0 (NVLink)                 node 1 (NVLink)
+  +----------------------------+   +----------------------------+
+  | TP group: GPUs 0..7        |   | TP group: GPUs 8..15       |
+  | PP stage 0 (layers 0-39)   |==&gt;| PP stage 1 (layers 40-79)  |   DP replica 0
+  +----------------------------+ IB+----------------------------+
+  nodes 2-3: DP replica 1    nodes 4-5: DP replica 2    nodes 6-7: DP replica 3
+  DP all-reduce / ZeRO-1 groups: same (stage, TP rank) across the 4 replicas, over IB</pre>
+<figcaption>The chosen layout: TP 8 × PP 2 × DP 4 on 8 nodes.</figcaption>
+</figure>
+
+<h3>MFU Accounting</h3>
+<div class="math">\text{MFU} = \frac{6 N \cdot \text{tokens/s}}{n_{GPU} \cdot \text{peak}}\qquad \text{HFU} = \frac{(6+2r) N \cdot \text{tokens/s}}{n_{GPU} \cdot \text{peak}},\ r \in [0, 1] \text{ fraction recomputed}</div>
+<ul>
+  <li>Report MFU, not HFU: recomputation raises HFU while making training slower.</li>
+  <li>Measure step-time breakdown (compute, exposed TP comm, bubble, exposed DP comm, data loading, optimiser) with a profiler before changing the layout.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 11 -->
+<section class="chapter">
+<h2 id="long-runs">Running Long Training Jobs</h2>
+<p class="chapter-lede">A frontier run is a distributed system that must stay correct for months while
+its hardware fails daily. Checkpointing, detection and recovery decide how much of the compute
+budget becomes model.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Llama 3 405B pretraining saw 466 job interruptions in a 54-day snapshot, 419 of them unexpected,
+  ≈ 78 % attributed to hardware (GPUs and HBM most often), yet achieved &gt; 90 % effective training
+  time (Dubey et al. 2024). At 16K GPUs, one interruption every ≈ 3 hours is normal. Recovery must be
+  automatic and fast, and must never silently corrupt the run.</p>
+</div>
+
+<h3>Distributed Checkpointing</h3>
+<ul>
+  <li><strong>Sharded:</strong> every rank writes only the state it owns (ZeRO/FSDP shards, TP slices, its pipeline stage). No rank gathers the whole model.</li>
+  <li><strong>Atomic commit:</strong> write to a temporary location, fsync, then publish a manifest (or rename). A crash mid-save must leave the previous checkpoint valid.</li>
+  <li><strong>Verifiable:</strong> checksums per shard; restore picks the newest checkpoint whose manifest and checksums verify.</li>
+  <li><strong>Reshardable:</strong> restore on a different world size (a lost node, a new layout). Store logical tensor metadata (global shape, offsets), not rank numbers. This is what <code>torch.distributed.checkpoint</code> (DCP) does.</li>
+  <li><strong>Complete:</strong> weights, optimiser state, LR-scheduler step, loss-scaler, every RNG state, and the data loader cursor (Volume 5's resumable sampler). Missing the data cursor re-trains on already seen data.</li>
+  <li><strong>Asynchronous:</strong> copy state to host memory (fast), resume training, write to storage in the background (DCP <code>async_save</code>).</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Sharded checkpoint with per-shard checksums, an atomic manifest commit, crash and corruption handling, and resharding from 4 ranks to 3.</figcaption>
+<pre><code>import hashlib, json, os, shutil, torch
+from pathlib import Path
+ROOT = Path("/tmp/vol6/ckpt"); shutil.rmtree(ROOT, ignore_errors=True)
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+def save_sharded(step, shards, extra):
+    """Each rank writes its own shard; a manifest commits the checkpoint atomically."""
+    tmp, final = ROOT / f"step_{step:07d}.tmp", ROOT / f"step_{step:07d}"
+    tmp.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for rank, shard in enumerate(shards):             # in reality: in parallel, per rank
+        p = tmp / f"shard_{rank:05d}.pt"
+        torch.save(shard, p)
+        with open(p, "rb") as f: os.fsync(f.fileno())
+        entries.append({"file": p.name, "sha256": sha(p), "numel": shard["flat"].numel()})
+    # barrier here; then rank 0 writes the manifest and renames (atomic on POSIX)
+    (tmp / "manifest.json").write_text(json.dumps(
+        {"step": step, "world": len(shards), "shards": entries, **extra}))
+    os.rename(tmp, final)
+    return final
+
+def latest_valid():
+    for d in sorted(ROOT.glob("step_*"), reverse=True):
+        if d.suffix == ".tmp" or not (d / "manifest.json").exists(): continue
+        man = json.loads((d / "manifest.json").read_text())
+        if all(sha(d / e["file"]) == e["sha256"] for e in man["shards"]):
+            return d, man
+        print(f"  {d.name}: checksum mismatch, skipping")
+    raise RuntimeError("no valid checkpoint")
+
+def load_resharded(d, man, new_world):
+    """Reassemble the flat state and split it for a different world size."""
+    flat = torch.cat([torch.load(d / e["file"])["flat"] for e in man["shards"]])
+    return list(flat.tensor_split(new_world))
+
+state = torch.arange(10, dtype=torch.float32)         # stand-in for a flat ZeRO state
+save_sharded(100, [{"flat": t.clone()} for t in state.tensor_split(4)], {"data_cursor": 51200})
+save_sharded(200, [{"flat": (t + 1).clone()} for t in state.tensor_split(4)], {"data_cursor": 102400})
+(ROOT / "step_0000300.tmp").mkdir()                   # crash mid-save: never committed
+with open(ROOT / "step_0000200" / "shard_00002.pt", "r+b") as f:   # silent corruption
+    f.seek(-8, 2); f.write(b"\x00" * 8)
+d, man = latest_valid()
+print(f"restored {d.name} (world={man['world']}, data_cursor={man['data_cursor']})")
+for r, t in enumerate(load_resharded(d, man, new_world=3)):
+    print(f"  new rank {r}: {t.tolist()}")</code></pre>
+</figure>
+<pre class="output">  step_0000200: checksum mismatch, skipping
+restored step_0000100 (world=4, data_cursor=51200)
+  new rank 0: [0.0, 1.0, 2.0, 3.0]
+  new rank 1: [4.0, 5.0, 6.0]
+  new rank 2: [7.0, 8.0, 9.0]</pre>
+<ul>
+  <li>The uncommitted <code>.tmp</code> directory is ignored; the corrupted step 200 is rejected; step 100 restores with its data cursor onto 3 ranks instead of 4.</li>
+  <li><code>.clone()</code> matters: <code>torch.save</code> on a view writes the whole underlying storage, so un-cloned shards would each contain the full tensor.</li>
+  <li>Keep at least two committed checkpoints plus periodic long-lived ones; divergence is often noticed after the next checkpoint has been written.</li>
+</ul>
+
+<p class="facet">Checkpoint interval</p>
+<ul>
+  <li>Young's approximation: optimal interval <span class="math">\tau \approx \sqrt{2\,\delta\,M}</span>, with <span class="math">\delta</span> the time to save (blocking part only) and <span class="math">M</span> the mean time between failures of the whole job.</li>
+  <li>Example: <span class="math">\delta = 30</span> s blocking, <span class="math">M = 3</span> h ⇒ <span class="math">\tau \approx \sqrt{2 \cdot 30 \cdot 10800} \approx 805</span> s, about every 13 minutes. Asynchronous saves shrink <span class="math">\delta</span> and hence <span class="math">\tau</span>.</li>
+  <li>Expected waste per failure ≈ <span class="math">\tau/2</span> + restart time (scheduler, NCCL init, loading). Restart time often dominates at scale; keep hot spares and cache checkpoints in local or host memory.</li>
+</ul>
+
+<h3>Failure Recovery</h3>
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  A["Training step"] --> B{"Health checks pass?"}
+  B -- yes --> A
+  B -- "NCCL timeout / Xid / ECC" --> C["Stop job, dump stacks"]
+  C --> D["Identify and cordon bad node"]
+  D --> E["Swap in hot spare"]
+  E --> F["Restore newest valid checkpoint"]
+  F --> A
+  B -- "loss spike" --> G["Skip batch or roll back"]
+  G --> A</pre>
+<figcaption>Automated recovery loop.</figcaption>
+</figure>
+<ul>
+  <li><strong>Detect hangs:</strong> collective timeouts (NCCL watchdog, <code>TORCH_NCCL_ASYNC_ERROR_HANDLING</code>), heartbeats per rank, and flight-recorder traces of the last collectives to find the rank that stalled.</li>
+  <li><strong>Detect slow ranks:</strong> one throttled GPU slows every synchronous step. Track per-rank step time and all-reduce wait time.</li>
+  <li><strong>Silent data corruption:</strong> faulty GPUs can produce wrong numbers without errors. Mitigations: periodic replay of a fixed batch comparing loss bit-for-bit across nodes, checksums on parameters across DP replicas (they must be identical).</li>
+</ul>
+
+<h3>Loss Spikes and Divergence</h3>
+<ul>
+  <li>Causes observed in the literature: bad data batches, attention-logit growth, output-logit divergence, Adam's <span class="math">\epsilon</span> being too large relative to <span class="math">\sqrt{v}</span> for rarely updated parameters, and too-high LR for the scale (Wortsman et al. 2023; Chowdhery et al. 2022).</li>
+  <li>PaLM (Chowdhery et al. 2022) saw ≈ 20 spikes despite gradient clipping; they restarted from a checkpoint ≈ 100 steps before the spike and skipped ≈ 200–500 batches, which suggests the spikes arise from a data batch meeting a particular model state.</li>
+  <li>Mitigations in architecture: QK-norm, z-loss on the output logsumexp (PaLM used <span class="math">10^{-4} \log^2 Z</span>), no biases, careful initialisation, lower Adam <span class="math">\beta_2</span> (e.g. 0.95), smaller <span class="math">\epsilon</span>.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>An EMA z-score spike detector with grad-norm ceiling that decides between skipping a batch and rolling back; recovery by restoring and skipping the offending batches.</figcaption>
+<pre><code>import math, random
+
+class SpikeDetector:
+    """EMA z-score on log-loss plus a grad-norm ceiling; decides skip vs rollback."""
+    def __init__(self, beta=0.98, z_max=5.0, warmup=100, patience=3):
+        self.beta, self.z_max, self.warmup, self.patience = beta, z_max, warmup, patience
+        self.mean = self.var = None; self.n = 0; self.bad_run = 0
+    def update(self, loss, grad_norm, gn_max=5.0):
+        x = math.log(loss); self.n += 1
+        if self.mean is None:
+            self.mean, self.var = x, 1e-4; return "ok"
+        z = (x - self.mean) / math.sqrt(self.var)
+        spike = self.n &gt; self.warmup and (z &gt; self.z_max or grad_norm &gt; gn_max)
+        if spike:
+            self.bad_run += 1                         # do not pollute the statistics
+            return "rollback" if self.bad_run &gt;= self.patience else "skip_batch"
+        self.bad_run = 0
+        d = x - self.mean
+        self.mean += (1 - self.beta) * d
+        self.var = self.beta * (self.var + (1 - self.beta) * d * d)
+        return "ok"
+
+def train(bad_window, start=0, end=3000, ckpt_every=250, seed=0):
+    """Toy run: loss follows a power law; batches in bad_window cause divergence."""
+    rnd, det = random.Random(seed), SpikeDetector()
+    ckpts, diverged, step, events = [0], 0, start, []
+    while step &lt; end:
+        base = 2.0 + 3.0 * (1 + step / 200) ** -0.5
+        if step in bad_window: diverged += 1
+        elif step == 1500: diverged = -1               # a single transient bad batch
+        loss = base * (1 + 0.01 * rnd.gauss(0, 1)) * (1 + 0.4 * max(diverged, 0))
+        gnorm = 1.0 + 0.1 * rnd.gauss(0, 1) + (8.0 if diverged else 0.0)
+        if diverged == -1: loss, diverged = base * 1.5, 0
+        action = det.update(loss, gnorm)
+        if action != "ok": events.append((step, round(loss, 3), action))
+        if action == "rollback":
+            return step, events, [c for c in ckpts if c &lt; step - det.patience][-1]
+        if action == "ok" and step % ckpt_every == 0: ckpts.append(step)
+        step += 1
+    return step, events, None
+
+stop, events, back_to = train(bad_window=range(2210, 2230))
+for e in events: print("step %d loss=%.3f -&gt; %s" % e)
+print(f"rollback at step {stop} to checkpoint {back_to}")
+# Recovery (PaLM-style): restart from the checkpoint before the spike and skip the
+# batches around it. The toy assumes the divergence is triggered by those batches.
+stop, events, back_to = train(bad_window=range(0), start=back_to, seed=1)
+print(f"resumed, skipped batches 2210-2229: reached step {stop}, "
+      f"events={events}, rollback={back_to}")</code></pre>
+</figure>
+<pre class="output">step 1500 loss=4.543 -&gt; skip_batch
+step 2210 loss=3.981 -&gt; skip_batch
+step 2211 loss=5.151 -&gt; skip_batch
+step 2212 loss=6.318 -&gt; rollback
+rollback at step 2212 to checkpoint 2000
+resumed, skipped batches 2210-2229: reached step 3000, events=[], rollback=None</pre>
+<ul>
+  <li>A single bad batch (step 1500) is skipped: the optimiser step is not applied, and the statistics are not updated with the outlier.</li>
+  <li>Three consecutive anomalies trigger a rollback to the last checkpoint taken while healthy (2000), after which the data loader skips the window.</li>
+  <li>The toy's recovery succeeds by construction. In real runs, if the spike recurs after skipping data, the cause is the model state: lower LR, tighten clipping, or change <span class="math">\epsilon</span>/<span class="math">\beta_2</span> for the re-run.</li>
+  <li>Detector state (EMA mean and variance) belongs in the checkpoint; otherwise a restart re-enters warm-up blind.</li>
+</ul>
+
+<h3>Monitoring and Evaluation During Training</h3>
+<table>
+  <caption>What to plot, and what each signal catches.</caption>
+  <thead><tr><th>Signal</th><th>Granularity</th><th>Catches</th></tr></thead>
+  <tbody>
+    <tr><td>Training loss (and per-domain loss)</td><td>Every step</td><td>Spikes, divergence, data-mixture bugs</td></tr>
+    <tr><td>Global grad norm; fraction of clipped steps</td><td>Every step</td><td>Instability before it reaches the loss</td></tr>
+    <tr><td>Per-layer update/weight ratio, max attention logit, output logsumexp</td><td>Every N steps</td><td>Logit growth (Wortsman et al. 2023)</td></tr>
+    <tr><td>Skipped steps (loss scaler), NaN counters</td><td>Every step</td><td>Precision problems</td></tr>
+    <tr><td>Tokens/s, MFU, per-rank step time, comm wait</td><td>Every step</td><td>Stragglers, network degradation</td></tr>
+    <tr><td>Held-out loss on fixed sets</td><td>Every ≈ 1K steps</td><td>Overfitting to repeated data, contamination</td></tr>
+    <tr><td>Downstream evals (few-shot)</td><td>Every checkpoint</td><td>Capability regressions; compare only at matched LR phase</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout security"><span class="title">Integrity</span>
+  <ul>
+    <li>Checkpoints are the most valuable artefact the organisation owns. Restrict write access, replicate across failure domains, sign manifests, and never load <code>torch.load</code> pickles from untrusted sources (use <code>weights_only=True</code> or safetensors).</li>
+    <li>Data-loader cursors and manifests (Volume 5) make the run auditable: you can say exactly which tokens the model has seen.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ REVIEW -->
+<section class="review">
+<h1>Volume Review</h1>
+
+<h2>What You Learned</h2>
+<ul>
+  <li>Training compute is <span class="math">C \approx 6ND</span>; wall-clock time follows from GPU count, peak FLOP/s and measured MFU; lifetime cost adds <span class="math">2N</span> per served token and favours over-trained smaller models.</li>
+  <li>Kaplan (N-heavy) versus Chinchilla (≈ equal scaling, ≈ 20 tokens/param) and why they differ; how to fit <span class="math">L(C) = aC^{-b} + L_\infty</span> and why the extrapolation band is wide.</li>
+  <li>Critical batch size from gradient noise and why it grows during training; LR scaling rules; μP's reason for 1/width learning rates; WSD schedules and cooldown branches.</li>
+  <li>Range versus precision across FP32, TF32, BF16, FP16 and FP8; FP16 overflow and underflow; loss scaling; which components must stay in FP32.</li>
+  <li>Activation memory <span class="math">sbh(34 + 5as/h)</span>, checkpointing's memory/compute trade, and when offload pays.</li>
+  <li>DDP, ring all-reduce cost <span class="math">2\frac{p-1}{p}n\beta</span>, bucketing and overlap.</li>
+  <li>ZeRO 1–3 memory equations and communication, FSDP and HSDP.</li>
+  <li>Megatron column/row parallelism with the f and g operators; sequence and context parallelism.</li>
+  <li>GPipe and 1F1B share the bubble <span class="math">(p-1)/(m+p-1)</span> but differ in memory; interleaving and zero-bubble schedules.</li>
+  <li>How to choose a TP × PP × DP layout from memory, bubble and topology; checkpointing, failure recovery and spike handling for long runs.</li>
+</ul>
+
+<h2>What You Built</h2>
+<ul>
+  <li>A compute planner and a scaling-law fitter with uncertainty bands (<code>forge.scaling</code>).</li>
+  <li>A gradient noise-scale estimator, WSD scheduler and μP width demonstration.</li>
+  <li>Precision probes, a dynamic loss scaler and a BF16 autocast trainer.</li>
+  <li>An exact saved-activation profiler for checkpointing experiments.</li>
+  <li>Mini-DDP with a hand-written ring all-reduce; mini ZeRO-1; Megatron column/row-parallel MLP; all verified against single-process references on gloo.</li>
+  <li>A pipeline schedule simulator; a 3D layout calculator; a sharded, verifiable, reshardable checkpointer; a loss-spike detector with rollback.</li>
+</ul>
+
+<h2>Important Code</h2>
+<table>
+  <caption>Listings to keep; later volumes reuse them inside <code>src/forge/</code>.</caption>
+  <thead><tr><th>Module</th><th>Forge path</th><th>Key function</th><th>Reused in</th></tr></thead>
+  <tbody>
+    <tr><td><code>scaling</code></td><td><code>forge.scaling</code></td><td><code>optimal_split</code>, law fit with covariance bands</td><td>Every model-size decision; Volume 22</td></tr>
+    <tr><td><code>precision</code></td><td><code>forge.train</code></td><td><code>DynamicScaler</code>, autocast trainer</td><td>Volumes 8, 11</td></tr>
+    <tr><td><code>memory</code></td><td><code>forge.train</code></td><td><code>saved_bytes</code> hook profiler</td><td>Any OOM investigation</td></tr>
+    <tr><td><code>dist</code></td><td><code>forge.train.distributed</code></td><td><code>ring_all_reduce</code>, <code>ZeRO1Adam</code>, TP linears</td><td>Volumes 7, 11</td></tr>
+    <tr><td><code>pipeline</code></td><td><code>forge.train.distributed</code></td><td><code>simulate</code></td><td>Layout planning</td></tr>
+    <tr><td><code>ops</code></td><td><code>forge.train.distributed</code></td><td><code>save_sharded</code>, <code>SpikeDetector</code></td><td>Volumes 8, 22</td></tr>
+  </tbody>
+</table>
+
+<h2>Important Architecture</h2>
+<div class="arch">
+  <div class="arch-layer" data-label="Planning">
+    <div class="node eval">Scaling-law fits</div><div class="node service">Compute planner</div><div class="node service">Layout calculator</div>
+  </div>
+  <div class="arch-layer" data-label="Data">
+    <div class="node store">Versioned shards</div><div class="node queue">Resumable mixture sampler</div>
+  </div>
+  <div class="arch-layer" data-label="Parallel training">
+    <div class="node gpu">TP + SP (NVLink)</div><div class="node gpu">PP 1F1B (IB)</div><div class="node gpu">DP + ZeRO-1/FSDP (IB)</div><div class="node gpu">CP (long context)</div>
+  </div>
+  <div class="arch-layer" data-label="Reliability">
+    <div class="node store">Async sharded checkpoints</div><div class="node guard">Spike detector</div><div class="node guard">Health checks + hot spares</div>
+  </div>
+  <div class="arch-layer" data-label="Observability">
+    <div class="node obs">Loss, grad norm, MFU</div><div class="node obs">Per-rank timing</div><div class="node eval">In-training evals</div>
+  </div>
+</div>
+
+<h2>Failure Modes</h2>
+<ul class="failure-modes">
+  <li>Scaling-law extrapolation without <span class="math">L_\infty</span>, across a data or architecture change, or from un-tuned small runs.</li>
+  <li>Batch size far above <span class="math">B_{crit}</span>; LR copied from a small model under standard parameterisation.</li>
+  <li>Comparing stable-phase and cooled-down checkpoints.</li>
+  <li>FP16 without loss scaling; BF16 accumulation in norms, losses or all-reduces; BF16 master weights.</li>
+  <li>Activation memory estimated for the average stage instead of pipeline stage 0.</li>
+  <li>Collective order differs across ranks: hangs. Unused parameters under DDP: hangs.</li>
+  <li>Gradient clipping by local norm under ZeRO/FSDP/TP.</li>
+  <li>Missing Megatron f operator: wrong input gradients with no error.</li>
+  <li>TP across nodes; pipeline micro-batches too few after raising DP.</li>
+  <li>Checkpoints without data cursor or RNG state; non-atomic saves; no checksums.</li>
+  <li>Silent data corruption on a faulty GPU; stragglers throttling the whole job.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<ul>
+  <li>Parallel correctness: every new parallel layout must match a single-device reference on a small model (loss curve over ≥ 100 steps within tolerance), as every listing here did.</li>
+  <li>Scaling fits: hold out the largest run; report prediction error and the band, not just the point estimate.</li>
+  <li>Efficiency: MFU, step-time breakdown, bubble fraction and exposed communication from profiles.</li>
+  <li>Reliability: effective training time (productive time ÷ wall time), mean time to recovery, checkpoint restore tested by actually restoring, including onto a different world size.</li>
+  <li>Model quality in-flight: held-out loss per domain and downstream evals at matched LR phase.</li>
+</ul>
+
+<h2>Practical Project</h2>
+<div class="frame exercise">
+  <p class="facet">Scaling study</p>
+  <ul>
+    <li>Using Volume 4's trainer and Volume 5's data, train 5–7 small models at each of 3 fixed compute budgets (IsoFLOP profiles), with a WSD schedule and cooldown branches.</li>
+    <li>Fit <span class="math">N_{opt}(C)</span> and <span class="math">L(C)</span>; predict the loss of a model 10× larger than your biggest run, with a band; optionally verify on a rented GPU (Tier G).</li>
+    <li>Run the small models under mini-DDP and mini ZeRO-1 on CPU processes and confirm identical loss curves.</li>
+    <li>Write a compute plan for a 1B model: tokens (compute-optimal and inference-aware), GPU-hours at a measured MFU, parallel layout from the calculator, checkpoint interval from Young's formula, and total cost.</li>
+  </ul>
+</div>
+
+<h2>Exercises</h2>
+<ol>
+  <li>Derive the <span class="math">C \approx 6ND</span> forward/backward split for one linear layer, and add the attention-score FLOPs for <span class="math">n_{ctx} = 32\text{K}</span>, <span class="math">d = 4096</span>. At what context does attention exceed 20 % of FLOPs?</li>
+  <li>Minimise <span class="math">L(N, D)</span> subject to <span class="math">6ND = C</span> analytically and show <span class="math">N_{opt} \propto C^{\beta/(\alpha+\beta)}</span>.</li>
+  <li>Refit the scaling law with 3 % noise and with only four budgets. How wide is the 1e25 band?</li>
+  <li>Implement the two-batch-size estimator of <span class="math">B_{simple}</span> from McCandlish et al. Appendix A and compare with the per-example estimate.</li>
+  <li>Extend the loss-scaling listing to FP8 E4M3 and E5M2 with per-tensor scaling from the amax.</li>
+  <li>Replace the all-reduce in ZeRO-1 with reduce-scatter built from point-to-point sends, and count bytes sent per rank.</li>
+  <li>Extend the TP listing to self-attention with heads split across ranks, and add sequence parallelism around LayerNorm.</li>
+  <li>Add interleaved 1F1B with <span class="math">v = 2</span> to the simulator and verify the bubble shrinks by ≈ 2×.</li>
+  <li>Rerun the layout calculator for a 405B model on 1,024 GPUs at sequence 8,192, including embedding memory on the end stages.</li>
+  <li>Compute Young's optimal checkpoint interval for 16K GPUs with a per-GPU MTBF of 5 years and a 20 s blocking save.</li>
+</ol>
+
+<h2>Research Papers</h2>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Scaling Laws for Neural Language Models</span>
+    <span class="paper-meta">Kaplan et al., 2020 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>No quantitative model of how loss depends on model size, data and compute.</dd>
+    <dt>Previous limitation</dt><dd>Scaling studied piecemeal, one factor at a time.</dd>
+    <dt>Approach</dt><dd>Hundreds of transformer runs over seven orders of magnitude; power-law fits in N, D and C.</dd>
+    <dt>Contribution</dt><dd>Smooth power laws; compute-efficient allocation favouring large models (<span class="math">N \propto C^{0.73}</span>).</dd>
+    <dt>Practical impact</dt><dd>Justified GPT-3-scale models; made scaling experiments standard practice.</dd>
+    <dt>Limitations</dt><dd>Fixed-length LR schedules and non-embedding parameter counting biased the allocation.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Training Compute-Optimal Large Language Models</span>
+    <span class="paper-meta">Hoffmann et al., 2022 · NeurIPS</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Were large models under-trained for their compute?</dd>
+    <dt>Previous limitation</dt><dd>Kaplan's allocation from runs without matched schedules.</dd>
+    <dt>Approach</dt><dd>Over 400 models (70M–16B); three estimation approaches; parametric <span class="math">L(N, D)</span>.</dd>
+    <dt>Contribution</dt><dd>Scale N and D equally; ≈ 20 tokens per parameter; Chinchilla 70B beats Gopher 280B.</dd>
+    <dt>Practical impact</dt><dd>Reset the industry towards more tokens per parameter.</dd>
+    <dt>Limitations</dt><dd>Ignores inference cost; Approach 3 constants later disputed (Besiroglu et al. 2024).</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">An Empirical Model of Large-Batch Training</span>
+    <span class="paper-meta">McCandlish et al., 2018 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>How large can the batch be before extra data parallelism is wasted?</dd>
+    <dt>Previous limitation</dt><dd>Batch size chosen by trial and error per task.</dd>
+    <dt>Approach</dt><dd>Gradient noise scale derived from a quadratic model of the loss.</dd>
+    <dt>Contribution</dt><dd><span class="math">B_{simple} = \operatorname{tr}\Sigma / |G|^2</span> predicts the critical batch; steps–examples trade-off curve.</dd>
+    <dt>Practical impact</dt><dd>Motivates batch-size ramps in large runs.</dd>
+    <dt>Limitations</dt><dd>Assumes well-tuned LR; noise scale shifts during training.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer</span>
+    <span class="paper-meta">Yang et al., 2022 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Hyperparameters tuned on small models do not transfer to wide ones.</dd>
+    <dt>Previous limitation</dt><dd>Standard parameterisation shifts the optimal LR with width.</dd>
+    <dt>Approach</dt><dd>Maximal Update Parameterisation: width-dependent init, LR and multipliers.</dd>
+    <dt>Contribution</dt><dd>μTransfer: tune a small proxy, copy hyperparameters to the large model.</dd>
+    <dt>Practical impact</dt><dd>Cheap hyperparameter search for large runs.</dd>
+    <dt>Limitations</dt><dd>Width only; depth, batch size and schedule need other treatment.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Mixed Precision Training</span>
+    <span class="paper-meta">Micikevicius et al., 2017 · ICLR 2018</span></div>
+  <dl>
+    <dt>Problem</dt><dd>FP16 halves memory and speeds up maths but loses accuracy.</dd>
+    <dt>Previous limitation</dt><dd>Gradients underflow; small updates vanish.</dd>
+    <dt>Approach</dt><dd>FP32 master weights, loss scaling, FP32 accumulation.</dd>
+    <dt>Contribution</dt><dd>FP16 training matching FP32 accuracy across many models.</dd>
+    <dt>Practical impact</dt><dd>Basis of AMP; extended to FP8 (Micikevicius et al. 2022).</dd>
+    <dt>Limitations</dt><dd>FP16 range issues largely superseded by BF16.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Training Deep Nets with Sublinear Memory Cost</span>
+    <span class="paper-meta">Chen et al., 2016 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Activation memory limits depth and batch size.</dd>
+    <dt>Previous limitation</dt><dd>All activations stored for backward.</dd>
+    <dt>Approach</dt><dd>Store checkpoints; recompute segments during backward.</dd>
+    <dt>Contribution</dt><dd><span class="math">O(\sqrt{n})</span> memory for one extra forward.</dd>
+    <dt>Practical impact</dt><dd>Activation checkpointing in every training framework.</dd>
+    <dt>Limitations</dt><dd>Extra compute; selective schemes are needed to minimise it.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</span>
+    <span class="paper-meta">Rajbhandari et al., 2019 · SC 2020</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Data parallelism replicates all model states.</dd>
+    <dt>Previous limitation</dt><dd>Model parallelism required invasive code changes and fast links.</dd>
+    <dt>Approach</dt><dd>Partition optimiser state, gradients and parameters across DP ranks.</dd>
+    <dt>Contribution</dt><dd>Memory ÷ <span class="math">N_d</span> with the same (stages 1–2) or 1.5× (stage 3) communication.</dd>
+    <dt>Practical impact</dt><dd>DeepSpeed; inspired PyTorch FSDP.</dd>
+    <dt>Limitations</dt><dd>Does not shard activations; stage 3 latency-bound at large scale.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel</span>
+    <span class="paper-meta">Zhao et al., 2023 · VLDB</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Bring ZeRO-3-style sharding natively into PyTorch.</dd>
+    <dt>Previous limitation</dt><dd>External libraries; poor composability.</dd>
+    <dt>Approach</dt><dd>FlatParameter units, prefetching, hybrid sharding, rate limiting.</dd>
+    <dt>Contribution</dt><dd>Production design and measurements up to large GPU counts.</dd>
+    <dt>Practical impact</dt><dd>Default sharded training in PyTorch; FSDP2 builds on DTensor.</dd>
+    <dt>Limitations</dt><dd>Wrapping and prefetch tuning remain manual.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</span>
+    <span class="paper-meta">Shoeybi et al., 2019 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Transformer layers too large for one GPU.</dd>
+    <dt>Previous limitation</dt><dd>Model parallelism needed compilers or custom frameworks.</dd>
+    <dt>Approach</dt><dd>Column/row-parallel MLP and head-parallel attention with two all-reduces per block.</dd>
+    <dt>Contribution</dt><dd>8.3B GPT-2 on 512 GPUs with simple PyTorch code.</dd>
+    <dt>Practical impact</dt><dd>The standard TP design.</dd>
+    <dt>Limitations</dt><dd>Needs NVLink-class bandwidth; replicated norm activations (fixed by SP).</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM</span>
+    <span class="paper-meta">Narayanan et al., 2021 · SC</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Combining TP, PP and DP efficiently at thousands of GPUs.</dd>
+    <dt>Previous limitation</dt><dd>Each strategy alone failed to scale to trillion-parameter models.</dd>
+    <dt>Approach</dt><dd>PTD-P: TP in node, PP across nodes, DP outside; interleaved 1F1B schedule.</dd>
+    <dt>Contribution</dt><dd>1T parameters on 3,072 GPUs at ≈ 52 % of peak; layout heuristics.</dd>
+    <dt>Practical impact</dt><dd>Template for 3D parallelism.</dd>
+    <dt>Limitations</dt><dd>Tuned for a specific cluster; activation memory handled later (Korthikanti et al. 2022).</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism</span>
+    <span class="paper-meta">Huang et al., 2018 · NeurIPS 2019</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Models too big for one accelerator.</dd>
+    <dt>Previous limitation</dt><dd>Naive model parallelism leaves devices idle.</dd>
+    <dt>Approach</dt><dd>Micro-batch pipelining with synchronous updates and re-materialisation.</dd>
+    <dt>Contribution</dt><dd>Near-linear speed-up with <span class="math">(p-1)/(m+p-1)</span> bubble.</dd>
+    <dt>Practical impact</dt><dd>Basis of all synchronous pipeline schedules.</dd>
+    <dt>Limitations</dt><dd>Activation memory grows with <span class="math">m</span>; fixed by 1F1B.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Reducing Activation Recomputation in Large Transformer Models</span>
+    <span class="paper-meta">Korthikanti et al., 2022 · MLSys 2023</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Full recomputation wastes ≈ 30–40 % of compute.</dd>
+    <dt>Previous limitation</dt><dd>TP left norm/dropout activations replicated.</dd>
+    <dt>Approach</dt><dd>Sequence parallelism plus selective recomputation of attention.</dd>
+    <dt>Contribution</dt><dd>Activation memory formula; ≈ 5× less activation memory, ≈ 90 % less recompute overhead.</dd>
+    <dt>Practical impact</dt><dd>SP is standard with TP.</dd>
+    <dt>Limitations</dt><dd>Selective recompute largely subsumed by FlashAttention.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">The Llama 3 Herd of Models</span>
+    <span class="paper-meta">Dubey et al., 2024 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Train and document a 405B dense model on 15.6T tokens.</dd>
+    <dt>Previous limitation</dt><dd>Few public accounts of frontier-scale infrastructure.</dd>
+    <dt>Approach</dt><dd>Scaling-law-guided sizing; 4D parallelism (TP, CP, PP, FSDP) on up to 16K H100s.</dd>
+    <dt>Contribution</dt><dd>Detailed layouts, MFU, failure statistics and recovery practice.</dd>
+    <dt>Practical impact</dt><dd>Reference design for large dense pretraining.</dd>
+    <dt>Limitations</dt><dd>Many internal tools undisclosed; results specific to Meta's clusters.</dd>
+  </dl>
+</section>
+<p class="facet">Further reading</p>
+<ul>
+  <li>Sardana and Frankle 2023 (inference-aware scaling); Hägele et al. 2024 (WSD and cooldowns); Micikevicius et al. 2022 (FP8 formats); Liu et al. 2023 (Ring Attention); Chowdhery et al. 2022 (PaLM: spikes, z-loss); Wortsman et al. 2023 (small-scale proxies for instabilities); Li et al. 2020 (PyTorch DDP); Qi et al. 2023 (zero-bubble pipelines).</li>
+</ul>
+
+<h2>Interview Questions</h2>
+<ol>
+  <li>Derive <span class="math">C \approx 6ND</span>. What does it ignore, and when does that matter?</li>
+  <li>Why did Kaplan and Chinchilla reach different allocations?</li>
+  <li>When would you train a model far beyond Chinchilla-optimal tokens?</li>
+  <li>Your scaling-law fit predicts loss 1.9 at the target budget. How confident are you, and how would you quantify it?</li>
+  <li>What is the critical batch size and why does it grow during training?</li>
+  <li>Explain why the optimal LR shrinks with width under standard parameterisation and how μP fixes it.</li>
+  <li>Why does BF16 rarely need loss scaling while FP16 does? Which operations stay in FP32 and why?</li>
+  <li>Estimate activation memory for one layer of a 70B model at 4K context, with and without TP 8 + SP.</li>
+  <li>Derive the ring all-reduce time. Why is its bandwidth term independent of the number of ranks?</li>
+  <li>Write the ZeRO-1/2/3 memory equations. Why does ZeRO-2 cost no more bandwidth than DDP?</li>
+  <li>Walk through the forward and backward communication of a Megatron MLP. What breaks without the f operator?</li>
+  <li>GPipe and 1F1B have the same bubble. Why use 1F1B?</li>
+  <li>Choose a layout for 70B on 64 H100s and justify each degree.</li>
+  <li>A 16K-GPU job hangs once every few hours. How do you detect, diagnose and recover automatically?</li>
+  <li>The loss spikes at step 120K and recovers; later it spikes and diverges. What do you do in each case?</li>
+</ol>
+
+<h2>Next Volume</h2>
+<p>Volume 7, Modern LLM Architectures, changes what is being trained: grouped-query and multi-head
+latent attention, RoPE scaling for long context, mixture-of-experts with expert parallelism, and
+state-space hybrids. Each changes the FLOP, memory and communication arithmetic from this volume.</p>
+<p class="facet">Prerequisites from this volume</p>
+<ul>
+  <li>FLOP and activation-memory accounting (Chapters 1 and 5).</li>
+  <li>All-reduce, reduce-scatter, all-gather and point-to-point costs (Chapter 6): MoE adds all-to-all.</li>
+  <li>TP and CP (Chapter 8) and layout selection (Chapter 10): expert parallelism is a fifth dimension.</li>
+</ul>
+</section>
+
+</body>
+</html>

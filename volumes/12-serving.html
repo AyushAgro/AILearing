@@ -1,0 +1,2763 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 12 · Model Serving and Deployment</title>
+<meta name="volume" content="Volume 12 · Model Serving and Deployment">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 12</p>
+  <h1 class="no-toc">Model Serving and Deployment</h1>
+  <p class="tp-subtitle">Model Servers, APIs, Containers, GPUs and Release Strategies</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Take a model from a checkpoint to a reliable, observable, autoscaled production API.</li>
+  <li>Ship the continuous package as <code>forge.serve</code>: FastAPI, a continuous-batching scheduler, backpressure, cancellation, health checks, LLM-aware routing, release controls and a resilient client — then map every piece onto production engines, containers and Kubernetes.</li>
+  <li>Treat an LLM endpoint as a distributed system with unusual properties: requests last seconds, cost is proportional to tokens, state (the KV and prefix caches) lives on the accelerator, and replicas take minutes to start.</li>
+  <li>Release models the way you release code: immutable artefacts, shadow, canary with automated rollback, blue-green.</li>
+  <li>Make the economics explicit: when does self-hosting beat a managed API?</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>You have run HTTP services behind load balancers, operated Kubernetes, and debugged tail latency.</li>
+  <li>Volume 1, Chapter 7: the <code>ChatModel</code> protocol and <code>ResilientClient</code>. This volume adds the server side of that boundary and finishes the reliability work it deferred.</li>
+  <li>Volume 11 (inference optimisation): KV cache, paged attention, continuous batching, quantisation and speculative decoding. Here those are properties of an <em>engine</em> you deploy; this volume is about everything around the engine.</li>
+</ul>
+
+<p class="facet">How to read the code</p>
+<ul>
+  <li>Every Python listing was executed on an Apple M2 laptop (Python 3.12, FastAPI 0.136, uvicorn 0.46, httpx 0.28, pydantic 2.12, PyTorch 2.10, Transformers 5.6). Printed output is real.</li>
+  <li>Listings in this volume seed <code>src/forge/serve/</code> (contract, server, router, registry, resilience, cost). Chapter code under <code>volumes/12-serving/code/</code> stays pedagogical and self-contained; Forge is the integrated package you keep.</li>
+  <li>The model server runs a real model, <code>HuggingFaceTB/SmolLM2-135M</code> on CPU, and a deterministic fake engine with a GPU-like cost model for load tests.</li>
+  <li>Dockerfiles and Kubernetes manifests are marked <strong>not executed</strong>: they need a GPU node and a cluster. They are written against documented interfaces and should be validated with <code>kind</code> or a staging cluster before use.</li>
+  <li>Prices in Chapter 10 are illustrative assumptions, not quotes.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1   Serving requirements     SLOs, traffic shapes, capacity from Little's law
+Chapter 2   API design               OpenAI-compatible contract, SSE, errors, idempotency
+Chapter 3   A model server           FastAPI + batching loop + backpressure + cancellation
+Chapter 4   Serving engines          vLLM, SGLang, TGI, TensorRT-LLM, Triton, Ollama, llama.cpp
+Chapter 5   GPU containers           CUDA images, weights, cold start
+Chapter 6   Kubernetes               GPU scheduling, probes, queue-depth autoscaling
+Chapter 7   Load balancing           prefix affinity, least-load, rate limiting, gateways
+Chapter 8   Registry and release     shadow, canary, blue-green, rollback, multi-LoRA
+Chapter 9   Reliability              deadlines, retries, circuit breakers, shedding, fallback
+Chapter 10  Cloud patterns           managed vs self-hosted vs serverless; cost crossover</pre>
+<figcaption>Map of Volume 12.</figcaption>
+</figure>
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="requirements">Serving Requirements</h2>
+<p class="chapter-lede">An LLM endpoint looks like any other RPC service until you measure it. A
+single request lasts seconds, its cost varies by three orders of magnitude with its token counts,
+and the replica serving it holds per-request state in accelerator memory. This chapter turns product
+requirements into service-level objectives and a first capacity number.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A product team asks for "a chat API with good latency and high availability". The model team
+  says one H100 does "about 2,400 tokens per second". Neither statement is enough to decide how many
+  GPUs to buy, what the queue limit should be, when to autoscale, or when to page someone. You need
+  SLOs expressed in the units the system actually consumes: tokens, time to first token and time
+  between tokens.</p>
+</div>
+
+<h3>Why LLM Serving Is Different</h3>
+
+<table>
+  <caption>A typical JSON API versus an LLM endpoint.</caption>
+  <thead><tr><th>Property</th><th>Typical backend API</th><th>LLM endpoint</th></tr></thead>
+  <tbody>
+    <tr><td>Request duration</td><td>1–100 ms</td><td>0.2–120 s; streamed</td></tr>
+    <tr><td>Cost per request</td><td>Roughly constant</td><td>Proportional to input + output tokens; 1000× spread</td></tr>
+    <tr><td>Unit of capacity</td><td>Requests per second</td><td>Tokens per second at a latency target, and concurrent sequences (KV memory)</td></tr>
+    <tr><td>Per-request state</td><td>None on the server</td><td>KV cache in HBM for the life of the request; prefix cache across requests</td></tr>
+    <tr><td>Batching</td><td>Optional optimisation</td><td>The economic model: a GPU at batch 1 wastes most of its compute</td></tr>
+    <tr><td>Replica start-up</td><td>Seconds</td><td>Minutes: node provisioning, image pull, weight load, compilation, warm-up</td></tr>
+    <tr><td>Correctness</td><td>Deterministic</td><td>Stochastic; a "successful" 200 can still be a wrong answer</td></tr>
+  </tbody>
+</table>
+
+<h3>Latency SLOs for Streaming Responses</h3>
+
+<p>End-to-end latency is the wrong single metric for a streamed response. Decompose it:</p>
+
+<div class="math">T_{\text{e2e}} = \underbrace{T_{\text{queue}} + T_{\text{prefill}}}_{\text{TTFT}} + (n_{\text{out}} - 1)\cdot \text{TPOT}</div>
+
+<ul>
+  <li><strong>TTFT</strong> (time to first token): queueing plus prefill. Dominated by queue depth and prompt length. This is what users perceive as "responsiveness".</li>
+  <li><strong>TPOT</strong> (time per output token, also inter-token latency): one decode step. Dominated by batch size and memory bandwidth. Humans read at roughly 5–10 tokens/s, so a TPOT below ~50 ms is "fast enough" for chat but not for agents that consume the output programmatically.</li>
+  <li><strong>E2E</strong> matters for non-streaming callers: agents, tool calls, batch jobs.</li>
+  <li><strong>Goodput</strong>: requests per second that meet <em>all</em> latency SLOs. Throughput that violates SLOs is not capacity.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Batching trades TPOT for throughput: a bigger batch raises tokens/s per GPU and slows every sequence in it. Capacity is therefore "tokens/s <em>at</em> a TPOT target", measured, never quoted.</li>
+    <li>TTFT is mostly a queueing problem; TPOT is mostly an engine problem. Different teams, different fixes.</li>
+  </ul>
+</aside>
+
+<h3>Traffic Shapes and Tenancy</h3>
+
+<table>
+  <caption>Workload classes and what each needs from the serving layer.</caption>
+  <thead><tr><th>Workload</th><th>Shape</th><th>SLO that matters</th><th>Serving implication</th></tr></thead>
+  <tbody>
+    <tr><td>Interactive chat</td><td>Diurnal, bursty; long shared system prompts</td><td>TTFT p95, TPOT p95</td><td>Streaming, prefix caching, headroom</td></tr>
+    <tr><td>Agent / tool loops</td><td>Many sequential calls per task; growing context</td><td>E2E per call; task completion time</td><td>Prefix affinity, low TTFT at long context</td></tr>
+    <tr><td>RAG</td><td>Long prompts (2–20k tokens), short outputs</td><td>TTFT</td><td>Prefill-heavy; chunked prefill; KV memory</td></tr>
+    <tr><td>Batch / offline</td><td>Large, schedulable, deadline in hours</td><td>Cost per token; completion by deadline</td><td>Separate queue or cluster, spot capacity, max batch</td></tr>
+    <tr><td>Multi-tenant platform</td><td>Many teams, many adapters, noisy neighbours</td><td>Per-tenant fairness and quotas</td><td>Token-based rate limits, priority classes, multi-LoRA</td></tr>
+  </tbody>
+</table>
+
+<p class="facet">Other requirements that change the design</p>
+<ul>
+  <li><strong>Model versions and adapters</strong>: several base versions live at once during a canary; tenants bring LoRA adapters (Chapter 8).</li>
+  <li><strong>Data residency and isolation</strong>: some tenants cannot share a GPU, a region or a prefix cache with others.</li>
+  <li><strong>Determinism expectations</strong>: evaluation and replay need pinned model, engine and sampling parameters; batching still introduces numerical non-determinism.</li>
+</ul>
+
+<h3>From SLOs to a Capacity Plan</h3>
+
+<p>Little's law gives the number of requests in flight, which sizes concurrency and therefore KV
+memory per replica:</p>
+
+<div class="math">L = \lambda W \qquad \text{replicas} = \left\lceil \frac{\lambda \cdot \bar{n}_{\text{out}}}{\text{tok/s per replica at SLO} \cdot (1 - h)} \right\rceil</div>
+
+<ul>
+  <li><span class="math">\lambda</span> is the peak arrival rate, <span class="math">W</span> the time in system, and <span class="math">h</span> the headroom you keep for bursts and failover.</li>
+  <li>The error budget is <span class="math">1 - \text{availability}</span> of requests or minutes per window; it funds releases and experiments (Beyer et al., 2016).</li>
+</ul>
+
+<figure class="listing">
+<figcaption>From product SLOs to an error budget, in-flight concurrency and a replica count.</figcaption>
+<pre><code>"""From product SLOs to a capacity plan: error budget, Little's law, replicas."""
+import math
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class SLO:
+    ttft_p95_ms: float        # time to first token
+    tpot_p95_ms: float        # time per output token (inter-token latency)
+    availability: float       # fraction of requests answered without 5xx/timeout
+
+
+@dataclass(frozen=True)
+class Traffic:
+    peak_rps: float
+    in_tokens: int
+    out_tokens: int
+
+
+def error_budget(slo: SLO, monthly_requests: float) -&gt; tuple[float, float]:
+    minutes = 30 * 24 * 60 * (1 - slo.availability)
+    return minutes, monthly_requests * (1 - slo.availability)
+
+
+def plan(slo: SLO, t: Traffic, replica_tok_s_at_slo: float, headroom: float = 0.3):
+    latency_s = slo.ttft_p95_ms / 1000 + t.out_tokens * slo.tpot_p95_ms / 1000
+    in_flight = t.peak_rps * latency_s                    # Little's law: L = lambda * W
+    out_tok_s = t.peak_rps * t.out_tokens
+    replicas = math.ceil(out_tok_s / (replica_tok_s_at_slo * (1 - headroom)))
+    return latency_s, in_flight, out_tok_s, replicas
+
+
+slo = SLO(ttft_p95_ms=500, tpot_p95_ms=40, availability=0.999)
+traffic = Traffic(peak_rps=20, in_tokens=1500, out_tokens=300)
+mins, reqs = error_budget(slo, monthly_requests=15e6)
+print(f"error budget: {mins:.1f} min/month or {reqs:,.0f} failed requests/month")
+lat, L, tok_s, n = plan(slo, traffic, replica_tok_s_at_slo=2400)
+print(f"worst-case in-SLO latency {lat:.1f}s -&gt; {L:.0f} requests in flight at peak")
+print(f"decode demand {tok_s:,.0f} tok/s -&gt; {n} replicas at 2,400 tok/s, 30% headroom")
+print(f"per-replica concurrency needed: {L / n:.0f} sequences (sizes the KV cache)")</code></pre>
+</figure>
+
+<pre class="output">error budget: 43.2 min/month or 15,000 failed requests/month
+worst-case in-SLO latency 12.5s -&gt; 250 requests in flight at peak
+decode demand 6,000 tok/s -&gt; 4 replicas at 2,400 tok/s, 30% headroom
+per-replica concurrency needed: 62 sequences (sizes the KV cache)</pre>
+
+<ul>
+  <li>The replica count is only valid if 2,400 tok/s was <em>measured at</em> 62 concurrent sequences and the TPOT target. At lower concurrency a replica produces fewer tokens/s; at higher concurrency it breaks the TPOT SLO.</li>
+  <li>62 sequences × (1,500 + 300) tokens is ~110k tokens of KV cache per replica. Check it fits with the Volume 1 formula before trusting the plan.</li>
+  <li>The plan ignores prefill: 20 req/s × 1,500 input tokens is 30k prefill tokens/s, which competes with decode for compute. Measure with the real prompt-length distribution (Chapter 3 load generator).</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Common Mistake</span>
+  <ul>
+    <li>Publishing an SLO on mean latency. LLM latency is heavy-tailed because output length is heavy-tailed. Use p95/p99 of TTFT and TPOT, and normalise E2E by output tokens when comparing versions.</li>
+    <li>Counting a 200 with a truncated or empty answer as "available". Include <code>finish_reason</code> and a cheap validity check in the success definition.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Rework the plan for a RAG workload with 12,000-token prompts and
+150-token answers at the same request rate. Which constraint binds first: decode throughput, prefill
+throughput or KV memory? What does that imply for the TTFT SLO you can offer?</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="api-design">API Design for LLMs</h2>
+<p class="chapter-lede">The API contract outlives every model and engine behind it. The industry has
+converged on the OpenAI chat-completions shape, so clients, SDKs, gateways and evaluation harnesses
+work unchanged across providers. This chapter implements that contract precisely, including the
+parts most teams get wrong: streaming framing, error semantics and idempotency.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Three internal teams call your model. One retries every non-200, including 400s. One cannot tell
+  a rate limit from an outage. One re-sends a "create ticket" agent request after a network timeout
+  and files the ticket twice. None of this is a model problem; all of it is contract.</p>
+</div>
+
+<p class="facet">Possible solutions and what each does not solve</p>
+<ul>
+  <li><strong>Bespoke JSON API</strong>: full control, but every SDK, gateway and eval tool needs an adapter.</li>
+  <li><strong>OpenAI-compatible surface</strong>: free ecosystem compatibility; does not define idempotency, and its error shapes are under-specified for internal SLOs. You must add both. <span class="evidence documented">Documented</span> vLLM, SGLang, TGI, Ollama and llama.cpp each document an OpenAI-compatible HTTP server in their official docs.</li>
+  <li><strong>gRPC</strong>: good for internal engine-to-router hops (<span class="evidence documented">Documented</span> Triton Inference Server documents both HTTP/REST and gRPC endpoints, and TensorRT-LLM is commonly served through it); poor for browsers and third-party tools. Common pattern: gRPC inside, HTTP+SSE at the edge.</li>
+</ul>
+
+<h3>The Contract</h3>
+
+<table>
+  <caption>Endpoints of <code>forge.serve</code>.</caption>
+  <thead><tr><th>Endpoint</th><th>Purpose</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>POST /v1/chat/completions</code></td><td>Chat, streamed or not</td><td>OpenAI-compatible body; <code>Idempotency-Key</code> and <code>X-Request-Timeout</code> headers</td></tr>
+    <tr><td><code>GET /healthz</code></td><td>Liveness</td><td>Is the process wedged? Restart if not.</td></tr>
+    <tr><td><code>GET /readyz</code></td><td>Readiness</td><td>Should the load balancer send traffic? False during load and drain.</td></tr>
+    <tr><td><code>GET /metrics</code></td><td>Queue depth, batch size, rejections, cancellations</td><td>Prometheus format in production; feeds autoscaling (Chapter 6)</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>The contract: pydantic request and response schemas, SSE framing, an error taxonomy and an idempotency store (<code>contract.py</code>).</figcaption>
+<pre><code>"""OpenAI-compatible chat contract: schemas, SSE framing, errors, idempotency."""
+import hashlib
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
+
+
+class ChatMessage(BaseModel):
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: list[ChatMessage] = Field(min_length=1)
+    max_tokens: int = Field(default=64, ge=1, le=4096)
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    stream: bool = False
+    stop: list[str] | None = None
+    user: str | None = None  # end-user id for abuse tracking, not auth
+
+    @field_validator("messages")
+    @classmethod
+    def last_is_user(cls, v: list[ChatMessage]) -&gt; list[ChatMessage]:
+        if v[-1].role not in ("user", "tool"):
+            raise ValueError("last message must be from user or tool")
+        return v
+
+
+class Usage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class Choice(BaseModel):
+    index: int = 0
+    message: ChatMessage
+    finish_reason: Literal["stop", "length", "cancelled"]
+
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int
+    model: str
+    choices: list[Choice]
+    usage: Usage
+
+
+class Delta(BaseModel):
+    role: str | None = None
+    content: str | None = None
+
+
+class ChunkChoice(BaseModel):
+    index: int = 0
+    delta: Delta
+    finish_reason: str | None = None
+
+
+class ChatCompletionChunk(BaseModel):
+    id: str
+    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: list[ChunkChoice]
+
+
+def new_id() -&gt; str:
+    return "chatcmpl-" + uuid.uuid4().hex[:12]
+
+
+def sse(obj: BaseModel | str) -&gt; bytes:
+    """One Server-Sent Event. The OpenAI convention ends the stream with [DONE]."""
+    data = obj if isinstance(obj, str) else obj.model_dump_json(exclude_none=True)
+    return f"data: {data}\n\n".encode()
+
+
+# ---- error taxonomy: (http status, retryable) -------------------------------
+ERRORS = {
+    "invalid_request_error": (400, False),
+    "authentication_error": (401, False),
+    "permission_error": (403, False),
+    "not_found_error": (404, False),
+    "idempotency_conflict": (409, False),
+    "context_length_exceeded": (400, False),
+    "rate_limit_error": (429, True),
+    "overloaded_error": (503, True),
+    "timeout_error": (504, True),
+    "server_error": (500, True),
+}
+
+
+class APIError(Exception):
+    def __init__(self, type_: str, message: str, retry_after_s: float | None = None):
+        self.type, self.message, self.retry_after_s = type_, message, retry_after_s
+        self.status, self.retryable = ERRORS[type_]
+
+    def body(self) -&gt; dict:
+        return {"error": {"type": self.type, "message": self.message,
+                          "retryable": self.retryable}}
+
+
+# ---- idempotency --------------------------------------------------------------
+@dataclass
+class _Entry:
+    fingerprint: str
+    response: dict | None  # None while the first attempt is still running
+    expires_at: float
+
+
+class IdempotencyStore:
+    """Key -&gt; (request fingerprint, stored response). In production: Redis with TTL."""
+
+    def __init__(self, ttl_s: float = 24 * 3600):
+        self.ttl_s, self._d = ttl_s, {}
+
+    @staticmethod
+    def fingerprint(req: ChatCompletionRequest) -&gt; str:
+        return hashlib.sha256(req.model_dump_json().encode()).hexdigest()[:16]
+
+    def begin(self, key: str, req: ChatCompletionRequest) -&gt; dict | None:
+        """Returns a stored response to replay, or None if the caller should execute."""
+        now, fp = time.time(), self.fingerprint(req)
+        e = self._d.get(key)
+        if e and e.expires_at &gt; now:
+            if e.fingerprint != fp:
+                raise APIError("idempotency_conflict", "key reused, body differs")
+            if e.response is None:
+                raise APIError("idempotency_conflict", "original request still running")
+            return e.response
+        self._d[key] = _Entry(fp, None, now + self.ttl_s)
+        return None
+
+    def finish(self, key: str, response: dict) -&gt; None:
+        self._d[key].response = response
+
+    def abort(self, key: str) -&gt; None:
+        self._d.pop(key, None)  # failed attempts must not be replayed</code></pre>
+</figure>
+
+<figure class="listing">
+<figcaption>Exercising the contract: validation, SSE framing and idempotent replay.</figcaption>
+<pre><code>from pydantic import ValidationError
+
+from contract import (APIError, ChatCompletionChunk, ChatCompletionRequest, ChunkChoice,
+                      Delta, IdempotencyStore, sse)
+
+req = ChatCompletionRequest.model_validate(
+    {"model": "smollm2-135m", "messages": [{"role": "user", "content": "Hi"}],
+     "max_tokens": 8, "stream": True})
+print(req.model_dump(exclude_none=True))
+
+try:
+    ChatCompletionRequest.model_validate(
+        {"model": "m", "messages": [{"role": "assistant", "content": "x"}],
+         "max_tokens": 0})
+except ValidationError as e:
+    for err in e.errors():
+        print("422:", err["loc"], err["msg"])
+
+chunk = ChatCompletionChunk(id="chatcmpl-1", created=0, model="m",
+                            choices=[ChunkChoice(delta=Delta(content="Hel"))])
+print(sse(chunk), sse("[DONE]"))
+
+store = IdempotencyStore()
+print("first:", store.begin("key-1", req))
+store.finish("key-1", {"id": "chatcmpl-1", "text": "Hello"})
+print("replay:", store.begin("key-1", req))
+try:
+    store.begin("key-1", req.model_copy(update={"max_tokens": 9}))
+except APIError as e:
+    print(e.status, e.body())</code></pre>
+</figure>
+
+<pre class="output">{'model': 'smollm2-135m', 'messages': [{'role': 'user', 'content': 'Hi'}], 'max_tokens': 8, 'temperature': 0.0, 'stream': True}
+422: ('messages',) Value error, last message must be from user or tool
+422: ('max_tokens',) Input should be greater than or equal to 1
+b'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"Hel"}}]}\n\n' b'data: [DONE]\n\n'
+first: None
+replay: {'id': 'chatcmpl-1', 'text': 'Hello'}
+409 {'error': {'type': 'idempotency_conflict', 'message': 'key reused, body differs', 'retryable': False}}</pre>
+
+<h3>Streaming with Server-Sent Events</h3>
+
+<ul>
+  <li><strong>Why SSE, not WebSockets</strong>: the stream is one-way, SSE is plain HTTP (works through proxies, gateways and HTTP/2 multiplexing), and it is what OpenAI-compatible clients expect. WebSockets are justified only for bidirectional sessions (voice, interruptible agents).</li>
+  <li><strong>Framing</strong>: each event is <code>data: {json}\n\n</code>. The first chunk carries the role, content chunks carry <code>delta.content</code>, the final chunk carries <code>finish_reason</code>, then <code>data: [DONE]</code>. <span class="evidence documented">Documented</span> This is the framing in OpenAI's Chat Completions API reference; Anthropic's Messages API instead documents named events (<code>message_start</code>, <code>content_block_delta</code>, <code>message_stop</code>, periodic <code>ping</code>), so a gateway that fronts both must normalise framing.</li>
+  <li><strong>Errors mid-stream</strong>: the status line (200) is already sent. Emit an error event (<code>data: {"error": ...}</code>) and close; clients must check for it. <span class="evidence documented">Documented</span> Anthropic's streaming docs state that errors such as <code>overloaded_error</code> can arrive as an <code>error</code> event after a 200. This is why a 200 on a stream is not success.</li>
+  <li><strong>Usage on streams</strong>: token counts are only known at the end. Send a final usage chunk (<span class="evidence documented">Documented</span> OpenAI's <code>stream_options.include_usage</code>, per its API reference) or bill from server-side logs, never from the client.</li>
+  <li><strong>Proxies</strong>: disable response buffering (<code>X-Accel-Buffering: no</code> on nginx), raise idle timeouts above your longest generation, and send comment heartbeats (<code>: ping\n\n</code>) on long reasoning pauses.</li>
+</ul>
+
+<h3>Errors and Rate-Limit Semantics</h3>
+
+<table>
+  <caption>Error taxonomy: status, retryability and what the client should do.</caption>
+  <thead><tr><th>Type</th><th>Status</th><th>Retry?</th><th>Client action</th></tr></thead>
+  <tbody>
+    <tr><td><code>invalid_request_error</code>, <code>context_length_exceeded</code></td><td>400</td><td>No</td><td>Fix the request; truncate context</td></tr>
+    <tr><td><code>authentication_error</code> / <code>permission_error</code></td><td>401 / 403</td><td>No</td><td>Refresh credentials; alert</td></tr>
+    <tr><td><code>idempotency_conflict</code></td><td>409</td><td>No</td><td>Bug: key reused with a different body, or concurrent duplicate</td></tr>
+    <tr><td><code>rate_limit_error</code></td><td>429</td><td>Yes, after <code>Retry-After</code></td><td>Back off; the <em>caller</em> is over quota or the queue is full</td></tr>
+    <tr><td><code>overloaded_error</code></td><td>503</td><td>Yes, with jitter</td><td>The <em>service</em> is shedding load; consider fallback</td></tr>
+    <tr><td><code>timeout_error</code></td><td>504</td><td>Yes, if deadline allows</td><td>Retry with the same idempotency key</td></tr>
+    <tr><td><code>server_error</code></td><td>500</td><td>Yes, bounded</td><td>Retry once or twice; open circuit if persistent</td></tr>
+  </tbody>
+</table>
+
+<ul>
+  <li>Return rate-limit state on every response (<code>x-ratelimit-remaining-tokens</code>, <code>x-ratelimit-reset-tokens</code>) so well-behaved clients pace themselves instead of discovering the limit by failing. <span class="evidence documented">Documented</span> These header names come from OpenAI's rate-limits guide; Anthropic documents <code>anthropic-ratelimit-*</code> headers plus <code>retry-after</code> on 429.</li>
+  <li>Distinguish 429 (you, the caller, should slow down) from 503 (we, the service, are overloaded). <span class="evidence documented">Documented</span> Public APIs differ here: OpenAI's error-codes guide uses 429 both for rate limits and for an exhausted billing quota, while Anthropic documents a separate 529 <code>overloaded_error</code>. Internal platforms should keep the two apart, because autoscaling and paging depend on it.</li>
+</ul>
+
+<h3>Idempotency Keys</h3>
+
+<p>A generation is not a side effect, but what an agent does with it often is. Once the network
+fails after the server has started work, the client cannot know whether it ran.</p>
+
+<ul>
+  <li>The client generates a UUID per <em>logical</em> operation and reuses it across retries.</li>
+  <li>The server stores <code>key → (request fingerprint, response)</code>. A replay with the same body returns the stored response; a different body is a 409; a concurrent duplicate while the first is running is a 409 (or waits on it).</li>
+  <li>Failed attempts are removed so a retry can execute; successful ones are kept for a TTL (24 h is common: <span class="evidence documented">Documented</span> Stripe's API docs say idempotency keys may be pruned once they are at least 24 hours old).</li>
+  <li>Streaming requests are not replayed in <code>forge.serve</code>. Replaying a stream needs the whole event log stored; <span class="evidence inferred">Inferred</span> to our knowledge no major chat API documents idempotent stream replay (check current docs), so agents that need exactly-once semantics should use non-streaming calls for side-effecting steps.</li>
+</ul>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>Scope idempotency keys to the authenticated tenant. A global key space lets one tenant read another's stored response by guessing or reusing a key.</li>
+    <li>The idempotency store holds full responses, often with personal data: apply the same retention and encryption rules as conversation logs.</li>
+  </ul>
+</aside>
+
+<h3>Structured Outputs and Tool Calls in the Contract</h3>
+
+<ul>
+  <li><code>response_format: {"type": "json_schema", ...}</code> and <code>tools</code> are part of the request contract. The server either enforces them (constrained decoding, Volume 13) or rejects them with a 400. Silently ignoring an unsupported field is the worst option.</li>
+  <li>Tool-call arguments stream as partial JSON fragments in <code>delta.tool_calls</code>. Clients must accumulate and parse at the end; gateways must not attempt to validate partial fragments.</li>
+  <li>Version the contract (<code>/v1</code>) and add fields, never change meanings. Engines differ in which OpenAI fields they honour; your gateway is where you normalise that.</li>
+</ul>
+
+<h3>Real-Product Case Study: Chat Assistant APIs</h3>
+
+<p>Every contract decision above has a public reference implementation: the APIs behind ChatGPT,
+Claude and Gemini. Their external behaviour is documented; the fleets behind them are not. Label
+accordingly.</p>
+
+<p class="facet">Problem</p>
+<ul>
+  <li><span class="evidence inferred">Inferred</span> Serve millions of interactive, long-lived streams from a shared GPU fleet to both
+  first-party apps and third-party developers, with fair allocation between tenants and a price
+  that tracks the real cost of prefill and decode.</li>
+</ul>
+
+<p class="facet">Workflow and published API behaviour</p>
+<ul>
+  <li><span class="evidence documented">Documented</span> All three stream over Server-Sent Events: OpenAI Chat Completions ends with
+  <code>data: [DONE]</code>; Anthropic's Messages API emits typed events ending in
+  <code>message_stop</code>; the Gemini API exposes <code>streamGenerateContent</code>, which returns
+  SSE with <code>alt=sse</code> (each provider's API reference).</li>
+  <li><span class="evidence documented">Documented</span> Rate limits are published per model as requests and tokens per minute, organised in
+  usage tiers that rise with spend. Anthropic splits input and output tokens per minute; OpenAI and
+  Anthropic return remaining-quota headers and <code>retry-after</code> on 429 (OpenAI rate-limits
+  guide; Anthropic rate-limits docs).</li>
+  <li><span class="evidence documented">Documented</span> Anthropic separates caller-side 429 <code>rate_limit_error</code> from service-side 529
+  <code>overloaded_error</code> (Anthropic errors docs) — the distinction this chapter recommends.</li>
+  <li><span class="evidence documented">Documented</span> Consumer plans apply usage caps that reset over a time window, and ChatGPT's help pages
+  have described falling back to a smaller model once a plan's flagship-model limit is reached
+  (OpenAI and Anthropic help-centre articles; details change by plan).</li>
+</ul>
+
+<p class="facet">Model, tools and guardrails at the serving layer</p>
+<ul>
+  <li><span class="evidence documented">Documented</span> Tool calls stream as incremental argument fragments (OpenAI <code>delta.tool_calls</code>;
+  Anthropic <code>input_json_delta</code>), so clients must accumulate before parsing.</li>
+  <li><span class="evidence inferred">Inferred</span> Behind the API: an admission layer enforcing per-organisation token buckets, priority
+  lanes for first-party traffic, prefix-cache-aware routing for shared system prompts, and
+  multi-region failover. None of this is published as a service graph; it is the design this
+  volume would build for the same external contract.</li>
+</ul>
+
+<p class="facet">Evaluation</p>
+<ul>
+  <li><span class="evidence documented">Documented</span> Each provider runs a public status page with incident history (for example
+  status.openai.com, status.anthropic.com), which is the only public view of availability.</li>
+  <li><span class="evidence inferred">Inferred</span> Internal TTFT and inter-token latency SLOs are not published; third-party benchmarking
+  sites measure them from outside, with network noise included.</li>
+</ul>
+
+<p class="facet">Cost</p>
+<ul>
+  <li><span class="evidence documented">Documented</span> Pricing pages charge per million tokens with output priced several times higher than
+  input, discount cached input, and offer asynchronous batch APIs at roughly half price with a
+  24-hour completion window (OpenAI Batch API; Anthropic Message Batches API).</li>
+  <li><span class="evidence inferred">Inferred</span> The output premium mirrors the economics in Chapter 1: decode is memory-bandwidth-bound
+  and holds KV memory for the whole stream, while prefill is compute-dense and batches well.</li>
+</ul>
+
+<div class="frame exercise"><p>Add <code>stream_options.include_usage</code> support: when set, emit a
+final chunk with an empty <code>choices</code> list and a <code>usage</code> object before
+<code>[DONE]</code>. Then write a client-side parser that raises on an in-stream error event.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="model-server">Building a Model Server</h2>
+<p class="chapter-lede">Before deploying vLLM or TGI, build the thing they are. A model server is a
+small amount of HTTP code wrapped around a scheduler, and nearly every production incident lives in
+the scheduler: unbounded queues, work for clients who have gone, a blocked event loop, a replica that
+reports healthy while wedged. This chapter builds <code>forge.serve</code> with all four handled,
+runs it against a real model, and load-tests it.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>The obvious server calls <code>model.generate()</code> inside the request handler. It serves one
+  request at a time per worker, blocks the event loop for the whole generation, never batches, keeps
+  generating after the user closes the tab, and under a traffic spike queues requests until every one
+  of them times out. Adding workers multiplies GPU memory, not throughput.</p>
+</div>
+
+<h3>Simple Version Versus Production Version</h3>
+
+<div class="frame simple">
+  <pre><code class="language-python">@app.post("/generate")
+def generate(prompt: str):
+    return {"text": tok.decode(model.generate(**tok(prompt, return_tensors="pt"))[0])}</code></pre>
+  <p>Correct for a demo with one user.</p>
+</div>
+
+<div class="frame production">
+  <ul>
+    <li>Handlers only validate, enqueue and stream; <strong>one scheduler task owns the model</strong>.</li>
+    <li>The scheduler runs a <strong>step loop</strong>: each iteration admits waiting sequences into free batch slots, runs one batched decode step, and routes each new token to its request's queue (continuous batching, Yu et al., 2022; Volume 11).</li>
+    <li><strong>Bounded admission</strong>: a full queue returns 429 with <code>Retry-After</code> immediately.</li>
+    <li><strong>Cancellation</strong>: a disconnected stream marks its sequence cancelled; the next step drops it and frees the slot.</li>
+    <li><strong>Deadlines</strong>: a sequence whose deadline passed while queued is dropped before it costs a GPU step.</li>
+    <li><strong>Health</strong>: liveness checks the scheduler heartbeat; readiness is false during load and drain.</li>
+  </ul>
+</div>
+
+<div class="frame why-complex">
+  <ul>
+    <li>The GPU is a single, shared, stateful resource; HTTP concurrency must be decoupled from model concurrency.</li>
+    <li>Asyncio makes it easy to block the event loop by accident: one synchronous forward pass freezes health checks, streaming and admission for every request.</li>
+    <li>Disconnect detection depends on the ASGI server, the proxy chain and whether the response is streaming.</li>
+  </ul>
+</div>
+
+<h3>Architecture</h3>
+
+<figure class="diagram">
+  <div class="arch">
+    <div class="arch-layer" data-label="Clients">
+      <div class="node client">SDK / httpx<small>stream=true</small></div>
+      <div class="node client">Load balancer<small>polls /readyz</small></div>
+    </div>
+    <div class="arch-layer" data-label="HTTP (event loop)">
+      <div class="node gateway">FastAPI handlers<small>validate · idempotency · SSE</small></div>
+      <div class="node guard">Admission<small>queue limit → 429</small></div>
+      <div class="node obs">/healthz · /readyz · /metrics</div>
+    </div>
+    <div class="arch-layer" data-label="Scheduler">
+      <div class="node queue">Waiting deque<small>bounded</small></div>
+      <div class="node service">Step loop<small>join · drop cancelled/expired · step</small></div>
+      <div class="node queue">Per-request token queues</div>
+    </div>
+    <div class="arch-layer" data-label="Engine (worker thread)">
+      <div class="node model">Engine.step(batch)<small>FakeEngine · HFEngine</small></div>
+      <div class="node gpu">Accelerator<small>CPU here; GPU in production</small></div>
+    </div>
+  </div>
+  <figcaption>Structure of <code>forge.serve</code>. The event loop never runs the model; the engine never touches HTTP.</figcaption>
+</figure>
+
+<h3>The Engine Interface</h3>
+
+<p>The scheduler needs one operation: given a batch of token sequences, return the next token for
+each. Any engine that can do this can join continuous batching at step granularity.</p>
+
+<figure class="listing">
+<figcaption>Two engines behind one interface: a fake with a GPU-like cost model, and a real causal LM (<code>engines.py</code>).</figcaption>
+<pre><code>"""Engines expose one batched decode step: token ids in, next token per sequence out."""
+import time
+from typing import Protocol
+
+
+class Engine(Protocol):
+    name: str
+    eos_id: int
+
+    def encode(self, text: str) -&gt; list[int]: ...
+    def step(self, batch: list[list[int]]) -&gt; list[int]: ...  # greedy next token each
+    def decode(self, ids: list[int]) -&gt; str: ...
+
+
+class FakeEngine:
+    """Deterministic engine with a GPU-like cost model: a fixed cost per step
+    (weights are read once per step) plus a small cost per sequence in the batch."""
+
+    name, eos_id = "fake", 0
+    WORDS = ["the", "server", "streams", "tokens", "while", "batching", "requests"]
+
+    def __init__(self, step_ms: float = 20.0, per_seq_ms: float = 1.0):
+        self.step_ms, self.per_seq_ms = step_ms, per_seq_ms
+
+    def encode(self, text: str) -&gt; list[int]:
+        return [1 + (hash(w) % 7) for w in text.split()] or [1]
+
+    def step(self, batch: list[list[int]]) -&gt; list[int]:
+        time.sleep((self.step_ms + self.per_seq_ms * len(batch)) / 1000)
+        return [1 + (len(ids) % 7) for ids in batch]
+
+    def decode(self, ids: list[int]) -&gt; str:
+        return "".join(" " + self.WORDS[i - 1] for i in ids)
+
+
+class HFEngine:
+    """A real causal LM. No KV cache: every step re-runs the padded batch, which is
+    quadratic but lets sequences join and leave the batch at any step."""
+
+    def __init__(self, model_id: str = "HuggingFaceTB/SmolLM2-135M"):
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        self.torch, self.name = torch, model_id.split("/")[-1].lower()
+        self.tok = AutoTokenizer.from_pretrained(model_id)
+        self.model = AutoModelForCausalLM.from_pretrained(model_id).eval()
+        self.eos_id = self.tok.eos_token_id
+
+    def encode(self, text: str) -&gt; list[int]:
+        return self.tok.encode(text)
+
+    def step(self, batch: list[list[int]]) -&gt; list[int]:
+        torch = self.torch
+        width = max(len(ids) for ids in batch)
+        ids = torch.full((len(batch), width), self.eos_id)  # left-padded (B, T)
+        mask = torch.zeros((len(batch), width), dtype=torch.long)
+        for i, seq in enumerate(batch):
+            ids[i, width - len(seq):] = torch.tensor(seq)
+            mask[i, width - len(seq):] = 1
+        pos = (mask.cumsum(-1) - 1).clamp(min=0)  # positions ignore padding
+        with torch.no_grad():
+            logits = self.model(input_ids=ids, attention_mask=mask,
+                                position_ids=pos).logits  # (B, T, V)
+        return logits[:, -1].argmax(-1).tolist()
+
+    def decode(self, ids: list[int]) -&gt; str:
+        return self.tok.decode(ids)</code></pre>
+</figure>
+
+<ul>
+  <li><code>HFEngine</code> deliberately has no KV cache so that the scheduler logic stays visible. A production engine keeps a paged KV cache per sequence (Kwon et al., 2023) and the step costs <span class="math">O(1)</span> in sequence length instead of <span class="math">O(T)</span>.</li>
+  <li>The fake's cost model (20 ms per step + 1 ms per sequence) captures the fact that matters for scheduling: decode is memory-bound, so adding a sequence to a batch is nearly free until the batch is large.</li>
+</ul>
+
+<h3>The Scheduler and the HTTP Layer</h3>
+
+<figure class="listing">
+<figcaption><code>forge.serve</code>: bounded admission, a step-level batching loop, deadlines, cancellation, SSE streaming, idempotency and health endpoints (<code>server.py</code>).</figcaption>
+<pre><code>"""forge.serve: an OpenAI-compatible model server with a continuous-batching loop."""
+import asyncio
+import os
+import time
+from collections import deque
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+
+from fastapi import FastAPI, Header, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from contract import (APIError, ChatCompletionChunk, ChatCompletionRequest,
+                      ChatCompletionResponse, ChatMessage, Choice, ChunkChoice, Delta,
+                      IdempotencyStore, Usage, new_id, sse)
+from engines import FakeEngine, HFEngine
+
+
+@dataclass
+class Seq:
+    prompt: list[int]
+    max_tokens: int
+    deadline: float
+    out: asyncio.Queue = field(default_factory=asyncio.Queue)
+    generated: list[int] = field(default_factory=list)
+    cancelled: bool = False
+    done: bool = False
+
+
+class Scheduler:
+    def __init__(self, engine, max_batch: int = 8, max_queue: int = 32):
+        self.engine, self.max_batch, self.max_queue = engine, max_batch, max_queue
+        self.waiting: deque[Seq] = deque()
+        self.running: list[Seq] = []
+        self.wake = asyncio.Event()
+        self.heartbeat = time.monotonic()
+        self.stats = dict(admitted=0, rejected=0, cancelled=0, expired=0, completed=0,
+                          steps=0, seq_steps=0)
+
+    def submit(self, seq: Seq) -&gt; None:
+        depth = len(self.waiting) + len(self.running)
+        if depth &gt;= self.max_queue:  # backpressure: fail fast, do not queue forever
+            self.stats["rejected"] += 1
+            raise APIError("rate_limit_error", f"queue full ({depth})", retry_after_s=1)
+        self.stats["admitted"] += 1
+        self.waiting.append(seq)
+        self.wake.set()
+
+    def _finish(self, s: Seq, reason: str, stat: str) -&gt; None:
+        s.done = True
+        self.stats[stat] += 1
+        s.out.put_nowait(("", reason))
+
+    async def run(self) -&gt; None:
+        while True:
+            self.heartbeat = time.monotonic()
+            if not self.waiting and not self.running:
+                self.wake.clear()
+                await self.wake.wait()
+                continue
+            now = time.monotonic()
+            while self.waiting and len(self.running) &lt; self.max_batch:  # join at step
+                s = self.waiting.popleft()
+                if s.cancelled:
+                    self.stats["cancelled"] += 1
+                elif now &gt; s.deadline:  # shed work nobody is waiting for any more
+                    self._finish(s, "timeout", "expired")
+                else:
+                    self.running.append(s)
+            for s in [s for s in self.running if s.cancelled]:
+                self.stats["cancelled"] += 1
+            self.running = [s for s in self.running if not s.cancelled]
+            if not self.running:
+                continue
+            batch = [s.prompt + s.generated for s in self.running]
+            nxt = await asyncio.to_thread(self.engine.step, batch)  # loop stays live
+            self.stats["steps"] += 1
+            self.stats["seq_steps"] += len(batch)
+            for s, tok in zip(self.running, nxt):
+                if s.cancelled:
+                    continue
+                if tok == self.engine.eos_id:
+                    self._finish(s, "stop", "completed")
+                    continue
+                s.generated.append(tok)
+                s.out.put_nowait((tok, None))
+                if len(s.generated) &gt;= s.max_tokens:
+                    self._finish(s, "length", "completed")
+            self.running = [s for s in self.running if not s.done]
+
+
+ENGINE = os.environ.get("ENGINE", "fake")
+state: dict = {"ready": False, "draining": False}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    engine = HFEngine() if ENGINE == "hf" else FakeEngine()
+    engine.step([engine.encode("warm up")])  # first call pays lazy init, not a user
+    sched = Scheduler(engine, max_batch=int(os.environ.get("MAX_BATCH", 8)),
+                      max_queue=int(os.environ.get("MAX_QUEUE", 32)))
+    task = asyncio.create_task(sched.run())
+    state.update(sched=sched, engine=engine, idem=IdempotencyStore(), ready=True)
+    yield
+    state.update(ready=False, draining=True)  # SIGTERM: fail readiness, then stop
+    task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.exception_handler(APIError)
+async def api_error(_: Request, e: APIError) -&gt; JSONResponse:
+    headers = {"Retry-After": str(int(e.retry_after_s))} if e.retry_after_s else {}
+    return JSONResponse(e.body(), status_code=e.status, headers=headers)
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid(_: Request, e: RequestValidationError) -&gt; JSONResponse:
+    err = e.errors()[0]  # map pydantic's 422 onto the contract's 400 taxonomy
+    loc = ".".join(str(x) for x in err["loc"][1:])
+    e400 = APIError("invalid_request_error", f"{loc}: {err['msg']}")
+    return JSONResponse(e400.body(), status_code=400)
+
+
+@app.get("/healthz")  # liveness: is the process wedged?
+async def healthz():
+    age = time.monotonic() - state["sched"].heartbeat
+    busy = bool(state["sched"].running)
+    ok = age &lt; 30 or not busy
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 500)
+
+
+@app.get("/readyz")  # readiness: should the load balancer send traffic here?
+async def readyz():
+    ok = state["ready"] and not state["draining"]
+    return JSONResponse({"ready": ok}, status_code=200 if ok else 503)
+
+
+@app.get("/metrics")
+async def metrics():
+    s = state["sched"]
+    return {**s.stats, "queue_depth": len(s.waiting), "running": len(s.running),
+            "mean_batch": round(s.stats["seq_steps"] / max(s.stats["steps"], 1), 2)}
+
+
+def render_prompt(req: ChatCompletionRequest) -&gt; str:
+    turns = [f"{m.role.capitalize()}: {m.content}" for m in req.messages]
+    return "\n".join(turns) + "\nAssistant:"
+
+
+@app.post("/v1/chat/completions")
+async def chat(req: ChatCompletionRequest,
+               idempotency_key: str | None = Header(default=None),
+               x_request_timeout: float = Header(default=30.0)):
+    engine, sched = state["engine"], state["sched"]
+    if idempotency_key and not req.stream:
+        replay = state["idem"].begin(idempotency_key, req)
+        if replay:
+            return JSONResponse(replay, headers={"Idempotent-Replayed": "true"})
+    prompt = engine.encode(render_prompt(req))
+    seq = Seq(prompt, req.max_tokens, time.monotonic() + x_request_timeout)
+    try:
+        sched.submit(seq)
+    except APIError:
+        if idempotency_key and not req.stream:
+            state["idem"].abort(idempotency_key)
+        raise
+    rid, created = new_id(), int(time.time())
+
+    if req.stream:
+        async def events():
+            text = ""
+            try:
+                yield sse(ChatCompletionChunk(
+                    id=rid, created=created, model=req.model,
+                    choices=[ChunkChoice(delta=Delta(role="assistant"))]))
+                while True:
+                    tok, reason = await seq.out.get()
+                    if reason:
+                        yield sse(ChatCompletionChunk(
+                            id=rid, created=created, model=req.model,
+                            choices=[ChunkChoice(delta=Delta(), finish_reason=reason)]))
+                        yield sse("[DONE]")
+                        return
+                    full = engine.decode(seq.generated)  # decode whole: safe for UTF-8
+                    piece, text = full[len(text):], full
+                    yield sse(ChatCompletionChunk(
+                        id=rid, created=created, model=req.model,
+                        choices=[ChunkChoice(delta=Delta(content=piece))]))
+            finally:
+                if not seq.done:
+                    seq.cancelled = True  # client went away: free the batch slot
+
+        return StreamingResponse(events(), media_type="text/event-stream")
+
+    reason = None
+    while reason is None:
+        _, reason = await seq.out.get()
+    if reason == "timeout":
+        if idempotency_key:
+            state["idem"].abort(idempotency_key)
+        raise APIError("timeout_error", "deadline exceeded in queue")
+    resp = ChatCompletionResponse(
+        id=rid, created=created, model=req.model,
+        choices=[Choice(message=ChatMessage(role="assistant",
+                                            content=engine.decode(seq.generated)),
+                        finish_reason=reason)],
+        usage=Usage(prompt_tokens=len(prompt), completion_tokens=len(seq.generated),
+                    total_tokens=len(prompt) + len(seq.generated))).model_dump()
+    if idempotency_key:
+        state["idem"].finish(idempotency_key, resp)
+    return resp</code></pre>
+</figure>
+
+<p class="facet">Design decisions in this code</p>
+<ul>
+  <li><strong><code>asyncio.to_thread(engine.step, ...)</code></strong> keeps the event loop free during the forward pass, so health checks, admission and streaming keep working. PyTorch releases the GIL inside kernels. A production engine runs the model in a separate process (vLLM's engine core) and talks to the API process over IPC.</li>
+  <li><strong>Admission counts waiting + running</strong>. The limit should come from the SLO: with measured throughput <span class="math">\mu</span> requests/s and a TTFT budget <span class="math">B</span>, a queue longer than about <span class="math">\mu B</span> guarantees that newcomers miss the SLO, so reject them now rather than time them out later.</li>
+  <li><strong>Cancellation via <code>finally</code></strong>: when the client disconnects, Starlette cancels the streaming generator; <code>finally</code> marks the sequence and the scheduler drops it before the next step. Non-streaming requests in this server are <em>not</em> cancelled on disconnect; add a watcher on <code>request.is_disconnected()</code> for that.</li>
+  <li><strong>Deadline from a header</strong> (<code>X-Request-Timeout</code>): the caller's remaining budget travels with the request, so the server never spends GPU time on an answer nobody will read (Chapter 9).</li>
+  <li><strong>Incremental detokenisation</strong> decodes the full sequence and emits the new suffix. Decoding token by token breaks multi-byte UTF-8 characters and some tokenisers' whitespace rules.</li>
+  <li><strong>Warm-up in <code>lifespan</code></strong> before readiness flips: lazy initialisation (CUDA context, kernel autotuning, graph capture) is paid by the platform, not the first user.</li>
+</ul>
+
+<h3>Running It Against a Real Model</h3>
+
+<figure class="listing">
+<figcaption>Start the server with SmolLM2-135M in a uvicorn subprocess and exercise every path with httpx: plain, idempotent replay, validation, streaming, backpressure and disconnect (<code>run_server.py</code>).</figcaption>
+<pre><code>"""Start forge.serve with a real model in a subprocess and exercise it with httpx."""
+import asyncio
+import json
+import os
+import subprocess
+import sys
+import time
+
+import httpx
+
+BASE = "http://127.0.0.1:8012"
+env = {**os.environ, "ENGINE": "hf", "MAX_BATCH": "4", "MAX_QUEUE": "8"}
+proc = subprocess.Popen([sys.executable, "-m", "uvicorn", "server:app",
+                         "--port", "8012", "--log-level", "warning"], env=env)
+t0 = time.time()
+while True:  # poll readiness, as a Kubernetes readiness probe would
+    try:
+        if httpx.get(f"{BASE}/readyz").status_code == 200:
+            break
+    except httpx.ConnectError:
+        pass
+    time.sleep(0.2)
+print(f"ready after {time.time() - t0:.1f}s (process start + weights + warm-up)")
+
+body = {"model": "smollm2-135m", "max_tokens": 12,
+        "messages": [{"role": "user", "content": "What is the capital of France?"}]}
+
+r = httpx.post(f"{BASE}/v1/chat/completions", json=body, timeout=30,
+               headers={"Idempotency-Key": "order-42"})
+out = r.json()
+print(r.status_code, repr(out["choices"][0]["message"]["content"]), out["usage"])
+r2 = httpx.post(f"{BASE}/v1/chat/completions", json=body, timeout=30,
+                headers={"Idempotency-Key": "order-42"})
+print("replay:", r2.headers.get("idempotent-replayed"), r2.json()["id"] == out["id"])
+bad = httpx.post(f"{BASE}/v1/chat/completions", json={**body, "max_tokens": 0})
+print("invalid:", bad.status_code, bad.json()["error"])
+
+print("--- streaming ---")
+t_start, ttft, pieces = time.perf_counter(), None, []
+with httpx.stream("POST", f"{BASE}/v1/chat/completions", timeout=30,
+                  json={**body, "stream": True}) as s:
+    for line in s.iter_lines():
+        if not line.startswith("data: "):
+            continue
+        data = line[len("data: "):]
+        if data == "[DONE]":
+            break
+        choice = json.loads(data)["choices"][0]
+        if choice["delta"].get("content"):
+            ttft = ttft or time.perf_counter() - t_start
+            pieces.append(choice["delta"]["content"])
+        if choice.get("finish_reason"):
+            print("finish_reason:", choice["finish_reason"])
+print("chunks:", pieces)
+total = time.perf_counter() - t_start
+print(f"TTFT {ttft * 1000:.0f} ms, total {total * 1000:.0f} ms")
+
+
+async def burst(n: int) -&gt; list[int]:
+    async with httpx.AsyncClient(base_url=BASE, timeout=60) as c:
+        rs = await asyncio.gather(*[c.post("/v1/chat/completions",
+                                           json={**body, "max_tokens": 16})
+                                    for _ in range(n)])
+    return [r.status_code for r in rs]
+
+codes = asyncio.run(burst(16))
+print("--- burst of 16, queue limit 8 ---")
+print({c: codes.count(c) for c in set(codes)})
+
+
+async def disconnect_after(n_chunks: int) -&gt; None:
+    async with httpx.AsyncClient(base_url=BASE, timeout=30) as c:
+        async with c.stream("POST", "/v1/chat/completions",
+                            json={**body, "stream": True, "max_tokens": 200}) as s:
+            seen = 0
+            async for line in s.aiter_lines():
+                seen += line.startswith("data: ")
+                if seen &gt;= n_chunks:
+                    break  # leaving the context manager closes the connection
+
+asyncio.run(disconnect_after(4))
+time.sleep(1.0)
+m = httpx.get(f"{BASE}/metrics").json()
+print("metrics:", m)
+proc.terminate()
+proc.wait()</code></pre>
+</figure>
+
+<pre class="output">ready after 7.3s (process start + weights + warm-up)
+200 ' Paris.\n\nQuestion: What is the capital of France' {'prompt_tokens': 13, 'completion_tokens': 12, 'total_tokens': 25}
+replay: true True
+invalid: 400 {'type': 'invalid_request_error', 'message': 'max_tokens: Input should be greater than or equal to 1', 'retryable': False}
+--- streaming ---
+finish_reason: length
+chunks: [' Paris', '.', '\n', '\n', 'Question', ':', ' What', ' is', ' the', ' capital', ' of', ' France']
+TTFT 123 ms, total 1553 ms
+--- burst of 16, queue limit 8 ---
+{200: 8, 429: 8}
+metrics: {'admitted': 11, 'rejected': 8, 'cancelled': 1, 'expired': 0, 'completed': 10, 'steps': 61, 'seq_steps': 156, 'queue_depth': 0, 'running': 0, 'mean_batch': 2.56}</pre>
+
+<ul>
+  <li><strong>Cold start</strong> of 7.3 s is for a 270 MB model on a laptop. A 70B model on GPUs takes minutes; Chapter 5 attacks that number.</li>
+  <li><strong>Correct answer, then rambling</strong>: SmolLM2-135M is a base model; it answers and then continues the pattern ("Question: ..."). A stop sequence (<code>stop=["\nQuestion"]</code>) or an instruction-tuned model fixes it; the serving path is unchanged.</li>
+  <li><strong>Idempotent replay</strong> returned the same response id without running the model again.</li>
+  <li><strong>Backpressure</strong>: 16 simultaneous requests against a limit of 8 produce exactly 8 immediate 429s, not 16 slow requests.</li>
+  <li><strong>Cancellation</strong>: the client that disconnected after 4 events asked for 200 tokens; the metrics show <code>cancelled: 1</code> and an idle scheduler one second later, so those GPU steps were never spent.</li>
+  <li><strong>Mean batch 2.56</strong>: even this toy workload batches because the burst requests joined the loop at step boundaries.</li>
+</ul>
+
+<h3>A Load Generator</h3>
+
+<p>Most home-grown load tests are <em>closed-loop</em>: N workers each send a request and wait. When
+the server slows, the workers send less, and the test hides exactly the queueing it was meant to
+find (coordinated omission). Use <em>open-loop</em> Poisson arrivals at a fixed rate instead.</p>
+
+<figure class="listing">
+<figcaption>An asyncio open-loop load generator measuring TTFT, end-to-end latency percentiles and token throughput over streaming requests (<code>loadgen.py</code>).</figcaption>
+<pre><code>"""Open-loop load generator: Poisson arrivals, streaming requests, TTFT and latency."""
+import asyncio
+import json
+import os
+import random
+import subprocess
+import sys
+import time
+
+import httpx
+
+
+def pct(xs: list[float], p: float) -&gt; float:
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(p / 100 * len(xs)))] if xs else float("nan")
+
+
+async def one(c: httpx.AsyncClient, res: dict, max_tokens: int) -&gt; None:
+    body = {"model": "fake", "stream": True, "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": "load test prompt"}]}
+    t0, first, n = time.perf_counter(), None, 0
+    try:
+        async with c.stream("POST", "/v1/chat/completions", json=body) as s:
+            if s.status_code != 200:
+                res["errors"][s.status_code] = res["errors"].get(s.status_code, 0) + 1
+                return
+            async for line in s.aiter_lines():
+                if line.startswith("data: {") and '"content"' in line:
+                    first = first or time.perf_counter()
+                    n += 1
+    except httpx.HTTPError as e:
+        res["errors"][type(e).__name__] = res["errors"].get(type(e).__name__, 0) + 1
+        return
+    res["ttft"].append(first - t0)
+    res["lat"].append(time.perf_counter() - t0)
+    res["tokens"] += n
+
+
+async def run(rate: float, duration_s: float, max_tokens: int, base: str) -&gt; dict:
+    res = {"ttft": [], "lat": [], "tokens": 0, "errors": {}}
+    rng, tasks = random.Random(0), []
+    limits = httpx.Limits(max_connections=1000)
+    async with httpx.AsyncClient(base_url=base, timeout=60, limits=limits) as c:
+        t0 = time.perf_counter()
+        while (now := time.perf_counter() - t0) &lt; duration_s:
+            tasks.append(asyncio.create_task(one(c, res, max_tokens)))
+            await asyncio.sleep(rng.expovariate(rate))  # open loop: do not wait
+        await asyncio.gather(*tasks)
+        res["wall"] = time.perf_counter() - t0
+    return res
+
+
+def serve(max_batch: int, port: int) -&gt; subprocess.Popen:
+    env = {**os.environ, "ENGINE": "fake", "MAX_BATCH": str(max_batch),
+           "MAX_QUEUE": "64"}
+    p = subprocess.Popen([sys.executable, "-m", "uvicorn", "server:app", "--port",
+                          str(port), "--log-level", "warning"], env=env)
+    while True:
+        try:
+            if httpx.get(f"http://127.0.0.1:{port}/readyz").status_code == 200:
+                return p
+        except httpx.ConnectError:
+            time.sleep(0.1)
+
+
+print(f"{'batch':&gt;5} {'rate':&gt;5} {'ok':&gt;4} {'429':&gt;4} {'TTFT p50':&gt;9} {'TTFT p95':&gt;9} "
+      f"{'lat p50':&gt;8} {'lat p95':&gt;8} {'tok/s':&gt;6}")
+for max_batch, rates in ((1, (2, 8)), (16, (8, 24, 40, 64))):
+    proc = serve(max_batch, 8013)
+    for rate in rates:
+        r = asyncio.run(run(rate, 3.0, 16, "http://127.0.0.1:8013"))
+        m = lambda xs, p: f"{pct(xs, p) * 1000:7.0f}ms"
+        n429 = r["errors"].get(429, 0)
+        print(f"{max_batch:&gt;5} {rate:&gt;5} {len(r['lat']):&gt;4} {n429:&gt;4} "
+              f"{m(r['ttft'], 50):&gt;9} {m(r['ttft'], 95):&gt;9} {m(r['lat'], 50):&gt;8} "
+              f"{m(r['lat'], 95):&gt;8} {r['tokens'] / r['wall']:6.0f}")
+    proc.terminate()
+    proc.wait()</code></pre>
+</figure>
+
+<pre class="output">batch  rate   ok  429  TTFT p50  TTFT p95  lat p50  lat p95  tok/s
+    1     2    7    0     233ms     855ms     672ms    1288ms     28
+    1     8   20    0    3554ms    5886ms    3993ms    6300ms     35
+   16     8   20    0      56ms      72ms     547ms     572ms     94
+   16    24   61    0      65ms      95ms     673ms     740ms    272
+   16    40   95    0     454ms    1113ms    1126ms    1755ms    337
+   16    64  124   37    1207ms    2134ms    1853ms    2799ms    347</pre>
+
+<ul>
+  <li><strong>Batch 1 saturates at ~35 tok/s</strong> (one token per ~21 ms step). At 8 req/s the queue grows without bound for the whole test and TTFT p95 reaches 5.9 s.</li>
+  <li><strong>Batch 16 at the same 8 req/s</strong>: TTFT p95 72 ms. The same "hardware" serves the load comfortably because each step now produces up to 16 tokens.</li>
+  <li><strong>The knee</strong> is between 24 and 40 req/s: throughput grows only 24% while TTFT p95 grows 12×. That is the queueing hockey stick; operate on the left of it.</li>
+  <li><strong>At 64 req/s</strong> the queue limit converts overload into 37 fast 429s. Latency for admitted requests is still poor because the limit (64) is above <span class="math">\mu B</span>; derive it from the SLO, as described above.</li>
+  <li>Tokens/s includes the drain after arrivals stop, so it understates peak throughput slightly; a longer run fixes this.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Report goodput (requests meeting both TTFT and TPOT SLOs per second), not raw throughput, when comparing configurations.</li>
+    <li>Replay a production prompt- and output-length distribution. A fixed 16-token output hides the head-of-line effects of long generations.</li>
+    <li>Run the generator on a different machine from the server in real tests; here both share one laptop.</li>
+  </ul>
+</aside>
+
+<h3>Failure Modes</h3>
+<ul class="failure-modes">
+  <li><strong>Blocking the event loop</strong>: a synchronous forward pass or tokeniser call in a handler freezes all streams and makes liveness fail, so Kubernetes restarts a healthy but busy pod.</li>
+  <li><strong>Unbounded queue</strong>: every request eventually times out; the replica does 100% work for 0% goodput.</li>
+  <li><strong>Orphaned generations</strong>: disconnects not propagated, often because a proxy buffers the stream or keeps the upstream connection open.</li>
+  <li><strong>Readiness tied to load</strong>: failing readiness when busy removes capacity exactly when it is needed and can cascade across replicas. Shed with 429 instead.</li>
+  <li><strong>Liveness that loads the model</strong>: a probe that runs inference times out under load and triggers restart loops.</li>
+  <li><strong>Multiple uvicorn workers per GPU</strong>: each worker loads its own weights; memory doubles and batching halves.</li>
+</ul>
+
+<div class="frame exercise"><p>Add a priority field (<code>interactive</code> or <code>batch</code>) and
+make admission into the running batch prefer interactive sequences. Then add chunked prefill to the
+fake engine (prefill costs 1 ms per 64 prompt tokens, in chunks of at most 512) and measure the TPOT
+of running sequences when a 16k-token prompt arrives, with and without chunking.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="engines">Production Serving Engines</h2>
+<p class="chapter-lede"><code>forge.serve</code> has the right shape and the wrong engine. Production
+engines keep the same outer loop (admit, step, stream) and replace the inside with paged KV memory,
+prefix caching, fused kernels, CUDA graphs, quantised weights, speculative decoding and multi-GPU
+parallelism. This chapter says what each engine abstracts, so you can choose one and know what you
+still own.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>The hand-built server re-runs the whole sequence at each step and holds no KV cache. On a GPU,
+  the gap between it and a tuned engine is one to two orders of magnitude in tokens per GPU-second.
+  Writing that engine yourself is a multi-year project; choosing the wrong one costs months of
+  migration.</p>
+</div>
+
+<h3>What an Engine Abstracts</h3>
+
+<figure class="diagram">
+<pre class="ascii">+--------------------------- what you still own ----------------------------+
+| auth, tenancy, quotas, routing, release, observability, cost, guardrails    |
++-----------------------------------------------------------------------------+
+| OpenAI-compatible HTTP server        (vLLM, SGLang, TGI, Ollama, llama.cpp) |
+| Scheduler: continuous batching, chunked prefill, priorities, preemption     |
+| KV memory manager: paging, prefix cache (hash or radix tree), CPU offload   |
+| Model executor: fused attention kernels, CUDA graphs, torch.compile         |
+| Parallelism: tensor, pipeline, expert, data; multi-node                     |
+| Weights: FP8/INT4/AWQ/GPTQ loading, LoRA adapters                           |
+| Decoding: sampling, speculative decoding, grammar-constrained outputs       |
++-----------------------------------------------------------------------------+</pre>
+<figcaption>Layers inside a modern LLM serving engine, and the layer above it that no engine provides.</figcaption>
+</figure>
+
+<h3>The Engines</h3>
+
+<table>
+  <caption>Production serving engines: what each abstracts and where it fits. Project details change quickly; check release notes before committing.</caption>
+  <thead><tr><th>Engine</th><th>Core abstraction</th><th>Strengths</th><th>Watch out for</th><th>Typical use</th></tr></thead>
+  <tbody>
+    <tr><td><strong>vLLM</strong></td><td>PagedAttention KV manager + continuous-batching scheduler; OpenAI server</td><td>Broadest model and hardware coverage (NVIDIA, AMD, TPU, others); automatic prefix caching; multi-LoRA; speculative decoding; structured outputs; large community</td><td>Fast-moving flags and defaults; performance depends on version and tuning</td><td>Default choice for self-hosted open-weight models</td></tr>
+    <tr><td><strong>SGLang</strong></td><td>RadixAttention (prefix cache as a radix tree) + low-overhead scheduler; frontend language for structured programs</td><td>Strong on prefix-heavy and agentic workloads; fast constrained decoding; strong large-MoE deployments</td><td>Smaller ecosystem than vLLM; fewer managed offerings</td><td>Agents, multi-call programs, shared-prefix workloads</td></tr>
+    <tr><td><strong>TGI</strong> (Hugging Face)</td><td>Rust router and batcher in front of model shards</td><td>Hub integration; production features early (streaming, metrics, watermarking)</td><td><span class="evidence inferred">Inferred</span> Project momentum has shifted toward vLLM and SGLang; read the repository README for its current maintenance status before adopting</td><td>Existing HF-centric stacks, Inference Endpoints</td></tr>
+    <tr><td><strong>TensorRT-LLM</strong> (NVIDIA)</td><td>Optimised kernels and model definitions, in-flight batching; FP8/FP4 paths</td><td><span class="evidence documented">Documented</span> NVIDIA's MLPerf Inference submissions use it; <span class="evidence inferred">Inferred</span> often the highest per-GPU throughput on recent NVIDIA hardware, but most published comparisons are vendor-run</td><td>NVIDIA only; build and version pinning complexity; engine rebuilds per configuration</td><td>Large, stable, cost-sensitive NVIDIA fleets</td></tr>
+    <tr><td><strong>Triton Inference Server</strong> (NVIDIA)</td><td>Multi-framework model server: model repository, dynamic batching, ensembles, HTTP/gRPC</td><td>Serves LLMs (via TensorRT-LLM or vLLM backends) next to vision, embedding and classical models; mature ops</td><td>Not an LLM engine itself; configuration heavy</td><td>Mixed-model platforms; pipelines of models</td></tr>
+    <tr><td><strong>Ollama</strong></td><td>Developer runtime on llama.cpp: pull, run, OpenAI-compatible API</td><td>Zero-setup local models, laptops and single-user boxes</td><td>Not built for multi-tenant, high-concurrency serving</td><td>Local development, offline demos, desktop apps</td></tr>
+    <tr><td><strong>llama.cpp</strong></td><td>Portable C/C++ inference, GGUF quantised formats, CPU/Metal/CUDA/Vulkan; <code>llama-server</code></td><td>Runs almost anywhere; aggressive quantisation; tiny footprint</td><td>Throughput at high concurrency far below GPU engines</td><td>Edge, CPU-only, on-device, embedded</td></tr>
+  </tbody>
+</table>
+
+<ul>
+  <li><strong>Distributed layers above engines</strong>: <span class="evidence documented">Documented</span> NVIDIA Dynamo (open-sourced 2025) and llm-d (Kubernetes-native, vLLM-based; announced 2025) document disaggregated serving in their repositories. These and similar projects add disaggregated prefill/decode, KV-aware routing and KV transfer between replicas. They are the multi-replica version of Chapter 7's router.</li>
+  <li><strong>Managed wrappers</strong>: KServe, Ray Serve, BentoML and the cloud endpoints (Chapter 10) typically run one of the engines above; they add deployment, scaling and routing, not a new engine.</li>
+</ul>
+
+<h3>Selection Matrix</h3>
+
+<pre class="mermaid">flowchart TD
+  A[Where does it run?] --&gt;|laptop, edge, CPU| B[llama.cpp / Ollama]
+  A --&gt;|data-centre GPUs| C{Mixed non-LLM models<br/>in one server?}
+  C --&gt;|yes| D[Triton + TensorRT-LLM or vLLM backend]
+  C --&gt;|no| E{Workload dominated by<br/>shared prefixes, agents,<br/>constrained decoding?}
+  E --&gt;|yes| F[SGLang; benchmark vLLM too]
+  E --&gt;|no| G{Large stable NVIDIA fleet,<br/>team can own builds?}
+  G --&gt;|yes| H[TensorRT-LLM; vLLM as baseline]
+  G --&gt;|no| I[vLLM]</pre>
+
+<aside class="callout warning"><span class="title">Trade-off</span>
+  <ul>
+    <li>Published engine benchmarks are workload-specific and quickly outdated. Choose with your own load test (Chapter 3 generator) using your prompt and output length distribution, at your SLO, on your hardware.</li>
+    <li>Keep the engine behind the OpenAI-compatible contract so it stays swappable. The expensive lock-in is engine-specific features in client code (custom sampling params, proprietary endpoints).</li>
+  </ul>
+</aside>
+
+<h3>From forge.serve to vLLM</h3>
+
+<table>
+  <caption>Mapping the hand-built server onto vLLM concepts.</caption>
+  <thead><tr><th><code>forge.serve</code></th><th>vLLM equivalent</th><th>Tuning knob</th></tr></thead>
+  <tbody>
+    <tr><td><code>max_batch</code></td><td>Max concurrent sequences; max batched tokens per step</td><td><code>--max-num-seqs</code>, <code>--max-num-batched-tokens</code></td></tr>
+    <tr><td>No KV cache</td><td>Paged KV blocks sized from free HBM</td><td><code>--gpu-memory-utilization</code>, <code>--max-model-len</code></td></tr>
+    <tr><td>Recompute per step</td><td>Automatic prefix caching</td><td><code>--enable-prefix-caching</code> (on by default in recent versions)</td></tr>
+    <tr><td><code>MAX_QUEUE</code> → 429</td><td>Not built in to the same degree; waiting queue grows</td><td>Gateway or router admission control; watch <code>num_requests_waiting</code></td></tr>
+    <tr><td>Cancellation in <code>finally</code></td><td>Abort on client disconnect</td><td>Verify through your proxy chain</td></tr>
+    <tr><td><code>/metrics</code> JSON</td><td>Prometheus metrics (queue, running, KV usage, TTFT, TPOT histograms)</td><td>Scrape and alert; drive autoscaling</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>Launching vLLM's OpenAI-compatible server (not executed: needs an NVIDIA GPU). Flags exist in current vLLM releases; pin the version.</figcaption>
+<pre><code>vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --tensor-parallel-size 1 \
+  --max-model-len 16384 \
+  --gpu-memory-utilization 0.90 \
+  --max-num-seqs 128 \
+  --enable-prefix-caching \
+  --enable-lora --max-loras 8 --max-lora-rank 16 \
+  --port 8000</code></pre>
+</figure>
+
+<div class="frame exercise"><p>Point the Chapter 3 load generator at a vLLM or Ollama endpoint
+(change the base URL and model name). Plot TTFT p95 and goodput against arrival rate for
+<code>--max-num-seqs</code> of 16, 64 and 256. Where does each configuration's knee fall?</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="containers">Containers for GPU Workloads</h2>
+<p class="chapter-lede">A GPU container is an ordinary OCI image with three unusual properties: it
+depends on a kernel driver it cannot ship, it is often 10–20 GB, and the most important artefact
+(the weights) is usually too large to belong in it. Those three facts decide your cold-start time,
+and cold-start time decides your autoscaling and your bill.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Traffic doubles at 09:00. The autoscaler asks for four more replicas. Each needs a GPU node
+  (minutes), a 12 GB image pull, 140 GB of weights, and a warm-up. The replicas are ready at 09:11,
+  after the spike has already burned the error budget.</p>
+</div>
+
+<h3>The CUDA Stack in a Container</h3>
+
+<figure class="diagram">
+<pre class="ascii">  container image                     host
++------------------------------+   +--------------------------------+
+| your server + engine (vLLM)  |   |                                |
+| PyTorch (bundles CUDA libs:  |   | NVIDIA kernel driver           |
+|  cuBLAS, cuDNN, NCCL)        |   |  (defines max CUDA version)    |
+| CUDA runtime (user space)    |   | NVIDIA Container Toolkit       |
+| base: nvidia/cuda:*-runtime  |   |  (mounts driver libs + /dev)   |
++------------------------------+   +--------------------------------+
+   image CUDA version &lt;= driver-supported CUDA version, or it fails at start</pre>
+<figcaption>What is in the image and what must come from the host.</figcaption>
+</figure>
+
+<ul>
+  <li>The driver is on the host; the NVIDIA Container Toolkit injects its user-space libraries and device nodes at run time. The image's CUDA runtime must be supported by that driver (NVIDIA publishes the compatibility matrix).</li>
+  <li>Use <code>-runtime</code> base images for serving; <code>-devel</code> images carry compilers and headers you need only to build kernels. Multi-stage builds keep them out of the final image.</li>
+  <li>PyTorch wheels bundle their own CUDA libraries, so a slim Python base plus the CUDA wheels often works; the <code>nvidia/cuda</code> base is still the safer default for engines with native extensions.</li>
+</ul>
+
+<h3>A Dockerfile for GPU Serving</h3>
+
+<figure class="listing">
+<figcaption>A multi-stage GPU image for <code>forge.serve</code> or a vLLM-based server (<strong>not executed</strong>: requires an NVIDIA host and registry). Weights are not baked in.</figcaption>
+<pre><code># syntax=docker/dockerfile:1.7
+# ---- build stage: resolve and compile Python deps once --------------------
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS build
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3-pip &amp;&amp; rm -rf /var/lib/apt/lists/*
+RUN python3.11 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+COPY requirements.lock .
+RUN pip install --require-hashes -r requirements.lock   # pinned: engine, torch, fastapi
+
+# ---- runtime stage: no compilers, non-root, small attack surface ----------
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends python3.11 \
+        &amp;&amp; rm -rf /var/lib/apt/lists/* &amp;&amp; useradd -u 10001 -m serve
+COPY --from=build /opt/venv /opt/venv
+COPY --chown=serve:serve forge/ /app/forge/
+ENV PATH=/opt/venv/bin:$PATH \
+    HF_HOME=/models/hf-cache \
+    HF_HUB_OFFLINE=1 \
+    MODEL_PATH=/models/llama-3.1-8b-instruct@sha256-9f2c \
+    PYTHONUNBUFFERED=1
+USER serve
+WORKDIR /app
+EXPOSE 8000
+# Weights arrive via a mounted volume (node-local cache or PVC), verified by digest.
+# exec form so SIGTERM reaches uvicorn and the lifespan drain runs.
+CMD ["uvicorn", "forge.serve.server:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--timeout-graceful-shutdown", "120"]</code></pre>
+</figure>
+
+<ul>
+  <li><strong>One uvicorn worker</strong>: the engine owns the GPU; scale with replicas, not workers.</li>
+  <li><strong>Pinned, hashed dependencies</strong>: engine versions change numerics and defaults. The image digest plus the weights digest is the deployable unit (Chapter 8).</li>
+  <li><strong><code>HF_HUB_OFFLINE=1</code></strong>: production pods must never download from the internet at start-up; it is slow, rate-limited and a supply-chain risk.</li>
+  <li><strong>Graceful shutdown</strong> longer than your longest generation, so in-flight streams finish during a rollout.</li>
+</ul>
+
+<h3>Weight Loading Strategies</h3>
+
+<table>
+  <caption>Where the weights live, and what each option costs.</caption>
+  <thead><tr><th>Strategy</th><th>Cold start</th><th>Pros</th><th>Cons</th></tr></thead>
+  <tbody>
+    <tr><td>Baked into the image</td><td>Image pull dominates</td><td>One immutable artefact; simple</td><td>40–150 GB images; registry and node disk pressure; rebuild per weight change</td></tr>
+    <tr><td>Download from object storage at start</td><td>Network-bound (minutes for 70B)</td><td>Small image; weights versioned separately</td><td>Every replica re-downloads; egress and throttling during scale-out</td></tr>
+    <tr><td>Shared network volume (NFS, Lustre, Filestore, EFS/FSx)</td><td>Throughput of the file system</td><td>Download once, mount everywhere</td><td>Shared file-system throughput collapses when many replicas load at once</td></tr>
+    <tr><td>Node-local NVMe cache (pre-warmed by a DaemonSet)</td><td>NVMe read speed</td><td>Fastest repeatable start</td><td>Cache management; first start on a new node still slow</td></tr>
+    <tr><td>Streaming loaders (read tensors from object storage directly into GPU memory, in parallel)</td><td>Near network line rate</td><td>No local disk staging</td><td>Extra dependency; tune concurrency per storage backend</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout security"><span class="title">Risk</span>
+  <ul>
+    <li>Load only <code>safetensors</code>. Pickle-based checkpoints (<code>.bin</code>, <code>.pt</code>) can execute arbitrary code at load time.</li>
+    <li>Verify weight digests against the registry record before loading, and never set <code>trust_remote_code</code> for models whose code you have not reviewed and pinned.</li>
+  </ul>
+</aside>
+
+<h3>Cold-Start Budget</h3>
+
+<figure class="listing">
+<figcaption>Where a 70B replica's cold start goes, and what each mitigation buys (illustrative bandwidths).</figcaption>
+<pre><code>"""Cold-start budget for a GPU replica: where the minutes go, and what each fix buys."""
+STAGES = ["node", "image", "weights", "load", "compile"]
+
+
+def cold_start(params_b: float, bytes_per_param: float, image_gb: float, node_s: float,
+               registry_gbps: float, weights_gbps: float, load_gbps: float,
+               compile_s: float) -&gt; dict:
+    w_gb = params_b * bytes_per_param
+    return {"node": node_s, "image": image_gb * 8 / registry_gbps,
+            "weights": w_gb * 8 / weights_gbps if weights_gbps else 0.0,
+            "load": w_gb / load_gbps, "compile": compile_s}
+
+
+base = dict(params_b=70, bytes_per_param=2, image_gb=12, node_s=240, registry_gbps=2,
+            weights_gbps=5, load_gbps=2, compile_s=60)
+scenarios = {
+    "naive (new node, pull, S3)": base,
+    "warm node pool": {**base, "node_s": 0},
+    "+ pre-pulled image": {**base, "node_s": 0, "image_gb": 0},
+    "+ node-local NVMe weights": {**base, "node_s": 0, "image_gb": 0, "weights_gbps": 0,
+                                  "load_gbps": 6},
+    "+ FP8 weights, cached graphs": {**base, "node_s": 0, "image_gb": 0,
+                                     "weights_gbps": 0, "load_gbps": 6,
+                                     "bytes_per_param": 1, "compile_s": 10},
+}
+print(f"{'scenario':30s}" + "".join(f"{s:&gt;9}" for s in STAGES) + f"{'total':&gt;9}")
+for name, kw in scenarios.items():
+    t = cold_start(**kw)
+    print(f"{name:30s}" + "".join(f"{t[s]:8.0f}s" for s in STAGES)
+          + f"{sum(t.values()):8.0f}s")</code></pre>
+</figure>
+
+<pre class="output">scenario                           node    image  weights     load  compile    total
+naive (new node, pull, S3)         240s      48s     224s      70s      60s     642s
+warm node pool                       0s      48s     224s      70s      60s     402s
++ pre-pulled image                   0s       0s     224s      70s      60s     354s
++ node-local NVMe weights            0s       0s       0s      23s      60s      83s
++ FP8 weights, cached graphs         0s       0s       0s      12s      10s      22s</pre>
+
+<ul>
+  <li>Moving weights off the network path is the single largest win; it is also the one most teams skip.</li>
+  <li>Compilation (CUDA graph capture, <code>torch.compile</code>, TensorRT engine builds) is easy to forget. Cache compiled artefacts keyed by model, engine version, GPU type and flags.</li>
+  <li>The remaining 22 s is why a small warm pool (Chapter 6) is still needed for sharp spikes.</li>
+</ul>
+
+<div class="frame exercise"><p>Measure the start-up phases of <code>forge.serve</code> with the HF
+engine: process start, tokeniser load, weight load and warm-up step. Add timings to
+<code>lifespan</code> and expose them in <code>/metrics</code>. Which phase would dominate for a 7B
+model on your laptop?</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="kubernetes">Kubernetes for Model Serving</h2>
+<p class="chapter-lede">Kubernetes descends from Borg and Omega (Burns et al., 2016) and was built for
+fungible CPU containers that start in seconds. Model servers are the opposite: scarce accelerators,
+minute-long starts, and a load signal that CPU utilisation does not capture. This chapter adapts the
+standard primitives (scheduling, probes, rollouts, autoscaling) to those facts.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>The default HPA scales on CPU. An LLM pod's CPU sits at 30% whether its queue is empty or
+  holds 500 requests, because the work happens on the GPU. The HPA never scales out, and when a
+  node fails, the replacement pod is killed by its liveness probe while it is still loading
+  weights.</p>
+</div>
+
+<h3>GPU Scheduling Primitives</h3>
+
+<ul>
+  <li><strong>Device plugin</strong>: the NVIDIA device plugin (usually installed by the GPU Operator, which also manages drivers and the container toolkit) advertises <code>nvidia.com/gpu</code> as an extended resource. GPUs are requested as integers in <code>limits</code>; they are not overcommitted.</li>
+  <li><strong>Node pools, taints and tolerations</strong>: GPU nodes are tainted so only GPU workloads land on them; serving pods tolerate the taint and select the GPU type with a node label.</li>
+  <li><strong>Sharing</strong>: MIG partitions an A100/H100 into isolated slices; time-slicing and MPS share without isolation. Use MIG for small models with isolation needs; avoid time-slicing for latency SLOs.</li>
+  <li><strong>Multi-GPU and multi-node</strong>: tensor parallel within a node needs all GPUs of one pod on one node (and NVLink); multi-node serving uses a leader/worker group (for example the LeaderWorkerSet API) scheduled as a unit.</li>
+  <li><strong>Dynamic Resource Allocation</strong> (DRA) is the newer Kubernetes API for describing devices with attributes rather than counts; check your cluster version and vendor support.</li>
+</ul>
+
+<h3>Deployment, Probes and Drain</h3>
+
+<figure class="listing">
+<figcaption>Deployment for a GPU model server with startup, readiness and liveness probes, graceful drain and a disruption budget (<strong>not executed</strong>).</figcaption>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forge-serve-llama8b
+  labels: {app: forge-serve, model: llama-3.1-8b, version: v2}
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}   # never drop below capacity
+  selector:
+    matchLabels: {app: forge-serve, model: llama-3.1-8b}
+  template:
+    metadata:
+      labels: {app: forge-serve, model: llama-3.1-8b, version: v2}
+      annotations: {prometheus.io/scrape: "true", prometheus.io/port: "8000"}
+    spec:
+      nodeSelector: {cloud.google.com/gke-accelerator: nvidia-h100-80gb}  # or equivalent
+      tolerations:
+        - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+      terminationGracePeriodSeconds: 180           # longest generation + drain
+      containers:
+        - name: server
+          image: registry.example.com/forge-serve@sha256:4be1...   # digest, not tag
+          args: ["--model", "/models/llama-3.1-8b-instruct@sha256-9f2c"]
+          ports: [{containerPort: 8000, name: http}]
+          resources:
+            limits: {nvidia.com/gpu: 1, memory: 64Gi}
+            requests: {cpu: "8", memory: 64Gi}
+          startupProbe:                            # allow up to 20 min to load
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 10
+            failureThreshold: 120
+          readinessProbe:                          # in or out of the Service
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:                           # wedged process only; cheap
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 15
+            failureThreshold: 4
+          lifecycle:
+            preStop:                               # let endpoints update first
+              exec: {command: ["sleep", "15"]}
+          volumeMounts:
+            - {name: weights, mountPath: /models, readOnly: true}
+            - {name: shm, mountPath: /dev/shm}     # NCCL / tensor parallel
+      volumes:
+        - name: weights
+          hostPath: {path: /mnt/nvme/models, type: Directory}   # pre-warmed cache
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 16Gi}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: forge-serve-llama8b}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: forge-serve, model: llama-3.1-8b}</code></pre>
+</figure>
+
+<ul>
+  <li><strong>startupProbe</strong> holds off liveness until the model has loaded. Without it, a liveness probe with a normal timeout kills every replica mid-load, forever.</li>
+  <li><strong>preStop sleep</strong> gives kube-proxy and the load balancer time to remove the endpoint before the server stops accepting; the lifespan drain then finishes in-flight streams.</li>
+  <li><strong><code>maxUnavailable: 0</code></strong> with <code>maxSurge: 1</code> needs a spare GPU during rollouts. If GPUs are fully booked, rollouts stall; budget one spare or roll by node pool.</li>
+</ul>
+
+<h3>Autoscaling on the Right Signal</h3>
+
+<table>
+  <caption>Candidate autoscaling signals for LLM serving.</caption>
+  <thead><tr><th>Signal</th><th>Meaning</th><th>Verdict</th></tr></thead>
+  <tbody>
+    <tr><td>CPU utilisation</td><td>Host-side work</td><td>Wrong: uncorrelated with GPU load</td></tr>
+    <tr><td>GPU utilisation (<code>DCGM_FI_DEV_GPU_UTIL</code>)</td><td>Fraction of time a kernel runs</td><td>Misleading: near 100% at batch 1 and at batch 256 alike</td></tr>
+    <tr><td>Queue depth (waiting requests per replica)</td><td>Demand the replica cannot absorb now</td><td>Best primary signal; leads TTFT</td></tr>
+    <tr><td>KV-cache utilisation</td><td>Memory headroom for more sequences</td><td>Good secondary signal; near 100% means preemption and recomputation</td></tr>
+    <tr><td>TTFT p95</td><td>User-visible symptom</td><td>Alert on it; scaling on it lags</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>KEDA ScaledObject scaling on waiting requests from Prometheus, with a warm floor and asymmetric scale-down (<strong>not executed</strong>). Metric names vary across vLLM versions; check <code>/metrics</code>.</figcaption>
+<pre><code>apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata: {name: forge-serve-llama8b}
+spec:
+  scaleTargetRef: {name: forge-serve-llama8b}
+  minReplicaCount: 2            # warm floor: absorbs spikes during cold starts
+  maxReplicaCount: 12           # GPU quota and budget cap
+  pollingInterval: 15
+  cooldownPeriod: 600
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:   {stabilizationWindowSeconds: 0,
+                    policies: [{type: Percent, value: 100, periodSeconds: 60}]}
+        scaleDown: {stabilizationWindowSeconds: 600,
+                    policies: [{type: Pods, value: 1, periodSeconds: 300}]}
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring:9090
+        query: sum(vllm:num_requests_waiting{model_name="llama-3.1-8b"})
+        threshold: "8"          # target waiting requests per replica
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring:9090
+        query: avg(vllm:gpu_cache_usage_perc{model_name="llama-3.1-8b"}) * 100
+        threshold: "85"</code></pre>
+</figure>
+
+<p>The HPA formula behind both HPA and KEDA is
+<span class="math">\text{desired} = \lceil \text{current} \cdot m / m^\ast \rceil</span> for a per-pod
+metric <span class="math">m</span> and target <span class="math">m^\ast</span>; for an external total it
+is <span class="math">\lceil M / m^\ast \rceil</span>. The simulation below uses the external form
+with cold starts, a 15 s sync period and slow scale-down.</p>
+
+<figure class="listing">
+<figcaption>Queue-depth autoscaling under a 5× spike: the effect of cold-start time and the warm floor.</figcaption>
+<pre><code>"""Queue-depth autoscaling (KEDA/HPA formula) with GPU cold starts, per-second sim."""
+import math
+
+
+def simulate(min_replicas: int, target_per_replica: int, cold_start_s: int,
+             cap_rps: float = 4.0, max_replicas: int = 12,
+             seconds: int = 900) -&gt; dict:
+    ready, booting = min_replicas, []           # booting: list of ready-at times
+    queue, served, breaches, peak_q, gpu_s = 0.0, 0.0, 0, 0.0, 0.0
+    for t in range(seconds):
+        rps = 6 if t &lt; 300 else 30 if t &lt; 600 else 10  # 5x spike at t=300s
+        ready += sum(1 for r in booting if r == t)
+        booting = [r for r in booting if r &gt; t]
+        queue += rps
+        done = min(queue, ready * cap_rps)
+        queue -= done
+        served += done
+        peak_q = max(peak_q, queue)
+        breaches += queue / max(ready * cap_rps, 1e-9) &gt; 2.0  # &gt;2s queueing wait
+        gpu_s += ready + len(booting)                          # you pay while booting
+        if t % 15 == 0:                                        # HPA sync period
+            desired = math.ceil((queue + rps) / target_per_replica)
+            desired = min(max(desired, min_replicas), max_replicas)
+            if desired &gt; ready + len(booting):
+                booting += [t + cold_start_s] * (desired - ready - len(booting))
+            elif desired &lt; ready and t % 300 == 0:             # slow scale-down
+                ready = max(desired, min_replicas)
+    return dict(peak_queue=round(peak_q), slo_breach_s=breaches,
+                gpu_hours=round(gpu_s / 3600, 2))
+
+
+for name, kw in [("cold 180s, min 2", dict(min_replicas=2, cold_start_s=180)),
+                 ("cold 45s,  min 2", dict(min_replicas=2, cold_start_s=45)),
+                 ("cold 45s,  min 4", dict(min_replicas=4, cold_start_s=45))]:
+    print(f"{name}: {simulate(target_per_replica=4, **kw)}")</code></pre>
+</figure>
+
+<pre class="output">cold 180s, min 2: {'peak_queue': 3960, 'slo_breach_s': 344, 'gpu_hours': 2.16}
+cold 45s,  min 2: {'peak_queue': 990, 'slo_breach_s': 94, 'gpu_hours': 1.42}
+cold 45s,  min 4: {'peak_queue': 630, 'slo_breach_s': 75, 'gpu_hours': 1.66}</pre>
+
+<ul>
+  <li>Cutting the cold start from 180 s to 45 s cuts SLO-breach seconds by 3.7× <em>and</em> GPU-hours by a third: long-booting replicas are paid for while useless, and a deep backlog forces the autoscaler to the maximum.</li>
+  <li>A larger warm floor buys a further 20% fewer breach-seconds for 17% more GPU-hours. Whether that is worth it is a business decision the error budget should make.</li>
+  <li>No reactive policy absorbs a 5× step within its cold-start time; for known peaks (09:00 on weekdays) use scheduled scaling, and shed load (Chapter 9) for the rest.</li>
+</ul>
+
+<h3>Controllers: KServe and Friends</h3>
+
+<ul>
+  <li><span class="evidence documented">Documented</span> <strong>KServe</strong> (per its docs) <code>InferenceService</code> wraps a Deployment (or Knative service), autoscaling, canary traffic splits and storage initialisers for weights behind one CRD, and ships runtimes for vLLM and Hugging Face models.</li>
+  <li><strong>Scale to zero</strong> (Knative/KEDA) saves money for rarely used models but converts every first request into a cold start. Use it for internal and batch models, not interactive SLOs.</li>
+  <li>For many models on shared GPUs, the unit of deployment becomes the <em>base model</em> plus adapters (Chapter 8), not one Deployment per fine-tune.</li>
+</ul>
+
+<h3>Failure Modes</h3>
+<ul class="failure-modes">
+  <li>Liveness probes without a startup probe: restart loops during weight load.</li>
+  <li>Autoscaling on CPU or GPU utilisation: no scale-out under load, or permanent maximum.</li>
+  <li>Aggressive scale-down: replicas removed and re-added every few minutes, each paying a cold start and dropping in-flight streams.</li>
+  <li>Rollouts that need spare GPUs that do not exist: stuck Deployments at 3 a.m.</li>
+  <li>Missing <code>/dev/shm</code> sizing: NCCL errors with tensor parallelism.</li>
+  <li>Driver upgrades on GPU node pools without draining: every model server on the node fails at once.</li>
+</ul>
+
+<div class="frame exercise"><p>Extend the autoscaling simulation with a scheduled floor (8 replicas
+between t=280 and t=620) and compare breach-seconds and GPU-hours with the purely reactive policies.
+Then add a KV-utilisation trigger that scales out when mean output length doubles at constant request
+rate.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="load-balancing">Load Balancing and Gateways</h2>
+<p class="chapter-lede">Round-robin is the wrong default for LLMs. The expensive state is the
+prefix cache on a particular GPU, and the scarce resource is free KV memory, not open TCP
+connections. This chapter builds LLM-aware routing, then puts rate limits and an API gateway in
+front of it.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Tenants share long system prompts. Round-robin scatters the same 2,000-token prefix across every
+  replica, so each GPU recomputes it. Least-connections ignores KV headroom: a replica with two long
+  RAG jobs looks "light" on connection count and then OOMs. A multi-region outage needs a policy that
+  fails over without doubling every in-flight stream.</p>
+</div>
+
+<p class="facet">Possible solutions and what each does not solve</p>
+<ul>
+  <li><strong>L4 / connection round-robin</strong>: cheap and opaque to HTTP; blind to prefixes and KV.</li>
+  <li><strong>Least outstanding requests</strong>: better than round-robin for heterogeneous latency; still ignores prefix locality and KV bytes.</li>
+  <li><strong>Prefix-cache affinity</strong>: sticky hash on a prefix fingerprint; needs an overload escape hatch or one hot tenant pins a replica.</li>
+  <li><strong>Least-KV / least-load from engine metrics</strong>: balances memory and queue depth; without affinity, cache hit rate collapses.</li>
+</ul>
+
+<h3>Why Affinity Matters</h3>
+
+<p>A shared system prompt of <span class="math">P</span> tokens that hits the prefix cache costs
+roughly nothing in prefill; a miss costs a full prefill of <span class="math">P</span>. With
+<span class="math">T</span> tenants and <span class="math">R</span> replicas, random routing yields a
+per-replica hit probability that falls as <span class="math">T / R</span> grows past the cache
+capacity. Affinity maps each prefix to one primary replica so the working set per GPU shrinks by
+about <span class="math">R</span>.</p>
+
+<figure class="diagram">
+<pre class="ascii">Client
+  |
+  v
+API gateway  -- auth, quotas, idempotency, request timeout
+  |
+  v
+LLM router   -- prefix hash -&gt; primary; escape to least-KV if overloaded
+  |         \
+  |          +-- multi-region: local first, failover on open circuit
+  v
+Replica A (prefix cache: tenant-7, tenant-12)   Replica B (...)   Replica C (...)</pre>
+<figcaption>Gateway, then LLM-aware router, then engine replicas. Affinity is a soft preference, not a hard pin.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption>Prefix-affinity versus round-robin and least-in-flight: cache hits and prefill tokens under a multi-tenant load (<code>router.py</code> seeds <code>forge.serve.router</code>).</figcaption>
+<pre><code>"""LLM-aware routing: round-robin, least-in-flight, prefix-cache affinity."""
+from __future__ import annotations
+
+import hashlib
+import random
+from dataclasses import dataclass, field
+
+
+CACHE_CAP = 8  # distinct prefixes retained per replica
+
+
+@dataclass
+class Replica:
+    name: str
+    in_flight: int = 0
+    cache: dict[str, int] = field(default_factory=dict)  # key -&gt; last used tick
+    hits: int = 0
+    misses: int = 0
+    prefill: int = 0
+
+
+def prefix_key(system: str) -&gt; str:
+    return hashlib.sha1(system.encode()).hexdigest()[:16]
+
+
+def route_rr(replicas: list[Replica], tick: int) -&gt; Replica:
+    return replicas[tick % len(replicas)]
+
+
+def route_least(replicas: list[Replica]) -&gt; Replica:
+    return min(replicas, key=lambda r: (r.in_flight, r.name))
+
+
+def route_prefix(replicas: list[Replica], key: str) -&gt; Replica:
+    h = int(hashlib.md5(key.encode()).hexdigest(), 16)
+    primary = replicas[h % len(replicas)]
+    least = route_least(replicas)
+    # overload escape: do not pin a hot tenant onto a saturated GPU
+    if primary.in_flight &gt;= least.in_flight + 3:
+        return least
+    return primary
+
+
+def admit(r: Replica, key: str, tick: int, shared: int, prompt: int) -&gt; None:
+    if key in r.cache:
+        r.hits += 1
+        r.prefill += prompt - shared
+        r.cache[key] = tick
+    else:
+        r.misses += 1
+        r.prefill += prompt
+        if len(r.cache) &gt;= CACHE_CAP:
+            victim = min(r.cache, key=r.cache.get)
+            del r.cache[victim]
+        r.cache[key] = tick
+    r.in_flight += 1
+
+
+def simulate(policy: str, n_tenants: int = 40, n_req: int = 800, seed: int = 1) -&gt; dict:
+    rng = random.Random(seed)
+    systems = [f"SYS{t}:" + ("P" * 1200) for t in range(n_tenants)]
+    reps = [Replica(f"r{i}") for i in range(4)]
+    in_flight: list[tuple[int, Replica, int]] = []
+    for t in range(n_req):
+        still = []
+        for done, r, prompt in in_flight:
+            if done &lt;= t:
+                r.in_flight = max(0, r.in_flight - 1)
+            else:
+                still.append((done, r, prompt))
+        in_flight = still
+        sys = systems[rng.randrange(n_tenants)]
+        key = prefix_key(sys)
+        prompt, shared = 1300 + rng.randint(0, 100), 1200
+        if policy == "rr":
+            r = route_rr(reps, t)
+        elif policy == "least":
+            r = route_least(reps)
+        else:
+            r = route_prefix(reps, key)
+        admit(r, key, t, shared, prompt)
+        in_flight.append((t + 3 + rng.randint(0, 4), r, prompt))
+    hits = sum(r.hits for r in reps)
+    total = hits + sum(r.misses for r in reps)
+    return dict(policy=policy, hit_rate=f"{100 * hits / total:.1f}%",
+                prefill_tokens=sum(r.prefill for r in reps))
+
+
+for p in ("rr", "least", "prefix"):
+    print(simulate(p))</code></pre>
+</figure>
+
+<pre class="output">{'policy': 'rr', 'hit_rate': '20.0%', 'prefill_tokens': 888851}
+{'policy': 'least', 'hit_rate': '18.1%', 'prefill_tokens': 906851}
+{'policy': 'prefix', 'hit_rate': '58.6%', 'prefill_tokens': 518051}</pre>
+
+<ul>
+  <li>Prefix affinity nearly triples the hit rate and cuts prefill tokens by ~42% versus round-robin on the same tenant mix.</li>
+  <li>Least-in-flight alone is slightly <em>worse</em> for hits: it spreads a tenant across replicas to balance load, which is the opposite of what the cache wants.</li>
+  <li>The escape hatch matters: without it, one chatty tenant pins a replica while others idle; with a threshold of +3 in-flight, affinity yields under overload.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Route on a fingerprint of the <em>cacheable prefix</em> (system prompt, tool schemas, RAG template), not the whole prompt and not the TCP connection.</li>
+    <li>Publish per-replica <code>kv_cache_usage</code> and <code>num_requests_waiting</code>; the router’s secondary key is least-KV / least-waiting, not CPU.</li>
+  </ul>
+</aside>
+
+<h3>Rate Limiting at the Edge</h3>
+
+<table>
+  <caption>Limits that make sense for token-priced APIs.</caption>
+  <thead><tr><th>Limit</th><th>Unit</th><th>Where</th><th>Typical use</th></tr></thead>
+  <tbody>
+    <tr><td>Requests per minute</td><td>req</td><td>Gateway</td><td>Abuse floor; too coarse alone</td></tr>
+    <tr><td>Tokens per minute (in + estimated out)</td><td>tokens</td><td>Gateway</td><td>Cost control per tenant</td></tr>
+    <tr><td>Concurrent streams</td><td>in-flight</td><td>Gateway + server</td><td>Protects KV memory</td></tr>
+    <tr><td>Queue depth</td><td>waiting</td><td>Server (Chapter 3)</td><td>Backpressure → 429</td></tr>
+  </tbody>
+</table>
+
+<ul>
+  <li>Estimate output tokens from <code>max_tokens</code> (or a percentile of the tenant’s history) when debiting the token bucket; reconcile on completion.</li>
+  <li>Return <code>429</code> with <code>Retry-After</code> and a machine-readable <code>error.type = rate_limit_error</code>; clients that retry 400s (Chapter 2) must not retry these blindly without backoff.</li>
+  <li>Multi-tenant platforms need both global and per-tenant buckets; a fair share of GPU time is closer to tokens than to requests.</li>
+</ul>
+
+<h3>API Gateways and Multi-Region</h3>
+
+<ul>
+  <li><strong>Gateway duties</strong>: TLS, authn/authz, request-id propagation, idempotency-key caching at the edge, body size limits, and the token/concurrency quotas above. Keep model routing <em>out</em> of a generic HTTP gateway unless it can read engine metrics.</li>
+  <li><strong>Envoy / kong / cloud L7</strong>: fine for auth and quotas; for prefix affinity use an application router (or a WASM/ext_proc filter that hashes the prefix) sitting one hop behind.</li>
+  <li><strong>Multi-region</strong>: prefer local region for TTFT; fail over when the local circuit breaker is open (Chapter 9). Sticky affinity does not travel with the user across regions — expect a cold prefix cache after failover and size headroom accordingly.</li>
+  <li><strong>Active–active</strong> needs a global admission budget: two regions each accepting 100% of traffic during a split brain will melt both clusters when they heal.</li>
+</ul>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">Prefix affinity</p>
+    <ul>
+      <li>Higher cache hit rate; lower TTFT and prefill cost.</li>
+      <li>Better packing of shared system prompts and tool schemas.</li>
+    </ul>
+  </div>
+  <div class="cons"><p class="facet">Cost of affinity</p>
+    <ul>
+      <li>Uneven load when one tenant dominates.</li>
+      <li>Harder rollouts: draining a replica discards its warm cache.</li>
+      <li>Cross-region failover pays a one-shot prefill tax.</li>
+    </ul>
+  </div>
+</div>
+
+<h3>Failure Modes</h3>
+<ul class="failure-modes">
+  <li>Hashing the full prompt (including the user turn): affinity thrashes every request.</li>
+  <li>Hard sticky sessions with no overload escape: hot-tenant meltdown on one GPU.</li>
+  <li>Balancing on CPU or connection count while KV is the bottleneck.</li>
+  <li>Per-request rate limits only: a few huge RAG prompts exhaust the fleet inside quota.</li>
+  <li>Failing over all regions at once without a global shed: cascading overload.</li>
+</ul>
+
+<div class="frame exercise"><p>Extend <code>route_prefix</code> with a consistent-hash ring and simulated replica
+removal. Measure hit-rate drop during a rolling restart of one replica in four, with and without
+draining (refuse new affinity mappings for <span class="math">N</span> seconds before kill). Then
+add a token-bucket limiter that debits <code>max_tokens</code> up front and refunds unused output
+tokens on completion.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="registry-release">Model Registry and Release Management</h2>
+<p class="chapter-lede">A model weight file is not a release. Production needs an immutable artefact
+identity, a promotion path through environments, and traffic controls that can reverse a bad model
+as quickly as a bad binary. This chapter wires a registry to shadow, canary, blue-green and
+multi-LoRA serving.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>The training job writes <code>checkpoint-48000/</code> to object storage. Someone copies it to
+  the production mount as <code>llama-8b-latest</code>. Two days later quality drops on one tenant;
+  nobody can say which digest was live, whether the tokenizer matched, or how to put yesterday back
+  without a heroic filesystem revert. Meanwhile three LoRA adapters want to share one base GPU.</p>
+</div>
+
+<p class="facet">Possible solutions and what each does not solve</p>
+<ul>
+  <li><strong>Mutable “latest” pointers</strong>: convenient; forbids audit, rollback and digests.</li>
+  <li><strong>MLflow / custom registry with content digests</strong>: immutable versions; still need a traffic plane to promote them safely.</li>
+  <li><strong>Shadow only</strong>: measures the candidate on live inputs without user impact; does not prove the serving path under real load split.</li>
+  <li><strong>Canary / blue-green</strong>: expose users gradually or cut over by environment; need automated rollback gates or you are doing hope-driven ops.</li>
+</ul>
+
+<h3>Artefact Versioning</h3>
+
+<table>
+  <caption>What an immutable model artefact must record.</caption>
+  <thead><tr><th>Field</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Content digest (weights, tokenizer, chat template)</td><td>Bit-for-bit identity; never “latest”</td></tr>
+    <tr><td>Base model + adapter digests</td><td>Multi-LoRA: adapters are first-class artefacts</td></tr>
+    <tr><td>Engine + quantisation config</td><td>Same weights, different numerics → different model</td></tr>
+    <tr><td>Eval report pointer (Volume 10 gate)</td><td>Promotion requires evidence, not a Slack emoji</td></tr>
+    <tr><td>Parent version</td><td>Lineage for rollback and bisect</td></tr>
+  </tbody>
+</table>
+
+<figure class="diagram">
+<pre class="ascii">train/export --&gt; registry (immutable version + digest)
+                      |
+          promote: staging --&gt; shadow --&gt; canary --&gt; stable
+                      |                      |
+                      v                      v
+              offline eval gate      online gates (error, TTFT, task success)
+                      |
+                      +-- rollback to previous digest &lt; 1 minute</pre>
+<figcaption>Promotion is a state machine over immutable versions; traffic shifts are separate from artefact creation.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption>Immutable registry with eval-gated promotion and pointer rollback (<code>registry.py</code> seeds <code>forge.serve.registry</code>).</figcaption>
+<pre><code>"""Model registry: immutable artefacts, staged promotion, rollback."""
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass, field
+
+STAGES = ("registered", "staging", "shadow", "canary", "stable")
+
+
+@dataclass(frozen=True)
+class Artefact:
+    name: str
+    version: str
+    weight_digest: str
+    tokenizer_digest: str
+    parent: str | None
+    eval_ok: bool
+
+
+@dataclass
+class Registry:
+    artefacts: dict[str, Artefact] = field(default_factory=dict)
+    stage: dict[str, str] = field(default_factory=dict)   # alias:stage -&gt; key
+    history: list[str] = field(default_factory=list)
+
+    def key(self, a: Artefact) -&gt; str:
+        return f"{a.name}@{a.version}"
+
+    def register(self, a: Artefact) -&gt; str:
+        k = self.key(a)
+        if k in self.artefacts:
+            raise ValueError("immutable: version exists")
+        self.artefacts[k] = a
+        self.history.append(f"register {k}")
+        return k
+
+    def promote(self, k: str, to: str, alias: str = "chat-prod") -&gt; None:
+        if to not in STAGES:
+            raise ValueError(to)
+        a = self.artefacts[k]
+        if to in ("canary", "stable") and not a.eval_ok:
+            raise PermissionError("eval gate failed")
+        was = self.stage.get(f"{alias}:{to}")
+        self.stage[f"{alias}:{to}"] = k
+        self.history.append(f"promote {k} -&gt; {to} (was {was})")
+
+    def rollback_stable(self, alias: str, to_key: str) -&gt; None:
+        self.stage[f"{alias}:stable"] = to_key
+        self.history.append(f"rollback {alias} stable -&gt; {to_key}")
+
+
+def digest(s: str) -&gt; str:
+    return hashlib.sha256(s.encode()).hexdigest()[:12]
+
+
+reg = Registry()
+v1 = Artefact("llama-8b", "2026.03.01", digest("w1"), digest("tok1"), None, True)
+v2 = Artefact("llama-8b", "2026.03.15", digest("w2"), digest("tok1"),
+              "llama-8b@2026.03.01", True)
+v3 = Artefact("llama-8b", "2026.03.20", digest("w3"), digest("tok2"),
+              "llama-8b@2026.03.15", False)  # tokenizer changed; eval not green
+for a in (v1, v2, v3):
+    print("registered", reg.register(a))
+reg.promote("llama-8b@2026.03.01", "stable")
+reg.promote("llama-8b@2026.03.15", "canary")
+try:
+    reg.promote("llama-8b@2026.03.20", "canary")
+except PermissionError as e:
+    print("blocked:", e)
+reg.rollback_stable("chat-prod", "llama-8b@2026.03.01")
+print("stable=", reg.stage["chat-prod:stable"])
+for h in reg.history:
+    print(h)</code></pre>
+</figure>
+
+<pre class="output">registered llama-8b@2026.03.01
+registered llama-8b@2026.03.15
+registered llama-8b@2026.03.20
+blocked: eval gate failed
+stable= llama-8b@2026.03.01
+register llama-8b@2026.03.01
+register llama-8b@2026.03.15
+register llama-8b@2026.03.20
+promote llama-8b@2026.03.01 -&gt; stable (was None)
+promote llama-8b@2026.03.15 -&gt; canary (was None)
+rollback chat-prod stable -&gt; llama-8b@2026.03.01</pre>
+
+<ul>
+  <li>Versions are append-only: re-registering <code>2026.03.15</code> raises. Rollback moves the <em>alias pointer</em>, it does not mutate the artefact.</li>
+  <li>Promotion into canary/stable requires <code>eval_ok</code> from the Volume 10 gate; v3 is blocked despite being “newer”.</li>
+  <li>A tokenizer digest change is a new artefact even when weights look familiar — serving the wrong template is a silent quality incident.</li>
+</ul>
+
+<h3>Shadow, Canary, Blue-Green</h3>
+
+<ul>
+  <li><strong>Shadow</strong>: duplicate a sample of production requests to the candidate; compare outputs offline (or score with a judge). Users only see stable. Good for “does it crash / how bad is the delta?”; bad for load proof if the shadow pool is tiny.</li>
+  <li><strong>Canary</strong>: send a sticky fraction of <em>users</em> (not requests) to the candidate so multi-turn sessions stay consistent. Raise 1% → 5% → 25% → 100% behind automated gates.</li>
+  <li><strong>Blue-green</strong>: two full stacks; flip the gateway pointer. Fast rollback, double the GPUs during the cut. Prefer for infra changes (engine upgrade) where half-and-half mixing is risky.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Sticky canary assignment, independent shadow sampling, and a non-inferiority rollback gate (<code>release.py</code> seeds <code>forge.serve.release</code>).</figcaption>
+<pre><code>"""Canary / shadow traffic split with sticky users and rollback gate."""
+from __future__ import annotations
+
+import hashlib
+import random
+
+
+def bucket(user: str, salt: str) -&gt; int:
+    h = hashlib.sha256(f"{salt}:{user}".encode()).hexdigest()
+    return int(h[:8], 16) % 10_000  # 0..9999
+
+
+def assign_canary(user: str, canary_pct: float, salt: str = "canary-v3") -&gt; str:
+    return "canary" if bucket(user, salt) &lt; canary_pct * 100 else "stable"
+
+
+def shadow_user(user: str, shadow_pct: float, salt: str = "shadow-v3") -&gt; bool:
+    return bucket(user, salt) &lt; shadow_pct * 100
+
+
+def simulate_gate(true_delta: float, n: int = 2000, margin: float = 0.02,
+                  seed: int = 2) -&gt; dict:
+    """Rollback if canary success &lt; stable success - margin (non-inferiority)."""
+    rng = random.Random(seed)
+    s_ok = sum(rng.random() &lt; 0.92 for _ in range(n))
+    c_ok = sum(rng.random() &lt; 0.92 + true_delta for _ in range(n))
+    s_rate, c_rate = s_ok / n, c_ok / n
+    return dict(stable=round(s_rate, 3), canary=round(c_rate, 3),
+                delta=round(c_rate - s_rate, 3),
+                rollback=c_rate &lt; s_rate - margin)
+
+
+users = [f"u{i}" for i in range(20_000)]
+for pct in (1.0, 5.0, 25.0):
+    arms = [assign_canary(u, pct) for u in users]
+    print(f"canary {pct:4.1f}% -&gt; stable={arms.count('stable'):5d} "
+          f"canary={arms.count('canary'):5d}")
+
+print("sticky u42:", [assign_canary("u42", 5.0) for _ in range(5)])
+shadow_on = sum(1 for u in users if shadow_user(u, 10.0))
+both = sum(1 for u in users
+           if assign_canary(u, 5.0) == "canary" and shadow_user(u, 10.0))
+print(f"shadow 10%: {shadow_on} users; overlap with 5% canary: {both}")
+print("good canary:", simulate_gate(+0.01))
+print("bad canary:", simulate_gate(-0.05))</code></pre>
+</figure>
+
+<pre class="output">canary  1.0% -&gt; stable=19795 canary=  205
+canary  5.0% -&gt; stable=19022 canary=  978
+canary 25.0% -&gt; stable=14872 canary= 5128
+sticky u42: ['stable', 'stable', 'stable', 'stable', 'stable']
+shadow 10%: 2092 users; overlap with 5% canary: 110
+good canary: {'stable': 0.923, 'canary': 0.931, 'delta': 0.008, 'rollback': False}
+bad canary: {'stable': 0.923, 'canary': 0.875, 'delta': -0.049, 'rollback': True}</pre>
+
+<ul>
+  <li>Sticky hashing keeps a user on one arm for the life of the canary salt; changing the salt reshuffles everyone — version the salt with the release.</li>
+  <li>Shadow uses a different salt so the 5% canary cohort is not identical to the 10% shadow cohort; overlap is ~0.5% as expected from independence.</li>
+  <li>The gate is non-inferiority, not “canary must win”: a flat model may still ship for cost reasons; a −4.9 point drop rolls back automatically.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Common Mistake</span>
+  <ul>
+    <li>Canarying by request hash: a single user sees both models mid-conversation; support tickets become uninterpretable.</li>
+    <li>Promoting on “vibes” or a single aggregate metric without slice floors (Volume 10).</li>
+  </ul>
+</aside>
+
+<h3>Multi-LoRA Serving</h3>
+
+<ul>
+  <li>One base model in GPU memory; many adapters loaded on demand or pinned (S-LoRA / vLLM LoRA). The registry records <code>(base_digest, adapter_digest)</code> as the serving identity.</li>
+  <li>Route on <code>model</code> alias → artefact; the engine’s continuous batch packs different adapters in one batch when memory allows.</li>
+  <li>Limits: adapter count × rank × hidden size must fit; a stampeded cold load of adapters looks like a weight-load latency spike. Pin the top-N by QPS.</li>
+  <li>Canary an adapter independently of the base: shadow the new LoRA on 10% of that tenant while the base stays put.</li>
+</ul>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">Canary</p>
+    <ul>
+      <li>Real user traffic; gradual blast radius.</li>
+      <li>Works with sticky sessions and online gates.</li>
+    </ul>
+  </div>
+  <div class="cons"><p class="facet">Blue-green</p>
+    <ul>
+      <li>Clean cut; instant pointer rollback.</li>
+      <li>Needs ~2× capacity during the switch; weak for “try 5% first”.</li>
+    </ul>
+  </div>
+</div>
+
+<h3>Failure Modes</h3>
+<ul class="failure-modes">
+  <li>Mutable tags in production; digests only in the training cluster.</li>
+  <li>Canary without sticky assignment or without automated rollback.</li>
+  <li>Shadowing to a pool that never sees peak load, then 100% cutover on Friday.</li>
+  <li>Tokenizer / chat-template mismatch between registry metadata and the running engine.</li>
+  <li>Loading unbounded LoRAs until KV and adapter memory fight each other.</li>
+</ul>
+
+<div class="frame exercise"><p>Add a registry <code>promote(version, stage)</code> API that refuses promotion
+unless an eval-gate JSON reports all slices non-inferior. Simulate a canary ramp 1→5→25→100 with a
+guardrail on TTFT p95; inject a 2× TTFT regression at 25% and show the controller rolling back to the
+previous digest.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 9 -->
+<section class="chapter">
+<h2 id="reliability">Reliability</h2>
+<p class="chapter-lede">LLM calls are long, non-idempotent by default, and expensive to retry.
+Timeouts, retries, circuit breakers, fallbacks and load shedding are not optional middleware — they
+are how you keep a few bad GPUs from taking down the product. This chapter finishes the resilience
+story Volume 1 started with <code>ResilientClient</code>.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>One replica’s GPU driver wedges. Clients time out at 60 s, retry immediately, and pile onto the
+  remaining replicas. TTFT blows the SLO, the autoscaler adds cold pods that are not ready for three
+  minutes, and the on-call discovers that “retry on any error” also retried a successful side-effecting
+  tool call twice. Availability is now worse than if the first replica had simply been removed.</p>
+</div>
+
+<p class="facet">Possible solutions and what each does not solve</p>
+<ul>
+  <li><strong>Longer timeouts</strong>: fewer false timeouts; worse queueing under load (holds capacity).</li>
+  <li><strong>Retries with backoff</strong>: survive blips; amplify outages unless bounded, jittered and idempotent.</li>
+  <li><strong>Circuit breakers</strong>: stop sending to a sick dependency; need half-open probes and a fallback path.</li>
+  <li><strong>Load shedding / admission control</strong>: protect goodput for what you <em>can</em> serve; users see fast 503s instead of slow death.</li>
+  <li><strong>Graceful degradation</strong>: smaller model, shorter <code>max_tokens</code>, cached answer, or “try again”; product must define what “degraded” means.</li>
+</ul>
+
+<h3>Deadlines, Retries and Idempotency</h3>
+
+<ul>
+  <li>Propagate a single <strong>deadline</strong> (budget) from gateway → router → engine; each hop checks remaining time. A 60 s client timeout with three 60 s server attempts is a 3-minute outage amplifier.</li>
+  <li>Retry only <strong>retryable</strong> failures: <code>408</code>/<code>429</code>/<code>502</code>/<code>503</code>/<code>504</code>, connection errors. Never retry <code>400</code> validation errors.</li>
+  <li>Require <code>Idempotency-Key</code> (Chapter 2) for any retry that could have reached the server; replays must return the cached completion, not a second generation.</li>
+  <li>Use exponential backoff with full jitter; cap attempts (typically 2–3 for interactive chat).</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Goodput under overload beats raw availability: a fast refusal preserves the replicas that are still healthy.</li>
+    <li>The circuit breaker protects the <em>caller</em> and the <em>rest of the fleet</em>; load shedding protects a single server’s queue.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption>Circuit breaker plus priority load shedding across healthy, outage and overload phases (<code>resilience.py</code> seeds <code>forge.serve.resilience</code>).</figcaption>
+<pre><code>"""Circuit breaker + priority load shedding under outage and overload."""
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass
+from enum import Enum
+
+
+class State(Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+@dataclass
+class CircuitBreaker:
+    fail_threshold: int = 5
+    success_threshold: int = 3
+    cooldown: int = 8
+    failures: int = 0
+    successes: int = 0
+    state: State = State.CLOSED
+    open_until: int = 0
+
+    def allow(self, t: int) -&gt; bool:
+        if self.state is State.OPEN:
+            if t &gt;= self.open_until:
+                self.state = State.HALF_OPEN
+                self.successes = 0
+                return True
+            return False
+        return True
+
+    def record(self, ok: bool, t: int) -&gt; None:
+        if self.state is State.HALF_OPEN:
+            if ok:
+                self.successes += 1
+                if self.successes &gt;= self.success_threshold:
+                    self.state, self.failures = State.CLOSED, 0
+            else:
+                self.state, self.open_until = State.OPEN, t + self.cooldown
+            return
+        if ok:
+            self.failures = 0
+        else:
+            self.failures += 1
+            if self.failures &gt;= self.fail_threshold:
+                self.state, self.open_until = State.OPEN, t + self.cooldown
+
+
+def run(seed: int = 5) -&gt; None:
+    rng = random.Random(seed)
+    br = CircuitBreaker()
+    in_flight = 0
+    soft, hard = 6, 12
+    served = shed = brk = fail = 0
+    for t in range(120):
+        if t &lt; 40:      # healthy
+            arrivals, p_ok, capacity = 3, 0.98, 3
+        elif t &lt; 70:    # dependency / GPU outage
+            arrivals, p_ok, capacity = 3, 0.05, 1
+        elif t &lt; 100:   # overload spike
+            arrivals, p_ok, capacity = 10, 0.95, 3
+        else:           # recovery
+            arrivals, p_ok, capacity = 3, 0.98, 3
+        done = min(in_flight, capacity)
+        in_flight -= done
+        served += done
+        for _ in range(arrivals):
+            priority = "critical" if rng.random() &lt; 0.18 else "normal"
+            if in_flight &gt;= hard or (in_flight &gt;= soft and priority != "critical"):
+                shed += 1
+                continue
+            if not br.allow(t):
+                brk += 1
+                continue
+            ok = rng.random() &lt; p_ok
+            br.record(ok, t)
+            if ok:
+                in_flight += 1
+            else:
+                fail += 1
+        if t in (39, 69, 99, 119):
+            print(f"t={t:3d} state={br.state.value:10s} in_flight={in_flight:2d} "
+                  f"served={served:3d} shed={shed:3d} breaker={brk:3d} fail={fail:3d}")
+
+
+run()</code></pre>
+</figure>
+
+<pre class="output">t= 39 state=closed     in_flight= 3 served=115 shed=  0 breaker=  0 fail=  2
+t= 69 state=open       in_flight= 0 served=119 shed=  0 breaker= 79 fail= 12
+t= 99 state=closed     in_flight= 7 served=194 shed=176 breaker=119 fail= 14
+t=119 state=closed     in_flight= 6 served=254 shed=177 breaker=119 fail= 14</pre>
+
+<ul>
+  <li><strong>Outage (t=40–69)</strong>: after five failures the breaker opens; 79 calls fail fast instead of joining a dead queue. Served barely moves (115 → 119).</li>
+  <li><strong>Overload (t=70–99)</strong>: the breaker closes again as probes succeed; shedding absorbs the spike (176 refusals) while in-flight stays near the soft/hard limits.</li>
+  <li><strong>Critical priority</strong> still enters between soft and hard limits — define “critical” narrowly (pager, safety) or everything becomes critical.</li>
+</ul>
+
+<h3>Fallbacks and Graceful Degradation</h3>
+
+<table>
+  <caption>Degradation ladder when the primary model path is unhealthy.</caption>
+  <thead><tr><th>Level</th><th>Action</th><th>User-visible effect</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>Retry other replica / zone</td><td>Extra latency within SLO</td></tr>
+    <tr><td>2</td><td>Smaller / quantised model</td><td>Slightly worse quality, met latency</td></tr>
+    <tr><td>3</td><td>Shorter max tokens / no tools</td><td>Partial answer; agent may need another turn</td></tr>
+    <tr><td>4</td><td>Cached or retrieval-only answer</td><td>Stale or extractive; labelled as such</td></tr>
+    <tr><td>5</td><td>Typed error + Retry-After</td><td>Honest failure beats a hung spinner</td></tr>
+  </tbody>
+</table>
+
+<ul>
+  <li>Fallbacks must be <em>tested</em> in shadow: an untested “backup model” that OOMs is not a fallback.</li>
+  <li>Record <code>fallback_reason</code> on the trace; otherwise dashboards show healthy 200s while quality silently drops.</li>
+</ul>
+
+<h3>Failure Modes</h3>
+<ul class="failure-modes">
+  <li>Retries without idempotency on side-effecting tool calls.</li>
+  <li>Circuit breaker with no half-open probe: permanent blackhole after one blip.</li>
+  <li>Shedding only at the client: the server still accepts until OOM.</li>
+  <li>Deadline not propagated: each layer uses its own full timeout.</li>
+  <li>Fallback to a model that was never capacity-planned for primary traffic.</li>
+</ul>
+
+<div class="frame exercise"><p>Wire <code>CircuitBreaker</code> into the Chapter 3 client so that three consecutive
+<code>503</code>s from a base URL open the breaker for 10 s. Add a second base URL as fallback.
+Drive the fake engine’s error injection at 100% on the primary and show that p95 client latency stays
+near the fail-fast path, not the 60 s timeout.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 10 -->
+<section class="chapter">
+<h2 id="cloud-patterns">Cloud Architecture Patterns</h2>
+<p class="chapter-lede">The same model can be a metered API call, a always-on GPU Deployment, or a
+scale-to-zero serverless worker. The right shape depends on traffic, latency SLO, data residency and
+how much operational load you will own. This chapter compares the patterns and finds the cost
+crossover with honest utilisation assumptions.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Finance asks whether to “just use the hosted API” or “buy H100s”. Engineering quotes peak tokens
+  per second; finance multiplies by the list GPU price and 720 hours. Both numbers are wrong: hosted
+  bills tokens you actually use, self-hosted bills GPUs you keep warm, and serverless bills a chilly
+  middle that still pays cold starts on every diurnal trough.</p>
+</div>
+
+<p class="facet">Possible solutions and what each does not solve</p>
+<ul>
+  <li><strong>Managed model API</strong> (OpenAI-compatible hosted): minimal ops, strong peak elasticity; data leaves your boundary, unit economics worsen at steady high volume, limited runtime control.</li>
+  <li><strong>Self-hosted on GPUs</strong> (GKE/EKS/AKS, bare metal): full control, better $/token at high utilisation; you own drivers, pages, and cold starts.</li>
+  <li><strong>Serverless GPUs</strong> (scale-to-zero containers): pay for use; cold starts of tens of seconds break interactive TTFT unless you keep a warm floor.</li>
+  <li><strong>Hybrid</strong>: self-host the fat steady workload; burst to managed or another region; route with the Chapter 7/9 machinery.</li>
+</ul>
+
+<h3>Managed versus Self-Hosted versus Serverless</h3>
+
+<table>
+  <caption>Concept-level map across clouds (names change; the pattern does not).</caption>
+  <thead><tr><th>Pattern</th><th>AWS</th><th>GCP</th><th>Azure</th></tr></thead>
+  <tbody>
+    <tr><td>Managed LLM API</td><td>Bedrock / third-party</td><td>Vertex AI Gemini &amp; partners</td><td>Azure OpenAI</td></tr>
+    <tr><td>Managed open-weight endpoint</td><td>SageMaker Real-time</td><td>Vertex Prediction</td><td>ML Managed Online Endpoints</td></tr>
+    <tr><td>Self-hosted Kubernetes + GPUs</td><td>EKS + GPU nodes</td><td>GKE + GPU / TPU</td><td>AKS + GPU node pools</td></tr>
+    <tr><td>Serverless / scale-to-zero GPUs</td><td>SageMaker Serverless*</td><td>Cloud Run / GKE autoscale-to-zero</td><td>ACA / serverless GPU previews</td></tr>
+  </tbody>
+</table>
+<p>*GPU serverless offerings change quickly; treat the row as a pattern, not a SKU guarantee.
+<span class="evidence documented">Documented</span> Product names are taken from each cloud's public documentation; <span class="evidence inferred">Inferred</span> how any cloud provisions
+capacity behind these services is not published and should not be assumed.</p>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">Managed API</p>
+    <ul>
+      <li>No GPU ops; instant capacity.</li>
+      <li>Best for spiky or low-QPS products.</li>
+    </ul>
+  </div>
+  <div class="cons"><p class="facet">Self-hosted</p>
+    <ul>
+      <li>Wins at sustained high utilisation.</li>
+      <li>Needs Chapters 5–9 operational maturity.</li>
+    </ul>
+  </div>
+</div>
+
+<figure class="listing">
+<figcaption>Monthly cost crossover: managed token pricing versus always-on GPUs versus serverless GPU-seconds (illustrative prices; <code>costing.py</code> seeds <code>forge.serve.costing</code>).</figcaption>
+<pre><code>"""Cost crossover: managed tokens vs self-hosted GPUs vs serverless GPU-seconds."""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Managed:
+    in_per_mtok: float
+    out_per_mtok: float
+
+
+@dataclass(frozen=True)
+class SelfHosted:
+    gpu_hour: float
+    tok_per_s: float
+    util: float = 0.55
+
+
+@dataclass(frozen=True)
+class ServerlessGPU:
+    gpu_second: float
+    cold_start_s: float
+    tok_per_s: float
+    cold_frac: float = 0.05
+
+
+def monthly_mtok(rps: float, in_tok: int, out_tok: int) -&gt; tuple[float, float, float]:
+    hours = 24 * 30
+    reqs = rps * 3600 * hours
+    return reqs * in_tok / 1e6, reqs * out_tok / 1e6, reqs
+
+
+def cost_self(s: SelfHosted, peak_out_tok_s: float, hours: float = 24 * 30) -&gt; tuple[float, int]:
+    replicas = max(1, math.ceil(peak_out_tok_s / (s.tok_per_s * s.util)))
+    return replicas * hours * s.gpu_hour, replicas
+
+
+managed = Managed(in_per_mtok=0.50, out_per_mtok=1.50)
+selfh = SelfHosted(gpu_hour=3.50, tok_per_s=2400, util=0.55)
+serv = ServerlessGPU(gpu_second=0.0015, cold_start_s=45, tok_per_s=2000)
+
+print(f"{'rps':&gt;6} {'managed':&gt;10} {'self':&gt;10} {'repl':&gt;4} "
+      f"{'serverless':&gt;12} {'winner':&gt;10}")
+for rps in (0.1, 0.5, 1, 2, 5, 10, 20):
+    in_tok, out_tok = 1500, 300
+    in_m, out_m, reqs = monthly_mtok(rps, in_tok, out_tok)
+    cm = in_m * managed.in_per_mtok + out_m * managed.out_per_mtok
+    cs, repl = cost_self(selfh, peak_out_tok_s=rps * out_tok)
+    decode_s = out_tok / serv.tok_per_s
+    cg = reqs * (serv.cold_frac * serv.cold_start_s + decode_s) * serv.gpu_second
+    winner = min([(cm, "managed"), (cs, "self"), (cg, "serverless")],
+                 key=lambda x: x[0])[1]
+    print(f"{rps:6.1f} {cm:10.0f} {cs:10.0f} {repl:4d} {cg:12.0f} {winner:&gt;10}")
+
+print("\nreserved vs spot (self-host, 2 replicas):")
+print(f"on-demand ${2 * 720 * 3.50:.0f}/mo  reserved ${2 * 720 * 2.10:.0f}/mo  "
+      f"spot ${2 * 720 * 1.20:.0f}/mo")</code></pre>
+</figure>
+
+<pre class="output">   rps    managed       self repl   serverless     winner
+   0.1        311       2520    1          933    managed
+   0.5       1555       2520    1         4666    managed
+   1.0       3110       2520    1         9331       self
+   2.0       6221       2520    1        18662       self
+   5.0      15552       5040    2        46656       self
+  10.0      31104       7560    3        93312       self
+  20.0      62208      12600    5       186624       self
+
+reserved vs spot (self-host, 2 replicas):
+on-demand $5040/mo  reserved $3024/mo  spot $1728/mo</pre>
+
+<ul>
+  <li>Under these assumptions the crossover sits near <strong>1 req/s</strong> steady: below that, managed wins; above, a warm H100-class replica wins even at 55% useful utilisation.</li>
+  <li>Serverless loses here because a 5% cold-start tax at 45 s dominates decode time for 300-token answers — fine for batch, hostile to chat TTFT.</li>
+  <li>Spot is not free reliability: keep at least one on-demand (or reserved) replica for the interactive SLO; use spot for batch and for elastic overflow with aggressive shedding.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Common Mistake</span>
+  <ul>
+    <li>Comparing managed $/million tokens to GPU list price at 100% utilisation. Real serving fleets often sit at 40–60% after headroom, canaries and diurnal troughs.</li>
+    <li>Ignoring engineer time and incident cost in the “self-hosted is cheaper” slide.</li>
+  </ul>
+</aside>
+
+<h3>Reserved versus Spot, and Hybrid Designs</h3>
+
+<ul>
+  <li><strong>Reserved / committed use</strong>: 30–60% cheaper than on-demand when you can pledge 1–3 years of baseline capacity.</li>
+  <li><strong>Spot / preemptible</strong>: deep discounts; expect 30 s–2 min preemptions. Checkpoint engine state is rare — treat preemption as replica death and rely on the PDB + warm floor from Chapter 6.</li>
+  <li><strong>Hybrid routing</strong>: primary = self-hosted; overflow when queue depth exceeds threshold = managed API with a cost ceiling; batch = spot pool.</li>
+  <li><strong>Data residency</strong> can forbid managed APIs regardless of price; then the crossover chart is irrelevant and you optimise self-hosted utilisation instead.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">                 +-- interactive (SLO) --&gt; reserved / on-demand GPUs (warm floor)
+traffic --&gt; router--+-- overflow / failover --&gt; managed API (budget cap)
+                 +-- batch / offline ------&gt; spot GPUs + deadline scheduler</pre>
+<figcaption>A common hybrid: buy certainty for the SLO path, elasticity for overflow, and cheap capacity for batch.</figcaption>
+</figure>
+
+<h3>Failure Modes</h3>
+<ul class="failure-modes">
+  <li>Self-hosting at low QPS “for control” and paying idle GPUs all month.</li>
+  <li>Serverless GPUs on an interactive chat SLO without a warm floor.</li>
+  <li>100% spot for the primary path; preemption storms during someone else’s training job.</li>
+  <li>Crossover analysis that forgets prefix-cache efficiency (self-hosted) or retry amplification (managed).</li>
+  <li>No cost attribution per tenant: the loudest team sets the architecture.</li>
+</ul>
+
+<div class="frame exercise"><p>Re-run the crossover with your real prompt/output lengths and a managed
+price sheet. Add a warm-floor serverless variant (always-on 1 GPU-second equivalent) and find the
+QPS where it beats cold serverless. Then model a hybrid: self-hosted up to queue depth 8, managed
+overflow priced with a 20% latency premium — at what rps does overflow cost exceed another always-on
+replica?</p></div>
+</section>
+
+<!-- ================================================================ REVIEW -->
+<section class="review">
+<h1>Review and Next Steps</h1>
+
+<h2>What You Learned</h2>
+<ul>
+  <li>LLM endpoints are token- and KV-shaped systems: SLOs split into TTFT and TPOT, capacity follows Little’s law, and goodput under SLO is the only throughput that counts.</li>
+  <li>The OpenAI-compatible chat contract (SSE, error taxonomy, idempotency) outlives any engine; backpressure and cancellation belong in the server, not only in the client.</li>
+  <li>Production engines (vLLM, SGLang, TGI, TensorRT-LLM, Triton, Ollama, llama.cpp) package continuous batching and paged KV; you still own the API, probes and rollout.</li>
+  <li>GPU containers and Kubernetes need startup probes, weight caching, queue-depth autoscaling and disruption budgets — CPU utilisation is the wrong signal.</li>
+  <li>Load balancing for LLMs is prefix-cache affinity plus least-KV, with token-aware rate limits and careful multi-region failover.</li>
+  <li>Releases are immutable artefacts promoted through shadow, sticky canary and blue-green with automated non-inferiority rollback; multi-LoRA shares one base.</li>
+  <li>Reliability is deadlines, idempotent retries, circuit breakers, priority shedding and an explicit degradation ladder.</li>
+  <li>Managed, self-hosted and serverless GPUs cross over on utilisation and cold-start tax; reserved versus spot is a reliability choice as much as a price choice.</li>
+</ul>
+
+<h2>What You Built</h2>
+<ul>
+  <li><code>forge.serve</code>: OpenAI-compatible FastAPI server with continuous batching, backpressure, cancellation, idempotency and health endpoints.</li>
+  <li>HF and fake engines, an open-loop load generator, and GPU Docker / Kubernetes manifests (validated against documented interfaces).</li>
+  <li><code>forge.serve.router</code>: prefix-affinity and least-load routing simulation.</li>
+  <li><code>forge.serve.registry</code> / <code>forge.serve.release</code>: immutable artefacts, eval-gated promotion, sticky canary / shadow and rollback gates.</li>
+  <li><code>forge.serve.resilience</code>: circuit breaker and priority load shedding.</li>
+  <li><code>forge.serve.costing</code>: managed versus self-hosted versus serverless crossover calculator.</li>
+</ul>
+
+<h2>Important Code</h2>
+<table>
+  <caption>Listings to keep; they seed <code>src/forge/serve/</code>.</caption>
+  <thead><tr><th>Listing</th><th>Forge module</th><th>Concept</th><th>Used in</th></tr></thead>
+  <tbody>
+    <tr><td><code>contract.py</code> schemas, SSE, idempotency</td><td><code>forge.serve</code></td><td>API contract</td><td>Volumes 13–18 clients</td></tr>
+    <tr><td><code>server.py</code> batching loop, backpressure</td><td><code>forge.serve</code></td><td>Model server</td><td>Local and K8s deploys</td></tr>
+    <tr><td><code>loadgen.py</code> open-loop TTFT/TPOT</td><td><code>forge.serve</code> / <code>forge.eval</code></td><td>Load testing</td><td>Capacity and canaries</td></tr>
+    <tr><td><code>router.py</code> prefix affinity</td><td><code>forge.serve.router</code></td><td>LLM-aware LB</td><td>Gateway / mesh</td></tr>
+    <tr><td><code>registry.py</code>, <code>release.py</code></td><td><code>forge.serve.registry</code> / <code>.release</code></td><td>Artefacts, canary, shadow</td><td>Model launches</td></tr>
+    <tr><td><code>resilience.py</code> breaker + shed</td><td><code>forge.serve.resilience</code></td><td>Reliability</td><td><code>ResilientClient</code></td></tr>
+    <tr><td><code>costing.py</code> crossover</td><td><code>forge.serve.costing</code></td><td>Build vs buy</td><td>Volume 22 ops</td></tr>
+  </tbody>
+</table>
+
+<h2>Important Architecture</h2>
+<figure class="diagram">
+  <div class="arch">
+    <div class="arch-layer" data-label="Clients">
+      <div class="node client">SDK with deadlines, retries, idempotency keys</div>
+      <div class="node client">Load generator / canary probes</div>
+    </div>
+    <div class="arch-layer" data-label="Edge">
+      <div class="node gateway">API gateway: auth, token-bucket quotas</div>
+      <div class="node gateway">LLM-aware router: prefix affinity, least-KV</div>
+      <div class="node guard">Circuit breakers, priority shedding</div>
+    </div>
+    <div class="arch-layer" data-label="Serving">
+      <div class="node service"><code>forge.serve</code> API (SSE, cancellation, backpressure)</div>
+      <div class="node queue">Admission queue</div>
+      <div class="node gpu">Engine: continuous batching, paged KV, multi-LoRA</div>
+    </div>
+    <div class="arch-layer" data-label="Platform">
+      <div class="node service">Kubernetes: GPU node pools, probes, PDBs</div>
+      <div class="node service">Autoscaler on queue depth and KV utilisation</div>
+      <div class="node store">Weight cache / object store</div>
+    </div>
+    <div class="arch-layer" data-label="Release">
+      <div class="node store">Model registry (digests, eval reports)</div>
+      <div class="node eval">Shadow, sticky canary, rollback gates</div>
+      <div class="node obs">TTFT / TPOT / goodput / error-rate metrics</div>
+    </div>
+  </div>
+  <figcaption>The Forge serving stack. Requests flow top to bottom; release decisions flow back up from metrics and eval gates.</figcaption>
+</figure>
+
+<h2>Failure Modes</h2>
+<ul class="failure-modes">
+  <li>SLOs stated as average latency; no separate TTFT and TPOT targets; throughput reported without an SLO.</li>
+  <li>Closed-loop load tests that hide queueing collapse (coordinated omission).</li>
+  <li>No backpressure: an unbounded queue turns overload into timeouts for everyone instead of fast 429s for some.</li>
+  <li>Client disconnects not propagated, so cancelled streams keep consuming KV and decode slots.</li>
+  <li>Retries without idempotency keys or jitter; retry storms amplifying a partial outage.</li>
+  <li>Autoscaling on CPU or GPU utilisation instead of queue depth and KV pressure; scale-up slower than the traffic ramp because of cold starts.</li>
+  <li>Readiness probes that pass before weights are loaded and warmed; liveness probes that kill replicas during long prefills.</li>
+  <li>Round-robin load balancing that destroys prefix-cache hit rate.</li>
+  <li>Mutable model tags ("latest") in production; canaries without stickiness or without a quality guardrail; no tested rollback.</li>
+  <li>Spot capacity for latency-critical traffic without a fallback pool.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<ul>
+  <li>Evaluate the service against its SLO, not the model in isolation: open-loop load tests at 50%, 100% and 150% of forecast peak, reporting TTFT and TPOT percentiles, goodput, error rate by class and cost per million tokens.</li>
+  <li>Every release candidate passes the Volume 10 offline gate first, then shadow traffic comparison, then a sticky canary with pre-registered non-inferiority thresholds on task success, TTFT p95 and error rate. Rollback must be automatic when a guardrail fires.</li>
+  <li>Test the failure paths explicitly: kill a replica mid-stream, exhaust KV, drop the network to a provider, cancel 20% of streams, and assert that the observed behaviour matches the degradation ladder (shed, degrade, fail over) rather than timing out.</li>
+  <li>Contract tests for the API: schema validation, SSE framing, error codes and idempotent replay are checked against both <code>forge.serve</code> and any external engine you put behind the same contract.</li>
+  <li>Track operational metrics over time: cold-start duration, time to scale, prefix-cache hit rate and cost per successful request. Regressions in any of them are release blockers, like quality regressions.</li>
+</ul>
+
+<h2>Practical Project</h2>
+<div class="frame exercise" data-title="Forge serving stack">
+  <p>Deliver a production-shaped serving stack for one open-weight chat model:</p>
+  <ol>
+    <li>Containerised <code>forge.serve</code> with streaming chat completions, <code>/healthz</code>, <code>/readyz</code> and Prometheus metrics.</li>
+    <li>Kubernetes Deployment with GPU requests, startup/readiness probes, PDB and a KEDA policy on queue depth.</li>
+    <li>A registry entry with weight digest; shadow a new version, then sticky-canary at 5% with automated rollback on task-success or TTFT guardrails.</li>
+    <li>Prefix-aware routing across ≥ 2 replicas and a token-bucket tenant quota at the gateway.</li>
+    <li>An SLO report from the open-loop load generator: TTFT/TPOT percentiles, goodput, cost per million tokens, and the effect of a injected replica failure with the circuit breaker engaged.</li>
+  </ol>
+</div>
+
+<h2>Exercises</h2>
+<ol>
+  <li>Derive the replica count formula from Little’s law and the TPOT target; show where prefill demand invalidates a decode-only plan.</li>
+  <li>Implement chunked SSE cancellation that frees KV within one engine step of client disconnect.</li>
+  <li>Compare consistent hashing versus modulo affinity under rolling restarts; quantify hit-rate loss.</li>
+  <li>Add multi-LoRA admission: reject new adapters when adapter memory + KV would exceed 90% HBM.</li>
+  <li>Simulate retry amplification: show how three unbounded retries turn a 10% replica failure into a herd.</li>
+  <li>Extend the cost model with engineer on-call hours and a data-residency constraint that forces self-hosting.</li>
+</ol>
+
+<h2>Research Papers</h2>
+<table>
+  <caption>Papers and books referenced in this volume.</caption>
+  <thead><tr><th>Paper</th><th>Why it matters here</th></tr></thead>
+  <tbody>
+    <tr><td>Crankshaw et al., 2017. <em>Clipper: A Low-Latency Online Prediction Serving System</em>. NSDI</td><td>Early model-serving system: batching, adaptive strategies, latency SLOs (Chapters 3–4).</td></tr>
+    <tr><td>Olston et al., 2017. <em>TensorFlow-Serving: Flexible, High-Performance ML Serving</em>. arXiv</td><td>Production model server patterns; versioned models (Chapters 4, 8).</td></tr>
+    <tr><td>Gujarati et al., 2020. <em>Serving DNNs like Clockwork: Performance Predictability with Latency-Awareness</em>. OSDI</td><td>Predictable latency via careful scheduling (Chapters 1, 6).</td></tr>
+    <tr><td>Kwon et al., 2023. <em>Efficient Memory Management for Large Language Model Serving with PagedAttention</em>. SOSP</td><td>vLLM: paged KV and continuous batching as the modern engine core (Chapter 4).</td></tr>
+    <tr><td>Sheng et al., 2023. <em>S-LoRA: Serving Thousands of Concurrent LoRA Adapters</em>. arXiv</td><td>Multi-LoRA on shared base models (Chapter 8).</td></tr>
+    <tr><td>Dean &amp; Barroso, 2013. <em>The Tail at Scale</em>. CACM</td><td>Why tails dominate; hedging and latency budgets (Chapters 1, 9).</td></tr>
+    <tr><td>Burns et al., 2016. <em>Borg, Omega, and Kubernetes</em>. ACM Queue</td><td>Cluster scheduling lineage behind GPU node pools (Chapter 6).</td></tr>
+    <tr><td>Zaharia et al., 2018. <em>Accelerating the Machine Learning Lifecycle with MLflow</em>. IEEE Data Eng. Bull.</td><td>Experiment and model registry patterns (Chapter 8).</td></tr>
+    <tr><td>Beyer et al., 2016. <em>Site Reliability Engineering</em>. O’Reilly</td><td>Error budgets, SLOs, load shedding (Chapters 1, 9).</td></tr>
+    <tr><td>Zheng et al., 2023. <em>SGLang: Efficient Execution of Structured Language Model Programs</em>. arXiv:2312.07104</td><td>RadixAttention prefix caching (Chapter 4).</td></tr>
+    <tr><td>OpenAI. <em>API reference</em> (Chat Completions streaming), <em>Rate limits</em> and <em>Error codes</em> guides; <em>Batch API</em> docs (official documentation).</td><td>SSE framing, <code>include_usage</code>, rate-limit headers, 429 semantics, batch pricing (Chapter 2 case study).</td></tr>
+    <tr><td>Anthropic. <em>Messages streaming</em>, <em>Errors</em>, <em>Rate limits</em> and <em>Message Batches</em> docs (official documentation).</td><td>Typed stream events, 529 <code>overloaded_error</code>, input/output token limits (Chapter 2 case study).</td></tr>
+    <tr><td>Google. <em>Gemini API reference</em>: <code>streamGenerateContent</code> (official documentation).</td><td>Streaming surface for Gemini (Chapter 2 case study).</td></tr>
+    <tr><td>Stripe. <em>Idempotent requests</em> (API documentation).</td><td>Idempotency-key TTL convention (Chapter 2).</td></tr>
+  </tbody>
+</table>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Clipper: A Low-Latency Online Prediction Serving System</span>
+    <span class="paper-meta">Crankshaw et al., 2017 · NSDI</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Machine-learning predictions needed interactive latency while frameworks were built for offline throughput.</dd>
+    <dt>Previous limitation</dt><dd>Ad hoc web wrappers around models lacked batching, adaptive timeouts and a common serving abstraction.</dd>
+    <dt>Approach</dt><dd>A layered prediction server with adaptive batching, caching, and latency-aware scheduling across model frameworks.</dd>
+    <dt>Contribution</dt><dd>Showed that careful batching and system structure beat naive RPC-to-Python for online inference.</dd>
+    <dt>Practical impact</dt><dd>Template for the “API + batching engine + SLO” split used throughout this volume.</dd>
+    <dt>Limitations</dt><dd>Pre-LLM: no KV cache, no multi-second generations, no token economics.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Efficient Memory Management for Large Language Model Serving with PagedAttention</span>
+    <span class="paper-meta">Kwon et al., 2023 · SOSP (vLLM)</span></div>
+  <dl>
+    <dt>Problem</dt><dd>KV cache memory fragmentation capped concurrency and wasted GPU HBM under continuous batching.</dd>
+    <dt>Previous limitation</dt><dd>Contiguous per-sequence KV reservations over-allocated memory and limited batch size.</dd>
+    <dt>Approach</dt><dd>PagedAttention: virtualised KV blocks allocated on demand, enabling higher concurrency and throughput.</dd>
+    <dt>Contribution</dt><dd>Became the reference open serving engine design for LLMs; continuous batching + paged KV as defaults.</dd>
+    <dt>Practical impact</dt><dd>Chapter 4’s engine choice and Chapter 6’s KV-utilisation autoscaling assume this memory model.</dd>
+    <dt>Limitations</dt><dd>Engine internals evolve quickly; operators still own routing, release and multi-LoRA policy above the engine.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">S-LoRA: Serving Thousands of Concurrent LoRA Adapters</span>
+    <span class="paper-meta">Sheng et al., 2023 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Multi-tenant platforms needed many fine-tunes without a GPU per adapter.</dd>
+    <dt>Previous limitation</dt><dd>Loading one adapter at a time or dedicating replicas destroyed utilisation.</dd>
+    <dt>Approach</dt><dd>Unified paging for base and adapter weights; batching across adapters with memory-aware scheduling.</dd>
+    <dt>Contribution</dt><dd>Made large-scale multi-LoRA serving practical on shared base models.</dd>
+    <dt>Practical impact</dt><dd>Chapter 8’s registry identity <code>(base, adapter)</code> and pin-top-N adapters follow this line of systems.</dd>
+    <dt>Limitations</dt><dd>Rank, count and hot-load latency still require admission control in production.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">The Tail at Scale</span>
+    <span class="paper-meta">Dean &amp; Barroso, 2013 · CACM</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Rare slow operations dominate end-to-end latency in large fan-out systems.</dd>
+    <dt>Previous limitation</dt><dd>Mean latency hid the user experience; more replicas often made tails worse.</dd>
+    <dt>Approach</dt><dd>Analyse tail causes; hedge requests, shed load, and budget latency across components.</dd>
+    <dt>Contribution</dt><dd>Established tail-aware design as mainstream systems practice.</dd>
+    <dt>Practical impact</dt><dd>Motivates TTFT/TPOT percentiles, hedged retries with care, and shedding in Chapters 1 and 9.</dd>
+    <dt>Limitations</dt><dd>Hedging doubles work — dangerous on GPUs unless bounded and idempotent.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Serving DNNs like Clockwork</span>
+    <span class="paper-meta">Gujarati et al., 2020 · OSDI</span></div>
+  <dl>
+    <dt>Problem</dt><dd>DNN inference latency was unpredictable under concurrent load, breaking SLOs.</dd>
+    <dt>Previous limitation</dt><dd>Throughput-oriented batching ignored tail latency and isolation.</dd>
+    <dt>Approach</dt><dd>Clockwork: predictable execution by planning around measured operator times and cautious scheduling.</dd>
+    <dt>Contribution</dt><dd>Latency predictability as a first-class serving goal, not an afterthought of throughput.</dd>
+    <dt>Practical impact</dt><dd>Supports queue-depth control, admission limits and “measure at SLO” capacity planning in this volume.</dd>
+    <dt>Limitations</dt><dd>Focused on shorter DNN inferences; LLM decode stretches the same ideas across seconds-long requests.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">BOOK</span>
+    <span class="paper-title">Site Reliability Engineering</span>
+    <span class="paper-meta">Beyer et al., 2016 · O’Reilly</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Organisations lacked a shared language for reliability, risk and operational toil.</dd>
+    <dt>Previous limitation</dt><dd>Availability targets without error budgets produced either endless freezes or reckless change.</dd>
+    <dt>Approach</dt><dd>SLIs/SLOs/SLAs, error budgets, toil reduction, load shedding and principled incident response.</dd>
+    <dt>Contribution</dt><dd>The standard vocabulary for production reliability used in Chapter 1’s capacity plan and Chapter 9.</dd>
+    <dt>Practical impact</dt><dd>Error budgets fund canaries; shedding protects goodput; pages map to user-visible SLOs, not raw GPU util.</dd>
+    <dt>Limitations</dt><dd>General distributed systems — LLM token economics and cold starts need the adaptations in this volume.</dd>
+  </dl>
+</section>
+
+<h2>Interview Questions</h2>
+<ol class="questions">
+  <li>Why is requests-per-second a poor primary capacity metric for an LLM API? What would you use instead?</li>
+  <li>Walk through TTFT versus TPOT. Which team owns each when TTFT is bad but TPOT is fine?</li>
+  <li>Design backpressure for a streaming chat endpoint. What status code, what metrics, what client behaviour?</li>
+  <li>Why can GPU utilisation sit at 100% while you still need to scale out?</li>
+  <li>How does prefix-cache affinity interact with least-KV load balancing? When do you break affinity?</li>
+  <li>Compare shadow, canary and blue-green for a tokenizer change versus a LoRA adapter change.</li>
+  <li>How do you canary without splitting a single user’s multi-turn session across two models?</li>
+  <li>A replica returns 503 for 2% of calls. Explain how naive retries make the outage worse, and how you stop it.</li>
+  <li>Where should load shedding happen — client, gateway or model server — and why?</li>
+  <li>Sketch a cost crossover between a managed API and self-hosted H100s. Which assumptions move the crossover most?</li>
+  <li>When are spot GPUs acceptable for LLM serving, and when are they not?</li>
+  <li>How would you autoscale a vLLM Deployment? Name the metric and the cold-start consequence.</li>
+</ol>
+
+<h2>Next Volume</h2>
+<p>Volume 13 turns from shipping the model to shaping what goes into it. You will treat prompts and
+context as versioned engineering artefacts: templates, structured outputs with constrained decoding,
+context budgets, compression, memory, and injection-aware assembly. The serving contract from this
+volume stays fixed — <code>forge.serve</code> remains the HTTP boundary — while
+<code>forge.context</code> learns to build the messages that cross it.</p>
+<p class="facet">Prerequisites from this volume</p>
+<ul>
+  <li>Streaming chat completions, cancellation and idempotency (Chapters 2–3).</li>
+  <li>Token-aware quotas and latency SLOs (Chapters 1 and 7).</li>
+  <li>Artefact digests and canary discipline (Chapter 8), reused for prompt versions.</li>
+  <li>Deadline propagation and fallbacks (Chapter 9), reused when context construction or tools fail.</li>
+</ul>
+</section>
+
+</body>
+</html>

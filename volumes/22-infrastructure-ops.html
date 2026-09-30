@@ -1,0 +1,2019 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 22 · AI Infrastructure, Operations and Cost</title>
+<meta name="volume" content="Volume 22 · AI Infrastructure, Operations and Cost">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 22</p>
+  <h1 class="no-toc">AI Infrastructure, Operations and Cost</h1>
+  <p class="tp-subtitle">GPUs, Cloud, Kubernetes, Observability, Reliability and FinOps</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Operate AI systems as production infrastructure: GPUs, cloud platforms, Kubernetes,
+  observability, reliability and cost — not as a demo that happens to have a Dockerfile.</li>
+  <li>Ship the continuous package as <code>forge.ops</code>: OpenTelemetry-shaped spans for LLM and
+  tool calls, Prometheus-style metric helpers, a cost ledger with per-request attribution,
+  drift monitors and an SLO calculator. Pair it with <code>deploy/</code> examples for a local
+  observability stack, Terraform sketches and Kubernetes manifests.</li>
+  <li>Treat TTFT, TPOT, KV utilisation, queue depth, quality drift and token spend as first-class
+  operational signals — the same units Volumes 11–12 used for capacity, now owned by the on-call.</li>
+  <li>Make FinOps explicit: attribution per tenant and feature, reserved versus spot, and a monthly
+  review that can stop a launch.</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>Volume 6: distributed training cost and scaling fits; you already know FLOPs and HBM matter.</li>
+  <li>Volume 11: KV cache, continuous batching, TTFT/TPOT as physical quantities.</li>
+  <li>Volume 12: <code>forge.serve</code>, GPU containers, K8s probes, canaries and the managed-versus-self-hosted crossover. This volume runs the platform those chapters deploy into.</li>
+  <li>Volume 16–17: harness traces and guardrail triggers — signals you will alert on here.</li>
+  <li>You have operated a Linux service behind a load balancer and read a Prometheus graph.</li>
+</ul>
+
+<p class="facet">How to read the code</p>
+<ul>
+  <li>Every Python listing was executed on an Apple M2 laptop (Python 3.12). Printed output is real.</li>
+  <li>Listings seed <code>src/forge/ops/</code> (spans, metrics, cost, drift, slo, canary). Chapter
+  code under <code>volumes/22-infrastructure-ops/code/</code> stays pedagogical; Forge is the package you keep.</li>
+  <li>Docker Compose for Prometheus / Grafana / OTel Collector / Tempo is meant to run locally.
+  <strong>Terraform and Kubernetes manifests are marked not executed</strong>: they need a cloud
+  account and a GPU node pool. Validate with <code>terraform plan</code>, <code>kubeconform</code>
+  or a staging cluster before apply.</li>
+  <li>Cloud prices and instance names are illustrative teaching constants, not quotes.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Package layout</span>
+  <ul>
+    <li><code>forge/ops/otel.py</code> — GenAI-shaped in-memory spans (same attribute names as Volume 16).</li>
+    <li><code>forge/ops/metrics.py</code> — histogram / counter helpers for TTFT, TPOT, KV, queue.</li>
+    <li><code>forge/ops/slo.py</code> — error budget and burn-rate calculator.</li>
+    <li><code>forge/ops/cost.py</code> — request ledger and attribution roll-ups.</li>
+    <li><code>forge/ops/drift.py</code> — input PSI and quality-drop alerts.</li>
+    <li><code>forge/ops/canary.py</code> — synthetic canary probes.</li>
+    <li><code>deploy/</code> — Compose observability stack; Terraform and K8s examples (not applied).</li>
+  </ul>
+</aside>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1   GPU hardware          HBM, NVLink, InfiniBand, MIG; train vs infer SKUs
+Chapter 2   Cloud AI platforms    AWS/GCP/Azure concepts; managed vs raw; neoclouds
+Chapter 3   Kubernetes for AI     GPU ops, gang scheduling, queues, weight storage
+Chapter 4   Infrastructure as Code Terraform concepts, promotion, secrets
+Chapter 5   Observability foundations  metrics/logs/traces; OTel GenAI conventions
+Chapter 6   Metrics and dashboards     Prometheus TTFT/TPOT/KV/queue; Grafana; alerts
+Chapter 7   LLM-specific monitoring    quality/input drift; guardrails; cost anomalies
+Chapter 8   Reliability engineering    SLOs, incidents, GPU failures, chaos
+Chapter 9   Cost management            attribution, reserved/spot, FinOps
+Chapter 10  Scaling                    H/V, multi-region, DR
+Chapter 11  Security operations        IAM, isolation, secrets, supply-chain</pre>
+<figcaption>Map of Volume 22. Volumes 11–12 built the engine and API; this volume runs them.</figcaption>
+</figure>
+
+<p>Read Chapters 1–4 as the substrate (hardware, cloud, Kubernetes, IaC), Chapters 5–7 as the
+sensing layer, and Chapters 8–11 as the control loop: reliability, money, scale and security.
+The project at the end asks you to operate Forge end-to-end, not to memorise vendor consoles.</p>
+
+<aside class="callout core"><span class="title">Operating posture</span>
+  <ul>
+    <li>Measure in tokens, TTFT/TPOT and dollars — then page on user impact.</li>
+    <li>Prefer reversible digests and error budgets over heroics.</li>
+    <li>Mark every cloud apply path as validated before it touches GPUs.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="gpu-hardware">GPU Hardware for Engineers</h2>
+<p class="chapter-lede">Capacity plans fail when they treat a GPU as a generic accelerator. HBM
+bandwidth, interconnect topology and isolation features decide whether your batching math from
+Volume 12 is even physically possible.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Procurement asks "how many H100s?" Product asks for interactive TTFT. Training wants
+  all-reduce bandwidth. Inference wants HBM for KV. One SKU rarely optimises both. Without a
+  hardware vocabulary you either over-buy or ship a latency SLO you cannot meet.</p>
+</div>
+
+<p class="facet">Possible Solutions</p>
+<ul>
+  <li><strong>Buy the biggest GPU</strong>: raises peak FLOPs; does not fix a memory-bound decode
+  path or a poorly packed MIG slice.</li>
+  <li><strong>Rent managed tokens</strong>: defers hardware choice; you still need to know when
+  self-hosting wins (Volume 12 crossover).</li>
+  <li><strong>Match SKU to phase</strong>: training clusters for interconnect; inference pools for
+  HBM and NVLink domains sized to tensor/pipeline parallel width.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Decode is usually memory-bandwidth bound: tokens/s tracks HBM GB/s more than peak TFLOPS.</li>
+    <li>Prefill is more compute-bound; long RAG prompts change the SKU economics.</li>
+    <li>Interconnect (NVLink, InfiniBand/RoCE) is a first-class capacity item for multi-GPU models.</li>
+  </ul>
+</aside>
+
+<h3>Generations and What Changed</h3>
+
+<table>
+  <caption>Illustrative properties operators care about (order-of-magnitude teaching table).</caption>
+  <thead><tr><th>Class</th><th>HBM (approx.)</th><th>Interconnect</th><th>Ops use</th></tr></thead>
+  <tbody>
+    <tr><td>A100-class</td><td>~40–80&nbsp;GB</td><td>NVLink domain; IB fabrics common</td><td>Still widely deployed for mid-size models</td></tr>
+    <tr><td>H100/H200-class</td><td>~80–141&nbsp;GB</td><td>Faster NVLink; denser racks</td><td>Default frontier train/infer rentals</td></tr>
+    <tr><td>B200 / GB200-class</td><td>Higher HBM; rack-scale NVLink</td><td>NVL72-style domains</td><td>Large TP/EP jobs; check driver/CUDA matrix</td></tr>
+    <tr><td>Inference-tuned (L4, L40S, …)</td><td>Lower HBM, strong $/tok</td><td>Often PCIe-heavy</td><td>Smaller models, high QPS, cost-sensitive</td></tr>
+  </tbody>
+</table>
+
+<ul>
+  <li><strong>HBM</strong> holds weights + KV. Concurrent sequences ≈ free HBM / bytes per token of KV
+  (Volume 11). An "empty" GPU can still be full of cache.</li>
+  <li><strong>NVLink</strong> couples GPUs inside a node (or rack domain) for tensor parallel. Crossing
+  NVLink domains forces slower paths and can destroy TPOT.</li>
+  <li><strong>InfiniBand / RoCE</strong> carry gradient all-reduce and sometimes disaggregated
+  prefill↔decode. Treat fabric congestion as an SLO risk, not a datacentre curiosity.</li>
+  <li><strong>MIG</strong> (Multi-Instance GPU) partitions A100/H100 into isolated slices. Use for
+  small models needing hard isolation; do not time-slice latency-critical chat on a shared GPU
+  without measuring tails.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">  training node                 inference node
+  [GPU]--NVLink--[GPU]          [GPU]  HBM: weights + KV pages
+     \            /                |
+      \ InfiniBand /                +- PCIe NIC (or RDMA if disagg)
+       \          /                 +- local SSD for weight cache
+        \________/</pre>
+<figcaption>Training cares about the fabric; interactive inference cares about HBM and cold-start I/O.</figcaption>
+</figure>
+
+<h3>Choosing Hardware: Training Versus Inference</h3>
+
+<table>
+  <caption>Decision axes that actually change the PO.</caption>
+  <thead><tr><th>Axis</th><th>Training</th><th>Interactive inference</th></tr></thead>
+  <tbody>
+    <tr><td>Primary bottleneck</td><td>Compute + interconnect</td><td>HBM bandwidth + KV capacity</td></tr>
+    <tr><td>Batching</td><td>Large microbatches</td><td>Continuous batching under TTFT/TPOT SLOs</td></tr>
+    <tr><td>Failure mode</td><td>Job restart / checkpoint</td><td>User-visible tail latency; partial GPU fault</td></tr>
+    <tr><td>Spot / preemptible</td><td>Often OK with checkpoints</td><td>Usually not for p95 chat without drain</td></tr>
+    <tr><td>MIG / isolation</td><td>Rarely needed</td><td>Useful for multi-tenant small models</td></tr>
+  </tbody>
+</table>
+
+<div class="tradeoffs">
+  <div class="pros">
+    <p class="facet">Prefer specialised inference SKUs when</p>
+    <ul>
+      <li>Models fit with room for KV at target concurrency.</li>
+      <li>You need many replicas more than peak TFLOPS.</li>
+      <li>$/MTok dominates over absolute tokens/s.</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <p class="facet">Prefer train-class GPUs when</p>
+    <ul>
+      <li>You run large TP/PP/EP jobs or shared train+serve clusters.</li>
+      <li>Weights + KV need maximum HBM per device.</li>
+      <li>Your interconnect topology is already paid for.</li>
+    </ul>
+  </div>
+</div>
+
+<ul class="failure-modes">
+  <li>Buying for FLOPs while decode is HBM-bound — utilisation looks high, goodput is not.</li>
+  <li>Ignoring driver / CUDA / engine matrix — a "free" GPU generation that will not boot your image.</li>
+  <li>Packing multi-tenant traffic on time-sliced GPUs and wondering why p99 TTFT exploded.</li>
+</ul>
+
+
+<h3>HBM Arithmetic Operators Use</h3>
+
+<p>A back-of-envelope still prevents bad POs. For a decoder-only model:</p>
+
+<div class="math">
+M_{\text{weights}} \approx \frac{P \cdot b}{8}\ \text{bytes}, \qquad
+M_{\text{KV}} \approx 2 \cdot L \cdot n_{\text{kv}} \cdot d_{\text{h}} \cdot s \cdot b_{\text{kv}} \cdot B
+</div>
+
+<ul>
+  <li><span class="math">P</span> parameters, <span class="math">b</span> bits per weight, <span class="math">L</span> layers,
+  <span class="math">s</span> sequence length, <span class="math">B</span> concurrent sequences.</li>
+  <li>Leave headroom for fragmentation, CUDA context and engine scratch (often 10–20%).</li>
+  <li>If <span class="math">M_{\text{weights}} + M_{\text{KV}}</span> exceeds HBM, no amount of "optimise the Python" fixes TTFT.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>KV memory sketch for capacity meetings.</figcaption>
+<pre><code>"""Rough KV bytes for concurrent sequences (fp16 KV toy)."""
+from __future__ import annotations
+
+
+def kv_bytes(
+    layers: int, kv_heads: int, head_dim: int,
+    seq: int, batch: int, bytes_per: int = 2,
+) -&gt; int:
+    # K and V each store layers * kv_heads * head_dim * seq * batch
+    return 2 * layers * kv_heads * head_dim * seq * batch * bytes_per
+
+
+def gib(n: int) -&gt; float:
+    return n / (1024 ** 3)
+
+
+mem = kv_bytes(layers=32, kv_heads=8, head_dim=128, seq=4096, batch=64)
+print(f"KV ~ {gib(mem):.2f} GiB for 64 seq @ 4k")
+mem2 = kv_bytes(layers=32, kv_heads=8, head_dim=128, seq=4096, batch=128)
+print(f"KV ~ {gib(mem2):.2f} GiB for 128 seq @ 4k")</code></pre>
+</figure>
+<pre class="output">KV ~ 32.00 GiB for 64 seq @ 4k
+KV ~ 64.00 GiB for 128 seq @ 4k</pre>
+
+<aside class="callout advanced"><span class="title">Interconnect topology</span>
+  <ul>
+    <li>Tensor parallel width should fit inside one NVLink domain when possible.</li>
+    <li>Pipeline parallel stages that cross slow links create bubbles; measure bubble fraction.</li>
+    <li>Expert parallel (MoE) adds all-to-all traffic — fabric congestion shows up as TPOT jitter.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise" data-title="Exercise">
+  <p>For a 7B model at 4-bit weights, estimate HBM for weights plus KV for 64 concurrent 4k-context
+  sequences. Does an L40S-class card clear the TTFT plan at your measured tokens/s, or do you need
+  an H100-class card for memory alone?</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="cloud-platforms">Cloud AI Platforms</h2>
+<p class="chapter-lede">Cloud vendors sell the same physical ideas under different product names.
+The engineering choice is not logo preference — it is managed API versus managed endpoint versus
+raw GPU, and who owns the failure domain.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A team can call a hosted chat API tomorrow, or stand up vLLM on rented GPUs in a week, or
+  buy a managed endpoint that hides the engine. Each path locks different costs, data flows and
+  operational toil. Mixing them without a boundary diagram produces three billings and one pager.</p>
+</div>
+
+<h3>Building Blocks at Concept Level</h3>
+
+<table>
+  <caption>AWS / GCP / Azure concepts mapped to the same engineering role.</caption>
+  <thead><tr><th>Role</th><th>Typical AWS idea</th><th>Typical GCP idea</th><th>Typical Azure idea</th></tr></thead>
+  <tbody>
+    <tr><td>Managed model API</td><td>Bedrock-style</td><td>Vertex Generative AI</td><td>Azure OpenAI / Foundry</td></tr>
+    <tr><td>Managed endpoint</td><td>SageMaker endpoints</td><td>Vertex Prediction</td><td>AML managed online</td></tr>
+    <tr><td>Raw GPU VM / node</td><td>EC2 / EKS GPU</td><td>GCE / GKE GPU</td><td>NV-series / AKS GPU</td></tr>
+    <tr><td>Object / artefact store</td><td>S3</td><td>GCS</td><td>Blob</td></tr>
+    <tr><td>Secrets / IAM</td><td>IAM + Secrets Manager</td><td>IAM + Secret Manager</td><td>Entra + Key Vault</td></tr>
+    <tr><td>Observability sink</td><td>CloudWatch / X-Ray</td><td>Cloud Monitoring / Trace</td><td>Monitor / App Insights</td></tr>
+  </tbody>
+</table>
+
+<p>Names change; roles do not. Volume 12’s crossover calculator still applies: utilisation and
+cold-start tax dominate the managed-versus-raw decision.</p>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li><strong>Managed API</strong>: you buy tokens and SLAs; you do not schedule GPUs.</li>
+    <li><strong>Managed endpoint</strong>: you bring weights; the platform runs the replica lifecycle.</li>
+    <li><strong>Raw GPU</strong>: you own image, driver, engine, autoscaling and pages.</li>
+    <li><strong>Neoclouds</strong> (specialist GPU clouds): often cheaper raw capacity, thinner
+    platform services — budget for your own observability and IAM glue.</li>
+  </ul>
+</aside>
+
+<figure class="diagram">
+<pre class="ascii">  product ──► gateway ─┬─► managed API (provider region)
+                       ├─► managed endpoint (your weights)
+                       └─► self-hosted forge.serve on GPU node pool
+                                 │
+                                 └─► forge.ops metrics / traces / cost ledger</pre>
+<figcaption>One product surface; three infrastructure modes. Route with <code>forge.router</code> (Volume 18).</figcaption>
+</figure>
+
+<p class="facet">When each mode wins</p>
+<ul>
+  <li><strong>Managed API</strong>: bursty traffic, many models, small ops team, data residency OK.</li>
+  <li><strong>Managed endpoint</strong>: custom weights without wanting K8s GPU ops.</li>
+  <li><strong>Raw / neocloud</strong>: steady utilisation, strict isolation, or unit economics past the crossover.</li>
+</ul>
+
+
+<h3>Neoclouds and Colocation</h3>
+
+<ul>
+  <li>Specialist GPU clouds often undercut hyperscaler on-demand list prices for raw devices.</li>
+  <li>You typically bring more of the platform: identity glue, private networking, observability sinks.</li>
+  <li>Contract for interconnect topology, not only "8× GPU" — an 8-GPU VM with weak NVLink is a different product.</li>
+  <li>Exit plan: keep artefacts and the OpenAI-compatible edge portable (Volume 12).</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">  decision tree (simplified)
+  need custom weights? ──no──► managed API (token bill)
+         │yes
+         ▼
+  want to own K8s/GPU ops? ──no──► managed endpoint
+         │yes
+         ▼
+  steady util &gt; crossover? ──no──► stay managed / hybrid
+         │yes
+         ▼
+  raw GPUs (hyperscaler or neocloud) + forge.ops</pre>
+<figcaption>Hybrid is normal: managed APIs for long-tail models, raw GPUs for the hot path.</figcaption>
+</figure>
+
+<aside class="callout impl"><span class="title">Hybrid control plane</span>
+  <ul>
+    <li>Route with <code>forge.router</code> capability profiles so a region outage can fail over to a managed API with a known quality floor.</li>
+    <li>Emit the same OTel attributes regardless of backend so dashboards do not fork.</li>
+  </ul>
+</aside>
+
+<aside class="callout warning"><span class="title">Vendor lock-in</span>
+  <ul>
+    <li>Keep the OpenAI-compatible contract from Volume 12 at the edge so backends can move.</li>
+    <li>Store artefacts (weights, prompts, eval sets) in your bucket with digests — not only in a
+    vendor model garden.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="kubernetes-ai">Kubernetes for AI</h2>
+<p class="chapter-lede">Kubernetes schedules pods; AI workloads need GPU device plugins, gang
+scheduling for multi-GPU jobs, and storage that can feed multi-gigabyte weight pulls without
+stomping interactive replicas.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A default Deployment with <code>nvidia.com/gpu: 1</code> starts one replica. Training jobs that
+  need eight GPUs together will partially schedule and deadlock. Inference replicas that pull
+  70&nbsp;GB weights through the registry on every scale-up miss every TTFT SLO for minutes. CPU
+  utilisation autoscaling still lies.</p>
+</div>
+
+<p class="facet">Possible Solutions</p>
+<ul>
+  <li><strong>More replicas</strong>: does not fix gang deadlock or weight cold-start.</li>
+  <li><strong>Bigger nodes</strong>: helps HBM; does not create a queueing policy.</li>
+  <li><strong>GPU operator + device plugin + queue + cache</strong>: the production pattern.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Not executed</span>
+  <p>Manifests below are validated against documented Kubernetes and NVIDIA device-plugin
+  interfaces. They were <strong>not applied</strong> to a live cluster in this volume’s authoring
+  run. Use <code>kubeconform</code> / staging before production.</p>
+</aside>
+
+<h3>GPU Operators and Device Plugins</h3>
+
+<ul>
+  <li>The NVIDIA GPU Operator (or equivalent) installs drivers, device plugin, DCGM exporter and
+  often MIG managers.</li>
+  <li>Pods request <code>nvidia.com/gpu</code> (or MIG resource names). Without the plugin, the
+  scheduler cannot count devices.</li>
+  <li>DCGM metrics (SM clocks, ECC, XID errors) belong next to your application Prometheus scrape.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Inference Deployment sketch: GPU request, startup probe, weight cache volume. <strong>Not executed.</strong></figcaption>
+<pre><code># deploy/k8s/forge-serve.yaml  — NOT EXECUTED
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forge-serve
+spec:
+  replicas: 2
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: serve
+          image: registry.example/forge-serve:1.4.2@sha256:…
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+          ports:
+            - containerPort: 8000
+          startupProbe:
+            httpGet: { path: /readyz, port: 8000 }
+            failureThreshold: 60
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8000 }
+          volumeMounts:
+            - name: weights
+              mountPath: /models
+      volumes:
+        - name: weights
+          persistentVolumeClaim:
+            claimName: model-weights-pvc</code></pre>
+</figure>
+
+<h3>Gang Scheduling and Queues</h3>
+
+<ul>
+  <li><strong>Gang scheduling</strong>: all pods of a multi-GPU job start together or none do.
+  Without it, partial allocation starves the cluster.</li>
+  <li>Systems such as Volcano, Kueue or proprietary trainers implement queues with priorities,
+  fair-share and quotas across teams.</li>
+  <li>Separate <em>interactive inference</em> node pools from <em>batch train / offline</em> pools
+  so a research job cannot evict chat capacity.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">  queues
+  ┌─────────────┐   ┌──────────────┐   ┌─────────────┐
+  │ interactive │   │ train gang   │   │ offline bat │
+  │ forge.serve │   │ 8-GPU jobs   │   │ spot OK     │
+  └──────┬──────┘   └──────┬───────┘   └──────┬──────┘
+         │                 │                  │
+         ▼                 ▼                  ▼
+     GPU pool A         GPU pool B         GPU pool C
+     (on-demand)        (reserved)         (spot)</pre>
+<figcaption>Queue and pool separation is capacity policy expressed as YAML.</figcaption>
+</figure>
+
+<h3>Storage for Checkpoints and Weights</h3>
+
+<ul>
+  <li>Object storage is source of truth; local NVMe / PVC caches absorb repeated pulls.</li>
+  <li>Pin weight digests in the registry (Volume 12). Rolling a bad digest is an ops incident.</li>
+  <li>Checkpoint writers need parallel filesystem or object multipart; do not NFS-mount a single
+  filer as the only path for multi-node training.</li>
+</ul>
+
+
+<h3>Multi-Tenant Clusters</h3>
+
+<ul>
+  <li>Namespaces per team are necessary but not sufficient — GPU quotas and PriorityClasses enforce fairness.</li>
+  <li>Noisy neighbours on shared node pools show up as TPOT jitter; dedicated pools cost more and simplify SLOs.</li>
+  <li>Chargeback needs the cost ledger labels (Chapter 9) propagated as pod labels / metric labels.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>PriorityClass sketch for interactive versus batch. <strong>Not executed.</strong></figcaption>
+<pre><code># deploy/k8s/priority.yaml  — NOT EXECUTED
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata: { name: forge-interactive }
+value: 100000
+globalDefault: false
+description: "Chat and agent traffic"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata: { name: forge-batch }
+value: 10000
+description: "Offline and train gangs yield first"</code></pre>
+</figure>
+
+<aside class="callout core"><span class="title">Disruption budgets</span>
+  <ul>
+    <li>PodDisruptionBudgets on serve Deployments prevent cluster upgrades from draining all replicas.</li>
+    <li>Combine with <code>terminationGracePeriodSeconds</code> long enough to finish in-flight generations or shed cleanly.</li>
+  </ul>
+</aside>
+
+<aside class="callout warning"><span class="title">Autoscaling reminder</span>
+  <ul>
+    <li>Scale on queue depth / KV utilisation / tokens in flight — not mean CPU.</li>
+    <li>Account for cold start: image pull + weight load + CUDA graphs can be minutes.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="iac">Infrastructure as Code</h2>
+<p class="chapter-lede">Click-ops GPU clusters drift. Terraform (or equivalent) makes environments
+reviewable, promotable and recoverable — if secrets and state are handled like production data.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Staging has a different CUDA driver, a hand-edited security group and an undocumented GPU
+  quota. Production "works" until the next peer leaves. Reproducing an incident environment takes
+  a week of archaeology.</p>
+</div>
+
+<aside class="callout impl"><span class="title">Not executed</span>
+  <p>Terraform snippets are conceptual. They were <strong>not applied</strong>
+  (<code>terraform apply</code> never ran). Run <code>terraform plan</code> in a sandbox account.</p>
+</aside>
+
+<h3>Terraform Concepts for AI Platforms</h3>
+
+<ul>
+  <li><strong>Modules</strong>: node pool, IAM role for nodes, artefact bucket, observability sink.</li>
+  <li><strong>Workspaces / directories</strong>: <code>dev</code> → <code>staging</code> → <code>prod</code>
+  with the same module versions and different variable files.</li>
+  <li><strong>State</strong>: remote backend with locking; treat state as confidential.</li>
+  <li><strong>Providers</strong>: cloud + Kubernetes + Helm common; pin provider versions.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Illustrative module inputs for a GPU node pool. <strong>Not executed.</strong></figcaption>
+<pre><code># deploy/terraform/gpu_pool/variables.tf  — NOT EXECUTED
+variable "cluster_name" { type = string }
+variable "gpu_instance_type" {
+  type    = string
+  default = "g5.12xlarge"  # illustrative
+}
+variable "desired_gpus" { type = number }
+variable "spot" {
+  type    = bool
+  default = false
+}
+
+# root: promote by tfvars, not by editing module source
+# environments/staging.tfvars → environments/prod.tfvars</code></pre>
+</figure>
+
+<h3>Environment Promotion</h3>
+
+<ol>
+  <li>Merge module change → plan on <code>dev</code>.</li>
+  <li>Apply <code>dev</code>; run synthetic canaries from <code>forge.ops.canary</code>.</li>
+  <li>Plan/apply <code>staging</code> with production-like GPU SKUs if budget allows.</li>
+  <li>Apply <code>prod</code> only with change windows funded by the error budget (Chapter 8).</li>
+</ol>
+
+<aside class="callout security"><span class="title">Secrets</span>
+  <ul>
+    <li>Never commit API keys, kubeconfigs or <code>terraform.tfvars</code> with credentials.</li>
+    <li>Inject secrets from a manager (cloud secret store / Vault) at runtime; Terraform may create
+    the <em>reference</em>, not the plaintext value in state when avoidable.</li>
+    <li>Rotate provider tokens used by CI separately from human credentials.</li>
+  </ul>
+</aside>
+
+
+<h3>State, Locking and Policy as Code</h3>
+
+<ul>
+  <li>Remote state with locking prevents two applies corrupting the GPU node pool mid-rollout.</li>
+  <li>OPA / Sentinel / cloud organisation policies can deny public buckets for weight artefacts.</li>
+  <li>Store plan JSON beside the PR; require a human approval on destroy or quota increases.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Promotion sketch: same module, different tfvars. <strong>Not executed.</strong></figcaption>
+<pre><code># deploy/terraform/environments/prod.tfvars  — NOT EXECUTED
+cluster_name       = "forge-prod"
+gpu_instance_type  = "g5.12xlarge"
+desired_gpus       = 16
+spot               = false
+enable_dcgm        = true
+weight_bucket      = "forge-prod-weights"
+
+# CI: terraform plan -var-file=environments/prod.tfvars -out=prod.plan
+# human approval, then terraform apply prod.plan</code></pre>
+</figure>
+
+<aside class="callout warning"><span class="title">Drift</span>
+  <ul>
+    <li>Console edits to security groups create invisible drift — schedule <code>terraform plan</code> and page on non-empty diffs for prod.</li>
+  </ul>
+</aside>
+
+<p class="facet">Minimal checklist</p>
+<ul>
+  <li>Pinned module versions and provider constraints.</li>
+  <li>Plan artefacts stored with the PR.</li>
+  <li>Destroy protection on prod buckets and GPU reservations.</li>
+  <li>Drift detection job (<code>plan</code> on a schedule) that pages on unexpected changes.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="otel">Observability Foundations</h2>
+<p class="chapter-lede">You cannot page on vibes. Metrics, logs and traces answer different
+questions; OpenTelemetry GenAI semantic conventions give LLM calls a shared vocabulary across
+Forge services.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Serve logs "done", Prometheus shows GPU util at 90%, and users still report empty replies.
+  Without traces that bind gateway → router → model → tool, and without token usage on the span,
+  you cannot tell timeout from refusal from upstream 429.</p>
+</div>
+
+<aside class="callout core"><span class="title">Three pillars</span>
+  <ul>
+    <li><strong>Metrics</strong>: aggregates for SLOs and autoscaling (Chapter 6).</li>
+    <li><strong>Logs</strong>: sparse, structured events for incidents — not full prompts in cleartext
+    by default.</li>
+    <li><strong>Traces</strong>: causal graph of one request across services and tools.</li>
+  </ul>
+</aside>
+
+<h3>OpenTelemetry GenAI Conventions</h3>
+
+<p>Attribute names follow the evolving GenAI semantic conventions (marked Development upstream).
+Volume 16’s harness tracer uses the same shape; <code>forge.ops.otel</code> is the ops-facing twin
+that can later export via the OTel SDK to a collector.</p>
+
+<figure class="listing">
+<figcaption>In-memory GenAI-shaped spans for Forge services (<code>forge.ops.otel</code>).</figcaption>
+<pre><code>"""forge.ops.otel: GenAI-shaped spans without requiring a collector."""
+from __future__ import annotations
+
+import itertools
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from collections.abc import Iterator
+
+
+def _hex(counter: int, width: int) -&gt; str:
+    return f"{counter:0{width}x}"
+
+
+@dataclass
+class Span:
+    name: str
+    trace_id: str
+    span_id: str
+    parent_id: str | None
+    attributes: dict
+    start: float
+    end: float | None = None
+
+    def finish(self) -&gt; None:
+        self.end = time.perf_counter()
+
+    def as_dict(self) -&gt; dict:
+        ms = None if self.end is None else round((self.end - self.start) * 1000, 3)
+        return {
+            "name": self.name,
+            "trace_id": self.trace_id,
+            "span_id": self.span_id,
+            "parent_id": self.parent_id,
+            "attributes": self.attributes,
+            "duration_ms": ms,
+        }
+
+
+@dataclass
+class Tracer:
+    service: str
+    trace_id: str = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    _ids: itertools.count = field(default_factory=lambda: itertools.count(1))
+    spans: list[Span] = field(default_factory=list)
+    _stack: list[str] = field(default_factory=list)
+
+    def _span_id(self) -&gt; str:
+        return _hex(next(self._ids), 16)
+
+    @contextmanager
+    def span(self, name: str, **attributes: object) -&gt; Iterator[Span]:
+        parent = self._stack[-1] if self._stack else None
+        current = Span(
+            name, self.trace_id, self._span_id(), parent,
+            dict(attributes), time.perf_counter(),
+        )
+        self.spans.append(current)
+        self._stack.append(current.span_id)
+        try:
+            yield current
+        finally:
+            current.finish()
+            self._stack.pop()
+
+    def export(self) -&gt; list[dict]:
+        return [span.as_dict() for span in self.spans]
+
+
+tr = Tracer("forge.serve")
+with tr.span(
+    "gen_ai.chat",
+    **{
+        "gen_ai.system": "openai",
+        "gen_ai.request.model": "forge-smol",
+        "gen_ai.operation.name": "chat",
+    },
+) as root:
+    with tr.span("gen_ai.prefill"):
+        time.sleep(0.002)
+    with tr.span(
+        "gen_ai.decode",
+        **{
+            "gen_ai.usage.input_tokens": 128,
+            "gen_ai.usage.output_tokens": 64,
+        },
+    ):
+        time.sleep(0.003)
+    root.attributes["gen_ai.usage.input_tokens"] = 128
+    root.attributes["gen_ai.usage.output_tokens"] = 64
+
+for row in tr.export():
+    usage = {
+        k: v for k, v in row["attributes"].items()
+        if "usage" in k or k.endswith("model") or k.endswith("name")
+    }
+    print(f"{row['name']:16s} parent={row['parent_id']} "
+          f"dur={row['duration_ms']}ms {usage}")</code></pre>
+</figure>
+<pre class="output">gen_ai.chat       parent=None dur=6.298ms {'gen_ai.request.model': 'forge-smol', 'gen_ai.operation.name': 'chat', 'gen_ai.usage.input_tokens': 128, 'gen_ai.usage.output_tokens': 64}
+gen_ai.prefill    parent=0000000000000001 dur=2.511ms {}
+gen_ai.decode     parent=0000000000000001 dur=3.766ms {'gen_ai.usage.input_tokens': 128, 'gen_ai.usage.output_tokens': 64}</pre>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Production replaces the in-memory list with OTLP export to a collector; attribute names stay.</li>
+    <li>Do not put raw prompts on spans by default — hash or sample under a privacy policy.</li>
+    <li>Tool calls get child spans (<code>gen_ai.execute_tool</code>) so agent fan-out is visible.</li>
+  </ul>
+</aside>
+
+
+<h3>Local Observability Stack</h3>
+
+<figure class="listing">
+<figcaption>Compose services for local ops drills (intended to run; adjust image tags to your pin set).</figcaption>
+<pre><code># deploy/compose/docker-compose.yml  — local stack (run on your machine)
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector:0.96.0
+    volumes: ["./otel-collector.yaml:/etc/otelcol/config.yaml"]
+    ports: ["4317:4317", "4318:4318"]
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    volumes: ["./prometheus.yml:/etc/prometheus/prometheus.yml"]
+    ports: ["9090:9090"]
+  grafana:
+    image: grafana/grafana:10.4.0
+    ports: ["3000:3000"]
+  tempo:
+    image: grafana/tempo:2.4.0
+    ports: ["3200:3200"]</code></pre>
+</figure>
+
+<p>Point <code>forge.serve</code> metrics at Prometheus and OTLP at the collector. Volume 16’s in-memory
+tracer becomes an exporter in production; attribute names stay stable across that swap.</p>
+
+<aside class="callout warning"><span class="title">PII in telemetry</span>
+  <ul>
+    <li>Default: no raw prompts, no tool payloads with secrets.</li>
+    <li>If debugging requires content, use redacted fields and a short retention tier.</li>
+  </ul>
+</aside>
+
+<figure class="diagram">
+<pre class="ascii">  forge.serve / harness / router
+           │  OTLP
+           ▼
+     OTel Collector ──► Tempo/Jaeger (traces)
+           │
+           ├──► Prometheus remote-write (metrics)
+           └──► log pipeline (structured JSON)</pre>
+<figcaption><code>deploy/compose</code> runs this locally; cloud exporters swap the backends.</figcaption>
+</figure>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="metrics-dashboards">Metrics and Dashboards</h2>
+<p class="chapter-lede">Prometheus histograms and Grafana boards turn Volume 12’s SLOs into pages
+someone can answer. The wrong metric (CPU, mean latency) produces confident autoscaling in the
+wrong direction.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>On-call sees "latency up". Which latency — TTFT or TPOT? Which tenant? Is KV full so new
+  requests queue, or is decode batch size too large? A single red line without labels forces a
+  guess during the incident.</p>
+</div>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Instrument TTFT, TPOT, queue depth, KV utilisation, goodput and token rates as separate series.</li>
+    <li>Alert on SLO burn, not on raw GPU utilisation alone.</li>
+    <li>Dashboards answer "user impact" first, "resource" second.</li>
+  </ul>
+</aside>
+
+<h3>Prometheus Metrics for Model Services</h3>
+
+<table>
+  <caption>Minimum series for <code>forge.serve</code> ops.</caption>
+  <thead><tr><th>Metric</th><th>Type</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td><code>llm_ttft_seconds</code></td><td>histogram</td><td>Responsiveness SLO</td></tr>
+    <tr><td><code>llm_tpot_seconds</code></td><td>histogram</td><td>Decode SLO</td></tr>
+    <tr><td><code>llm_queue_depth</code></td><td>gauge</td><td>Admission / autoscaling</td></tr>
+    <tr><td><code>llm_kv_utilisation_ratio</code></td><td>gauge</td><td>Concurrency headroom</td></tr>
+    <tr><td><code>llm_tokens_total</code></td><td>counter</td><td>Cost and capacity</td></tr>
+    <tr><td><code>llm_requests_total</code></td><td>counter</td><td>Success / 429 / 5xx labels</td></tr>
+    <tr><td><code>llm_goodput_total</code></td><td>counter</td><td>In-SLO completions</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>Lightweight histogram / counter helpers used before a real client library (<code>forge.ops.metrics</code>).</figcaption>
+<pre><code>"""forge.ops.metrics: teaching stand-ins for Prometheus client patterns."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Histogram:
+    name: str
+    buckets: list[float]
+    counts: list[int] = field(default_factory=list)
+    sum: float = 0.0
+    n: int = 0
+
+    def __post_init__(self) -&gt; None:
+        self.counts = [0] * len(self.buckets)
+
+    def observe(self, value: float) -&gt; None:
+        self.sum += value
+        self.n += 1
+        for i, edge in enumerate(self.buckets):
+            if value &lt;= edge:
+                self.counts[i] += 1
+                return
+
+    def quantile_approx(self, q: float) -&gt; float:
+        """Upper-bound estimate from cumulative buckets (demo quality)."""
+        if self.n == 0:
+            return float("nan")
+        target = q * self.n
+        cum = 0
+        for edge, c in zip(self.buckets, self.counts):
+            cum += c
+            if cum &gt;= target:
+                return edge
+        return self.buckets[-1]
+
+
+@dataclass
+class Counter:
+    name: str
+    value: float = 0.0
+
+    def inc(self, delta: float = 1.0) -&gt; None:
+        self.value += delta
+
+
+ttft = Histogram(
+    "llm_ttft_seconds",
+    buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.5],
+)
+tpot = Histogram(
+    "llm_tpot_seconds",
+    buckets=[0.01, 0.02, 0.04, 0.08, 0.16],
+)
+goodput = Counter("llm_goodput_total")
+
+samples_ttft = [0.12, 0.18, 0.40, 0.55, 0.09, 0.22]
+samples_tpot = [0.025, 0.031, 0.045, 0.028, 0.060, 0.033]
+for a, b in zip(samples_ttft, samples_tpot):
+    ttft.observe(a)
+    tpot.observe(b)
+    if a &lt;= 0.5 and b &lt;= 0.04:
+        goodput.inc()
+
+print(f"ttft_p95_bucket~{ttft.quantile_approx(0.95)}s  "
+      f"tpot_p95_bucket~{tpot.quantile_approx(0.95)}s  "
+      f"goodput={goodput.value}/{ttft.n}")</code></pre>
+</figure>
+<pre class="output">ttft_p95_bucket~0.55s  tpot_p95_bucket~0.08s  goodput=4.0/6</pre>
+
+<h3>Grafana and Alerting</h3>
+
+<ul>
+  <li>Row 1: goodput, error rate, TTFT/TPOT p95 by model and tenant.</li>
+  <li>Row 2: queue depth, KV utilisation, batch size, prefix-cache hit rate.</li>
+  <li>Row 3: GPU DCGM (temp, ECC, XID), replica count, cold starts.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Example Prometheus alert on TTFT burn. <strong>Not executed</strong> against a live Alertmanager.</figcaption>
+<pre><code># deploy/prometheus/alerts.yml  — NOT EXECUTED
+groups:
+  - name: forge-serve-slo
+    rules:
+      - alert: ForgeTTFTBudgetBurn
+        expr: |
+          (
+            histogram_quantile(0.95, sum by (le) (rate(llm_ttft_seconds_bucket[5m])))
+            &gt; 0.5
+          )
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: "TTFT p95 above 500ms for 10m"</code></pre>
+</figure>
+
+
+<h3>Synthetic Canaries</h3>
+
+<p>Black-box canaries catch "the pod is up but the model returns empty". Run them on a schedule
+from outside the cluster and on a scrape from inside.</p>
+
+<figure class="listing">
+<figcaption>Minimal synthetic canary (<code>forge.ops.canary</code>).</figcaption>
+<pre><code>"""forge.ops.canary: probe an OpenAI-compatible /v1/chat/completions."""
+from __future__ import annotations
+
+import json
+import urllib.request
+from dataclasses import dataclass
+
+
+@dataclass
+class CanaryResult:
+    ok: bool
+    latency_ms: float
+    reason: str
+
+
+def probe_chat(base_url: str, model: str, timeout_s: float = 5.0) -&gt; CanaryResult:
+    import time
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 8,
+    }).encode()
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    t0 = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            payload = json.loads(resp.read().decode())
+        ms = (time.perf_counter() - t0) * 1000
+        text = payload["choices"][0]["message"]["content"]
+        if not text:
+            return CanaryResult(False, ms, "empty_content")
+        return CanaryResult(True, ms, "ok")
+    except Exception as exc:  # noqa: BLE001 — canary must never crash the cron
+        ms = (time.perf_counter() - t0) * 1000
+        return CanaryResult(False, ms, type(exc).__name__)
+
+
+# Offline demonstration without a live server:
+demo = CanaryResult(True, 42.0, "ok")
+print(demo)</code></pre>
+</figure>
+<pre class="output">CanaryResult(ok=True, latency_ms=42.0, reason='ok')</pre>
+
+<p class="facet">Dashboard annotations</p>
+<ul>
+  <li>Mark deploys and model digest changes on Grafana timelines.</li>
+  <li>Overlay error-budget remaining with release events — the SRE book’s change-management loop.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Alert hygiene</span>
+  <ul>
+    <li>Page on user-visible SLO burn; ticket on capacity trends.</li>
+    <li>Multi-window burn rates (Chapter 8) beat single threshold flapping.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="llm-monitoring">LLM-Specific Monitoring</h2>
+<p class="chapter-lede">Infrastructure green does not mean the product is healthy. Quality drift,
+input mix shifts, guardrail trip rates and cost anomalies need their own detectors beside
+latency graphs.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>TTFT is fine. Task success on the weekly golden set fell six points after a prompt change
+  nobody tagged. Separately, a tenant’s token bill doubled because a client bug retried streams.
+  Neither shows up as a 5xx.</p>
+</div>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Monitor <em>quality</em> (task success, judge scores, thumbs) on a sample with latency SLOs.</li>
+    <li>Monitor <em>input drift</em> so you know when yesterday’s eval set stopped representing traffic.</li>
+    <li>Monitor <em>policy</em> (guardrail triggers) and <em>money</em> (cost anomalies) as first-class series.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption>Input drift via population stability index and quality-drop alerts (<code>forge.ops.drift</code>).</figcaption>
+<pre><code>"""forge.ops.drift: input mix PSI and quality drop detection."""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+
+@dataclass
+class Bucket:
+    name: str
+    counts: dict[str, int]
+
+
+def psi(ref: Bucket, cur: Bucket, eps: float = 1e-6) -&gt; float:
+    keys = set(ref.counts) | set(cur.counts)
+    rtot = sum(ref.counts.get(k, 0) for k in keys) + eps * len(keys)
+    ctot = sum(cur.counts.get(k, 0) for k in keys) + eps * len(keys)
+    score = 0.0
+    for k in keys:
+        p = (ref.counts.get(k, 0) + eps) / rtot
+        q = (cur.counts.get(k, 0) + eps) / ctot
+        score += (q - p) * math.log(q / p)
+    return score
+
+
+def quality_alert(
+    baseline: dict, current: dict, min_n: int = 50, drop: float = 0.05,
+) -&gt; str:
+    if current["n"] &lt; min_n:
+        return "insufficient_n"
+    if baseline["rate"] - current["rate"] &gt; drop:
+        return "quality_drop"
+    return "ok"
+
+
+ref = Bucket("week0", {"support": 40, "code": 30, "creative": 20, "other": 10})
+cur = Bucket("week1", {"support": 25, "code": 45, "creative": 15, "other": 15})
+print("psi", round(psi(ref, cur), 4))
+print(quality_alert({"rate": 0.82, "n": 500}, {"rate": 0.74, "n": 200}))
+print(quality_alert({"rate": 0.82, "n": 500}, {"rate": 0.80, "n": 200}))</code></pre>
+</figure>
+<pre class="output">psi 0.166
+quality_drop
+ok</pre>
+
+<p class="facet">Signals to wire</p>
+<ul>
+  <li><strong>Guardrail triggers</strong> (Volume 17): rate by rule id — spikes mean attack or broken client.</li>
+  <li><strong>Feedback</strong>: thumbs / ticket reopen rates linked to model version digests.</li>
+  <li><strong>Cost anomalies</strong>: tokens per request and $ per tenant z-scores versus 7-day baseline.</li>
+  <li><strong>Refusal / empty</strong> rates: often silent product failures.</li>
+</ul>
+
+
+<h3>Cost Anomaly Detection</h3>
+
+<figure class="listing">
+<figcaption>Simple z-score on daily token spend per tenant.</figcaption>
+<pre><code>"""Flag tenants whose spend jumps versus a trailing baseline."""
+from __future__ import annotations
+
+import statistics
+
+
+def cost_anomaly(history: list[float], today: float, z: float = 3.0) -&gt; str:
+    if len(history) &lt; 5:
+        return "insufficient_history"
+    mu = statistics.mean(history)
+    sigma = statistics.pstdev(history) or 1e-9
+    score = (today - mu) / sigma
+    if score &gt;= z:
+        return f"anomaly_z={score:.2f}"
+    return "ok"
+
+
+hist = [10, 11, 9, 10, 12, 11, 10]
+print(cost_anomaly(hist, 11))
+print(cost_anomaly(hist, 40))</code></pre>
+</figure>
+<pre class="output">ok
+anomaly_z=32.73</pre>
+
+<p>Wire this to the ledger daily roll-up; page only when correlated with traffic or a deploy annotation.</p>
+
+<ul class="failure-modes">
+  <li>Judging every request with an LLM judge — circular cost and latency; sample instead.</li>
+  <li>Alerting on PSI without a playbook — drift is a hypothesis, not always a bug.</li>
+  <li>Logging full prompts to the metrics backend — privacy incident waiting to happen.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="reliability">Reliability Engineering</h2>
+<p class="chapter-lede">SLOs convert product promises into error budgets. Incidents, GPU failure
+modes and chaos tests spend that budget deliberately instead of discovering its size in an outage.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Leadership wants 99.9% availability. Engineering ships daily. Without an error budget, every
+  launch is either frozen or reckless. GPU nodes also fail differently from CPU web tiers: XID
+  errors, ECC storms, stranded MIG slices and silent throughput collapse.</p>
+</div>
+
+<figure class="listing">
+<figcaption>SLO window consumption and breaches (<code>forge.ops.slo</code>).</figcaption>
+<pre><code>"""forge.ops.slo: error budget and multi-signal SLO checks."""
+from __future__ import annotations
+
+import math
+import random
+from dataclasses import dataclass
+
+
+@dataclass
+class Window:
+    successes: int
+    failures: int
+    ttft_ms: list[float]
+    tpot_ms: list[float]
+
+
+@dataclass
+class SLOs:
+    availability: float = 0.999
+    ttft_p95_ms: float = 500.0
+    tpot_p95_ms: float = 40.0
+
+
+def percentile(xs: list[float], p: float) -&gt; float:
+    if not xs:
+        return float("nan")
+    ys = sorted(xs)
+    k = (len(ys) - 1) * p / 100
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return ys[int(k)]
+    return ys[f] * (c - k) + ys[c] * (k - f)
+
+
+def error_budget(slo: SLOs, window_requests: int) -&gt; float:
+    return window_requests * (1 - slo.availability)
+
+
+def consume(slo: SLOs, w: Window) -&gt; dict:
+    total = w.successes + w.failures
+    avail = w.successes / total if total else 1.0
+    ttft = percentile(w.ttft_ms, 95)
+    tpot = percentile(w.tpot_ms, 95)
+    budget = error_budget(slo, total)
+    burned = float(w.failures)
+    breaches: list[str] = []
+    if avail &lt; slo.availability:
+        breaches.append("availability")
+    if ttft &gt; slo.ttft_p95_ms:
+        breaches.append("ttft_p95")
+    if tpot &gt; slo.tpot_p95_ms:
+        breaches.append("tpot_p95")
+    return {
+        "availability": round(avail, 6),
+        "ttft_p95": round(ttft, 1),
+        "tpot_p95": round(tpot, 1),
+        "budget": budget,
+        "burned": burned,
+        "remaining": budget - burned,
+        "breaches": breaches,
+    }
+
+
+random.seed(0)
+ttfts = [random.gauss(220, 80) for _ in range(1000)]
+tpots = [random.gauss(28, 8) for _ in range(1000)]
+window = Window(successes=997, failures=3, ttft_ms=ttfts, tpot_ms=tpots)
+print(consume(SLOs(), window))</code></pre>
+</figure>
+<pre class="output">{'availability': 0.997, 'ttft_p95': 359.2, 'tpot_p95': 41.2, 'budget': 1.0000000000000009, 'burned': 3, 'remaining': -1.9999999999999991, 'breaches': ['availability', 'tpot_p95']}</pre>
+
+<p>In this toy hour, three failures already exhaust a 99.9% budget on 1&nbsp;000 requests, and TPOT
+p95 slips the decode SLO — freeze risky launches until burn recovers.</p>
+
+<h3>Incident Response for Model Services</h3>
+
+<ol>
+  <li>Declare: user impact, blast radius (model, region, tenant).</li>
+  <li>Mitigate: shed load, pin previous artefact, open breaker, fail over region.</li>
+  <li>Diagnose: traces → engine metrics → DCGM / node events.</li>
+  <li>Recover: restore capacity; verify goodput before closing.</li>
+  <li>Learn: blameless postmortem with SLO burn attached.</li>
+</ol>
+
+<h3>GPU Failure Modes</h3>
+
+<table>
+  <caption>Failures that look like "the model got dumb" until you check the node.</caption>
+  <thead><tr><th>Mode</th><th>Symptom</th><th>First response</th></tr></thead>
+  <tbody>
+    <tr><td>XID / ECC storm</td><td>Process abort, throughput cliff</td><td>Cordon node; replace GPU</td></tr>
+    <tr><td>Thermal throttle</td><td>TPOT rises, clocks fall</td><td>Check cooling; reduce batch</td></tr>
+    <tr><td>Driver / CUDA mismatch</td><td>Crash loop on start</td><td>Roll image; pin driver</td></tr>
+    <tr><td>Stranded MIG</td><td>Capacity missing</td><td>Reset MIG geometry</td></tr>
+    <tr><td>Silent goodput loss</td><td>200s with empty/garbage</td><td>Canary + quality alert</td></tr>
+  </tbody>
+</table>
+
+<p>Published fleet studies make these failures concrete. Weng et al. (2022) traced a production
+GPU cluster and found most jobs request fractional GPUs and leave them under-utilised, which is the
+case for sharing and MIG. Hu et al. (2024) characterised LLM development in a datacentre: pretraining
+jobs are few but dominate GPU time, evaluation jobs are many and short, and infrastructure faults
+are a leading cause of failed long jobs. MegaScale (Jiang et al., 2024) reports running training
+on more than 10,000 GPUs and depends on in-depth diagnostics, straggler detection and fast
+checkpoint recovery to keep MFU high. Kokolis et al. (2024) measure failure rates in large research
+clusters and show that the mean time to failure of a job falls roughly in proportion to the
+number of GPUs it spans. At 1,000+ GPUs, failures are routine events to engineer for, not
+exceptions.</p>
+
+
+<h3>Multi-Window Burn Rates</h3>
+
+<p>A single 5-minute threshold flaps. Multi-window burn rates page when short windows burn fast
+<em>and</em> long windows confirm the trend (Google SRE workbook pattern).</p>
+
+<figure class="listing">
+<figcaption>Burn-rate helper for pages versus tickets.</figcaption>
+<pre><code>"""Page when fast burn and slow burn both exceed thresholds."""
+from __future__ import annotations
+
+
+def should_page(
+    budget_per_month: float,
+    burned_1h: float,
+    burned_6h: float,
+    fast_factor: float = 14.4,   # 2% budget in 1h ≈ 14.4×
+    slow_factor: float = 6.0,
+) -&gt; str:
+    if budget_per_month &lt;= 0:
+        return "misconfigured"
+    hour_budget = budget_per_month / (30 * 24)
+    fast = burned_1h / hour_budget
+    slow = burned_6h / (hour_budget * 6)
+    if fast &gt;= fast_factor and slow &gt;= slow_factor:
+        return "page"
+    if slow &gt;= slow_factor:
+        return "ticket"
+    return "ok"
+
+
+print(should_page(100, burned_1h=3.0, burned_6h=8.0))
+print(should_page(100, burned_1h=0.2, burned_6h=1.0))</code></pre>
+</figure>
+<pre class="output">page
+ok</pre>
+
+<aside class="callout impl"><span class="title">Incident timeline</span>
+  <ul>
+    <li>Attach model digest, router policy version and guardrail rule ids to the incident doc.</li>
+    <li>Export a trace id sample set — not screenshots alone — into the postmortem.</li>
+  </ul>
+</aside>
+
+<aside class="callout advanced"><span class="title">Chaos</span>
+  <ul>
+    <li>Inject replica kill, NVLink partition simulation (where safe), and dependency 429s in staging.</li>
+    <li>Verify shedding and breakers from Volume 12 fire before users feel the full blast.</li>
+    <li>Never chaos-test prod GPU fabrics without an explicit error-budget grant.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 9 -->
+<section class="chapter">
+<h2 id="cost">Cost Management</h2>
+<p class="chapter-lede">Token bills and GPU hours are the same money in different costumes. FinOps
+for AI is attribution, utilisation discipline, and reserved/spot policy — reviewed monthly like
+any other large spend.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Finance sees one cloud line item: "GPU". Product cannot tell which feature burned the budget.
+  Engineering cannot tell whether to buy reservations or fix a retry bug. Without a ledger keyed by
+  tenant, feature and model, every meeting is guesswork.</p>
+</div>
+
+<figure class="listing">
+<figcaption>Per-request cost ledger with attribution roll-ups (<code>forge.ops.cost</code>).</figcaption>
+<pre><code>"""forge.ops.cost: attribute token and GPU cost per tenant and feature."""
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass
+
+
+@dataclass
+class Line:
+    tenant: str
+    feature: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    gpu_seconds: float
+    price_in: float   # $ / 1M input tokens
+    price_out: float  # $ / 1M output tokens
+    gpu_hour: float   # $ / GPU-hour
+
+
+class Ledger:
+    def __init__(self) -&gt; None:
+        self.lines: list[Line] = []
+
+    def record(self, **kwargs: object) -&gt; None:
+        self.lines.append(Line(**kwargs))  # type: ignore[arg-type]
+
+    def cost(self, line: Line) -&gt; float:
+        tok = (
+            line.input_tokens / 1e6 * line.price_in
+            + line.output_tokens / 1e6 * line.price_out
+        )
+        gpu = line.gpu_seconds / 3600 * line.gpu_hour
+        return tok + gpu
+
+    def by(self, key: str) -&gt; dict[str, float]:
+        bags: dict[str, float] = defaultdict(float)
+        for line in self.lines:
+            bags[getattr(line, key)] += self.cost(line)
+        return dict(sorted(bags.items(), key=lambda kv: -kv[1]))
+
+
+led = Ledger()
+rows = [
+    ("acme", "chat", "forge-smol", 1200, 400, 0.8),
+    ("acme", "rag", "forge-smol", 8000, 300, 1.2),
+    ("beta", "chat", "forge-smol", 900, 350, 0.7),
+    ("acme", "chat", "forge-smol", 1500, 500, 0.9),
+    ("beta", "batch", "forge-smol", 20000, 2000, 12.0),
+]
+for tenant, feature, model, tin, tout, gpu_s in rows:
+    led.record(
+        tenant=tenant, feature=feature, model=model,
+        input_tokens=tin, output_tokens=tout, gpu_seconds=gpu_s,
+        price_in=0.10, price_out=0.40, gpu_hour=2.50,
+    )
+
+print("by tenant", {k: round(v, 4) for k, v in led.by("tenant").items()})
+print("by feature", {k: round(v, 4) for k, v in led.by("feature").items()})
+print("total", round(sum(led.cost(L) for L in led.lines), 4))</code></pre>
+</figure>
+<pre class="output">by tenant {'beta': 0.0118, 'acme': 0.0036}
+by feature {'batch': 0.0111, 'chat': 0.0025, 'rag': 0.0018}
+total 0.0154</pre>
+
+<p>Even on toy dollars, batch dominates — the monthly review should open on features, not only
+tenants.</p>
+
+<h3>Reserved, Spot and On-Demand</h3>
+
+<table>
+  <caption>Capacity commitment versus interruption risk.</caption>
+  <thead><tr><th>Mode</th><th>Unit economics</th><th>Reliability fit</th></tr></thead>
+  <tbody>
+    <tr><td>On-demand</td><td>Highest $/hr</td><td>Interactive baselines, failover buffer</td></tr>
+    <tr><td>Reserved / savings plan</td><td>Lower if utilised</td><td>Steady chat / RAG pools</td></tr>
+    <tr><td>Spot / preemptible</td><td>Lowest $/hr</td><td>Offline batch, training with checkpoints</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">FinOps loop</span>
+  <ul>
+    <li>Attribute → set token budgets per feature → review utilisation → commit reservations only
+    where steady → put waste (idle GPUs, retry amplification) on the engineering backlog.</li>
+  </ul>
+</aside>
+
+
+<h3>Token Budgets and Unit Economics</h3>
+
+<ul>
+  <li>Product budgets are tokens or dollars per feature per day — enforced at the gateway.</li>
+  <li>Unit economics: $ / successful task, not $ / request (retries and cascades inflate requests).</li>
+  <li>Compare managed versus self-host with Volume 12’s crossover, refreshed monthly with real util.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Monthly roll-up sketch from ledger lines.</figcaption>
+<pre><code>"""Summarise feature spend plus idle GPU waste for a FinOps review."""
+from __future__ import annotations
+
+
+def review_rows(
+    by_feature: dict[str, float], idle_gpu_hours: float, gpu_hour: float,
+) -&gt; list[dict]:
+    waste = idle_gpu_hours * gpu_hour
+    rows = [{"feature": k, "spend": round(v, 4)} for k, v in by_feature.items()]
+    rows.append({"feature": "idle_gpu_waste", "spend": round(waste, 4)})
+    return rows
+
+
+print(review_rows(
+    {"batch": 0.0111, "chat": 0.0025, "rag": 0.0018},
+    idle_gpu_hours=4,
+    gpu_hour=2.5,
+))</code></pre>
+</figure>
+<pre class="output">[{'feature': 'batch', 'spend': 0.0111}, {'feature': 'chat', 'spend': 0.0025}, {'feature': 'rag', 'spend': 0.0018}, {'feature': 'idle_gpu_waste', 'spend': 10.0}]</pre>
+
+<p>Idle waste dominating feature spend is the usual smoking gun in early platforms.</p>
+
+<div class="frame checklist">
+  <ul>
+    <li>Every request records tenant, feature, model, tokens, GPU-seconds.</li>
+    <li>Budgets enforced at the gateway (Volume 12 rate limits) and in the harness (Volume 16).</li>
+    <li>Monthly review: top features by $, idle GPU hours, managed-API versus self-host crossover.</li>
+  </ul>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 10 -->
+<section class="chapter">
+<h2 id="scaling">Scaling</h2>
+<p class="chapter-lede">Horizontal and vertical scaling for LLMs are constrained by HBM, cold
+starts and stateful KV. Multi-region and disaster recovery inherit those constraints — copying a
+web-tier runbook wholesale will lie to you.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Traffic doubles. You add pods. Half of them spend four minutes loading weights while the
+  other half OOMs on KV. A region fails and DNS flips, but prefix caches are cold and TTFT
+  collapses. Capacity without a drain and warm-up policy is theatre.</p>
+</div>
+
+<p class="facet">Possible Solutions</p>
+<ul>
+  <li><strong>Vertical</strong>: bigger GPU / more HBM per replica — raises concurrency ceiling;
+  does not remove single-node blast radius.</li>
+  <li><strong>Horizontal</strong>: more replicas — needs queue-aware autoscaling and weight caches.</li>
+  <li><strong>Disaggregation</strong>: separate prefill and decode fleets — operational complexity
+  for large scale (research and early production systems).</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Scale out on signals that track user SLOs: queue depth, KV headroom, goodput — not CPU.</li>
+    <li>Warm pools and cached weights are part of the capacity plan, not nice-to-haves.</li>
+    <li>Multi-region active-active needs sticky sessions or accept prefix-cache miss tax.</li>
+  </ul>
+</aside>
+
+<h3>Horizontal Versus Vertical</h3>
+
+<table>
+  <caption>When to grow the box versus grow the fleet.</caption>
+  <thead><tr><th>Pressure</th><th>Prefer vertical</th><th>Prefer horizontal</th></tr></thead>
+  <tbody>
+    <tr><td>KV OOM at target concurrency</td><td>More HBM / fewer bits</td><td>More replicas if model already fits</td></tr>
+    <tr><td>TPOT OK, TTFT queueing</td><td>—</td><td>More replicas / admission</td></tr>
+    <tr><td>Model needs TP across GPUs</td><td>Wider NVLink domain</td><td>Only with gang-aware placement</td></tr>
+    <tr><td>Burst diurnal chat</td><td>Reserved baseline</td><td>Autoscale with warm buffer</td></tr>
+  </tbody>
+</table>
+
+<figure class="diagram">
+<pre class="ascii">  peak λ
+    │     warm buffer (min replicas)
+    │    ┌──────────┐
+    │────┤ scale out ├──► new pods pull weights from cache
+    │    └──────────┘
+    │         │
+    │         ▼
+    │   ready when /readyz passes (startupProbe)
+    └─────────────────────────────────────────► time</pre>
+<figcaption>Autoscaling without warm-up accounting creates a latency cliff at the worst moment.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption>Capacity sketch: replicas from peak arrivals and measured in-SLO tokens/s.</figcaption>
+<pre><code>"""Replica count from peak QPS and measured tok/s at SLO (teaching formula)."""
+from __future__ import annotations
+
+import math
+
+
+def replicas_needed(
+    peak_qps: float,
+    mean_out_tokens: float,
+    tok_per_s_per_replica: float,
+    headroom: float = 0.3,
+) -&gt; int:
+    if tok_per_s_per_replica &lt;= 0:
+        raise ValueError("tok/s must be positive")
+    raw = peak_qps * mean_out_tokens / (
+        tok_per_s_per_replica * (1 - headroom)
+    )
+    return max(1, math.ceil(raw))
+
+
+print("replicas", replicas_needed(20, 400, 2400, headroom=0.3))
+print("replicas", replicas_needed(50, 800, 2400, headroom=0.3))</code></pre>
+</figure>
+<pre class="output">replicas 5
+replicas 24</pre>
+
+<h3>Multi-Region and Disaster Recovery</h3>
+
+<ul>
+  <li><strong>Active-passive</strong>: cheaper; failover RTO includes weight load unless standby is warm.</li>
+  <li><strong>Active-active</strong>: route by latency and data residency; accept cache asymmetry.</li>
+  <li><strong>Artefacts</strong>: replicate weight digests and config to each region’s bucket before cutover drills.</li>
+  <li><strong>Stateful agents</strong>: externalise conversation state; do not rely on in-memory KV across regions.</li>
+</ul>
+
+<table>
+  <caption>DR checklist items unique to LLM serving.</caption>
+  <thead><tr><th>Item</th><th>Why it differs from CRUD apps</th></tr></thead>
+  <tbody>
+    <tr><td>Cold start budget</td><td>Minutes, not seconds</td></tr>
+    <tr><td>Prefix / KV caches</td><td>Regional; miss tax is user-visible</td></tr>
+    <tr><td>Model digests</td><td>Wrong weights = silent quality incident</td></tr>
+    <tr><td>GPU quota</td><td>Failover region may have no capacity</td></tr>
+    <tr><td>Reserved capacity</td><td>DR region often unpaid until needed — budget it</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout warning"><span class="title">Capacity reservations</span>
+  <ul>
+    <li>Cloud GPU quota is not infinite at incident time. Hold reservations or committed use
+    discounts sized to failover traffic, or document a degraded mode (smaller model, higher latency).</li>
+  </ul>
+</aside>
+
+<ul class="failure-modes">
+  <li>DNS failover without warm replicas — SLO burn during the "successful" DR test.</li>
+  <li>Scaling on GPU util while KV is the real constraint — thrashing pods.</li>
+  <li>Cross-region retries without hedged budgets — amplified cost and herd effects (Dean &amp; Barroso).</li>
+</ul>
+
+
+<h3>Warm Pools and Drain</h3>
+
+<ul>
+  <li>Keep <code>minReplicas</code> high enough that diurnal peaks do not wait on CUDA initialisation.</li>
+  <li>On scale-in, stop admitting new work, wait for in-flight generations, then terminate.</li>
+  <li>Pre-pull images and weights via DaemonSet or node cache — the silent half of autoscaling.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">  region A (primary)          region B (DR)
+  [warm serve pool]           [warm standby or scaled min]
+  [weight cache]              [replicated digests]
+  [Prometheus]                [scrape + alert routing]
+         \\                      /
+          \\______ health ________/
+                    │
+                 traffic policy</pre>
+<figcaption>DR is not only DNS — it is warm capacity and replicated artefacts.</figcaption>
+</figure>
+
+<div class="frame exercise" data-title="Exercise">
+  <p>Write an RTO/RPO table for chat state, weight artefacts and eval golden sets. Which of the
+  three actually blocks user traffic if missing for an hour?</p>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 11 -->
+<section class="chapter">
+<h2 id="secops">Security Operations</h2>
+<p class="chapter-lede">Volume 17 hardened the prompt channel. Security operations hardens the
+platform around it: IAM, network isolation, secrets, audit trails and supply-chain scanning for
+images and model artefacts.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A leaked cloud key can pull every weight and every prompt log. A poisoned base image can
+  backdoor the inference process. A flat VPC lets a compromised batch job scrape the chat
+  namespace. Model files are large opaque blobs — teams skip scanning because "it is just weights".</p>
+</div>
+
+<aside class="callout security"><span class="title">Defence in depth</span>
+  <ul>
+    <li>Least-privilege IAM for nodes, CI and humans — separate train and serve roles.</li>
+    <li>Private subnets for GPU nodes; egress allow-lists for model registries.</li>
+    <li>Secrets in a manager; short-lived tokens for CI; no long-lived keys in node user-data.</li>
+    <li>Sign and scan container images; pin digests in Deployments.</li>
+    <li>Scan model artefacts for embedded pickle / unexpected formats (Volume 17 supply tools).</li>
+  </ul>
+</aside>
+
+<figure class="diagram">
+<pre class="ascii">  CI ──signed image──► registry (digest pinned)
+                          │
+  humans ─SSO/IAM─┐       ▼
+                  ├─► GPU node pool (private)
+  services ─IRSA─┘       │
+                         ├─► secrets manager (runtime inject)
+                         └─► audit log (API + model version + tenant)</pre>
+<figcaption>Identity, artefact integrity and network isolation are the ops half of AI security.</figcaption>
+</figure>
+
+<h3>IAM and Isolation</h3>
+
+<table>
+  <caption>Identity boundaries that matter in AI platforms.</caption>
+  <thead><tr><th>Principal</th><th>May</th><th>Must not</th></tr></thead>
+  <tbody>
+    <tr><td>Serve node role</td><td>Read specific weight objects; write metrics</td><td>Write training buckets; mint cloud keys</td></tr>
+    <tr><td>Train job role</td><td>Write checkpoints to train prefix</td><td>Read prod prompt logs</td></tr>
+    <tr><td>CI deployer</td><td>Push signed images; apply K8s in one ns</td><td>Interactive SSH to prod GPUs</td></tr>
+    <tr><td>On-call human</td><td>Break-glass with audit</td><td>Standing admin on all accounts</td></tr>
+  </tbody>
+</table>
+
+<ul>
+  <li><strong>Network</strong>: separate namespaces and network policies for serve, train and batch;
+  deny lateral traffic by default.</li>
+  <li><strong>Tenancy</strong>: strong tenants may need dedicated node pools or accounts for data
+  residency — document the cost.</li>
+  <li><strong>Audit</strong>: every admin action and every model digest change should be queryable
+  next to the incident timeline.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Digest pin check before a deploy proceeds (teaching helper).</figcaption>
+<pre><code>"""Refuse deploy when image or weight digest drifts from the registry pin."""
+from __future__ import annotations
+
+
+def assert_pinned(expected: str, actual: str, label: str) -&gt; None:
+    if not expected.startswith("sha256:") or len(expected) &lt; 15:
+        raise ValueError(f"{label}: expected digest looks malformed")
+    if expected != actual:
+        raise AssertionError(f"{label}: pin {expected} != {actual}")
+
+
+assert_pinned(
+    "sha256:aaaaaaaaaaaaaaaa",
+    "sha256:aaaaaaaaaaaaaaaa",
+    "image",
+)
+try:
+    assert_pinned(
+        "sha256:aaaaaaaaaaaaaaaa",
+        "sha256:bbbbbbbbbbbbbbbb",
+        "weights",
+    )
+except AssertionError as exc:
+    print("blocked:", exc)</code></pre>
+</figure>
+<pre class="output">blocked: weights: pin sha256:aaaaaaaaaaaaaaaa != sha256:bbbbbbbbbbbbbbbb</pre>
+
+<h3>Supply Chain for Images and Models</h3>
+
+<ol>
+  <li>Build from minimal CUDA base; record SBOM.</li>
+  <li>Scan OS and Python deps in CI; fail on critical CVEs with a tracked exception process.</li>
+  <li>Store weights as versioned objects with checksums; prefer safe serializers over pickle.</li>
+  <li>Admit new models through the registry gates from Volume 12 (eval + digest).</li>
+  <li>Reproduce: image digest + weight digest + config hash on every canary.</li>
+</ol>
+
+<ul class="failure-modes">
+  <li>Shared long-lived GPU AMI with baked credentials.</li>
+  <li>"Temporary" 0.0.0.0/0 SSH during an incident that never closes.</li>
+  <li>Loading untrusted fine-tunes with <code>pickle</code> in-process on the serve host.</li>
+</ul>
+
+
+<h3>Audit and Access Reviews</h3>
+
+<ul>
+  <li>Quarterly access review for GPU project IAM and break-glass roles.</li>
+  <li>Immutable audit logs for model registry mutations and secret reads.</li>
+  <li>Separate duties: the person who can push weights should not sole-approve prod digests.</li>
+</ul>
+
+<aside class="callout security"><span class="title">Prompt logs</span>
+  <ul>
+    <li>Treat stored prompts as sensitive data: encryption, retention limits, access tickets.</li>
+    <li>Align with Volume 17 redaction — ops tooling must not re-expand secrets for convenience.</li>
+  </ul>
+</aside>
+
+<div class="frame checklist">
+  <ul>
+    <li>Break-glass documented and tested quarterly.</li>
+    <li>Secret rotation drilled; canary fails if env lacks the new secret reference.</li>
+    <li>Model and image digests appear on the Grafana annotation timeline for releases.</li>
+  </ul>
+</div>
+</section>
+
+<!-- ================================================================ REVIEW -->
+<section class="review">
+<h1>Review and Next Steps</h1>
+
+<h2>What You Learned</h2>
+<ul>
+  <li>GPU choice is HBM, interconnect and isolation — not peak TFLOPS alone; train and infer SKUs diverge.</li>
+  <li>Cloud AI is three modes (managed API, managed endpoint, raw/neocloud) behind one product contract.</li>
+  <li>Kubernetes for AI needs GPU operators, gang scheduling, weight caches and queue-aware autoscaling.</li>
+  <li>IaC promotes environments; secrets and state are production data; Terraform/K8s examples stay plan-only until validated.</li>
+  <li>Observability splits metrics, logs and traces; OTel GenAI attributes bind tokens to request graphs.</li>
+  <li>Dashboards and alerts centre on TTFT, TPOT, KV, queue depth and goodput — not CPU vanity metrics.</li>
+  <li>LLM monitoring adds quality drift, input PSI, guardrail rates and cost anomalies.</li>
+  <li>Reliability is SLOs, error budgets, GPU-specific failure playbooks and staged chaos.</li>
+  <li>FinOps attributes spend to tenant/feature, then chooses reserved versus spot deliberately.</li>
+  <li>Scaling and DR must budget cold starts, cache miss tax and GPU quota in the failover region.</li>
+  <li>SecOps covers IAM, isolation, secrets and supply-chain pins for images and weights.</li>
+</ul>
+
+<h2>What You Built</h2>
+<ul>
+  <li><code>forge.ops.otel</code> — GenAI-shaped in-memory spans ready to swap for OTLP export.</li>
+  <li><code>forge.ops.metrics</code> — histogram/counter helpers for TTFT/TPOT/goodput.</li>
+  <li><code>forge.ops.slo</code> — availability and latency SLO consumption with error budgets.</li>
+  <li><code>forge.ops.cost</code> — request ledger with tenant and feature attribution.</li>
+  <li><code>forge.ops.drift</code> — PSI input drift and quality-drop alerts.</li>
+  <li><code>deploy/</code> sketches — Compose observability, Prometheus alerts, Terraform variables,
+  Kubernetes Deployment (Compose intended to run; Terraform/K8s <strong>not executed</strong>).</li>
+</ul>
+
+<h2>Important Code</h2>
+<table>
+  <caption>Listings to keep; they seed <code>src/forge/ops/</code> and <code>deploy/</code>.</caption>
+  <thead><tr><th>Listing</th><th>Forge / deploy</th><th>Concept</th><th>Used in</th></tr></thead>
+  <tbody>
+    <tr><td><code>otel.py</code> spans</td><td><code>forge.ops.otel</code></td><td>GenAI traces</td><td>Serve, harness, router</td></tr>
+    <tr><td><code>metrics.py</code></td><td><code>forge.ops.metrics</code></td><td>TTFT/TPOT/goodput</td><td>Prometheus export</td></tr>
+    <tr><td><code>slo.py</code></td><td><code>forge.ops.slo</code></td><td>Error budgets</td><td>Release freezes</td></tr>
+    <tr><td><code>cost.py</code> ledger</td><td><code>forge.ops.cost</code></td><td>FinOps attribution</td><td>Monthly review</td></tr>
+    <tr><td><code>drift.py</code></td><td><code>forge.ops.drift</code></td><td>PSI / quality</td><td>Canaries</td></tr>
+    <tr><td>K8s / Terraform sketches</td><td><code>deploy/</code></td><td>GPU ops, IaC</td><td>Staging validation</td></tr>
+  </tbody>
+</table>
+
+<h2>Important Architecture</h2>
+<div class="arch">
+  <div class="arch-layer" data-label="Edge">API gateway · auth · token budgets · canaries</div>
+  <div class="arch-layer" data-label="Control">forge.router · release pins · feature flags</div>
+  <div class="arch-layer" data-label="Data plane">forge.serve · engines · GPU node pools</div>
+  <div class="arch-layer" data-label="Ops">forge.ops spans/metrics/cost/drift · Prometheus · Grafana · Tempo</div>
+  <div class="arch-layer" data-label="IaC">Terraform modules · deploy/k8s · secrets manager</div>
+</div>
+<figure class="diagram">
+<pre class="ascii">  clients → gateway → forge.router → forge.serve → engines
+                │            │            │
+                └────────────┴────────────┴──► forge.ops (spans, metrics, cost)
+                                                   │
+                                                   ▼
+                                          Prometheus / Grafana / Tempo</pre>
+<figcaption><code>forge.ops</code> instruments the stack Volumes 12–18 already built.</figcaption>
+</figure>
+
+<h2>Failure Modes</h2>
+<ul class="failure-modes">
+  <li>Scaling on CPU while KV-bound — thrash without goodput.</li>
+  <li>Terraform apply to prod without plan review — silent security group drift.</li>
+  <li>Traces without token attributes — cost and latency cannot be joined.</li>
+  <li>Alerts on GPU util alone — misses empty 200s and quality cliffs.</li>
+  <li>Spot for interactive chat without drain — user-visible preemptions.</li>
+  <li>DR DNS cutover without warm weights — RTO fantasy.</li>
+  <li>Unpinned images/weights — unreproducible incidents.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<ul>
+  <li>Offline eval gates (Volume 10) still block digests; online canaries catch serving skew between staging and production.</li>
+  <li>Hold out a traffic sample for continuous eval; never train routers on the same slice you alert on.</li>
+  <li>Report quality with confidence intervals — a one-day dip may be noise.</li>
+  <li>Evaluate the monitoring itself: inject known faults (replica kill, quality drop, cost spike) in staging and measure time to detect and time to page. An alert that has never fired in a drill is untested code.</li>
+  <li>Check telemetry completeness: the fraction of requests with a trace, token counts and a cost-ledger entry should be ≥ 99%; gaps make attribution and incident review guesswork.</li>
+  <li>Review SLOs and cost attribution monthly against user-reported incidents and the cloud bill; if the bill and the ledger disagree by more than a few percent, the ledger is wrong.</li>
+</ul>
+
+<h2>Practical Project</h2>
+<div class="frame exercise" data-title="Operate Forge">
+  <p>Instrument and operate the full Forge stack as if you were the platform on-call:</p>
+  <ol>
+    <li>Wire <code>forge.ops.otel</code> spans through <code>forge.serve</code> and the Volume 16 harness;
+    export via OTLP to a local Compose stack (collector + Tempo + Prometheus + Grafana).</li>
+    <li>Emit TTFT, TPOT, queue depth, KV utilisation and goodput; build one Grafana board and two
+    alerts (SLO burn + cost anomaly).</li>
+    <li>Define availability and latency SLOs; compute error budget with <code>forge.ops.slo</code>;
+    document a freeze policy when budget is exhausted.</li>
+    <li>Inject a replica kill and a quality drop in staging; show shedding/breaker behaviour and
+    a drift alert from <code>forge.ops.drift</code>.</li>
+    <li>Produce a monthly-style cost report from <code>forge.ops.cost</code> with tenant and feature
+    attribution, plus a reserved-versus-spot recommendation for one workload class.</li>
+  </ol>
+</div>
+
+<h2>Exercises</h2>
+<ol>
+  <li>Derive KV-limited concurrency for your model and show when horizontal scale cannot help without quantisation.</li>
+  <li>Compare managed API versus raw GPU using last month’s utilisation; move the crossover with reserved pricing.</li>
+  <li>Add multi-window burn-rate alerts (1h and 6h) and explain which pages humans.</li>
+  <li>Design a Kueue/Volcano queueing policy that protects interactive pools from train gangs.</li>
+  <li>Chaos: interrupt spot nodes under a batch workload and measure completion delay with checkpoints.</li>
+  <li>Extend the ledger to carbon estimates using a regional grid factor (Patterson-style accounting).</li>
+</ol>
+
+<h2>Research Papers</h2>
+<table>
+  <caption>Papers and books referenced in this volume.</caption>
+  <thead><tr><th>Paper</th><th>Why it matters here</th></tr></thead>
+  <tbody>
+    <tr><td>Sigelman et al., 2010. <em>Dapper, a Large-Scale Distributed Systems Tracing Infrastructure</em>. Google Tech Report</td><td>Production distributed tracing that shaped OpenTelemetry practice (Chapter 5).</td></tr>
+    <tr><td>Beyer et al., 2016. <em>Site Reliability Engineering</em>. O’Reilly</td><td>SLIs/SLOs, error budgets, incident culture (Chapter 8).</td></tr>
+    <tr><td>Verma et al., 2015. <em>Large-scale cluster management at Google with Borg</em>. EuroSys</td><td>Cluster scheduling lineage behind Kubernetes GPU pools (Chapter 3).</td></tr>
+    <tr><td>Dean &amp; Barroso, 2013. <em>The Tail at Scale</em>. CACM</td><td>Tail latency, hedging hazards, why percentiles matter (Chapters 6, 10).</td></tr>
+    <tr><td>Patterson et al., 2021. <em>Carbon Emissions and Large Neural Network Training</em>. arXiv</td><td>Energy and carbon as first-class operational costs (Chapter 9).</td></tr>
+    <tr><td>Dubey et al., 2024. <em>The Llama 3 Herd of Models</em>. arXiv</td><td>Frontier-scale training/inference infrastructure report (Chapters 1, 10).</td></tr>
+    <tr><td>Barroso, Hölzle, Ranganathan. <em>The Datacenter as a Computer</em></td><td>Warehouse-scale computing economics and efficiency.</td></tr>
+    <tr><td>Jeon et al., 2019. <em>Analysis of Large-Scale Multi-Tenant GPU Clusters</em>. ATC</td><td>Real GPU cluster utilisation and scheduling lessons.</td></tr>
+    <tr><td>Weng et al., 2022. <em>MLaaS in the Wild: Workload Analysis and Scheduling in Large-Scale Heterogeneous GPU Clusters</em>. NSDI</td><td>Fractional GPU requests, low utilisation, sharing (Chapters 1, 3).</td></tr>
+    <tr><td>Hu et al., 2024. <em>Characterization of Large Language Model Development in the Datacenter</em>. NSDI</td><td>LLM workload mix and failure causes in a real cluster (Chapters 3, 8).</td></tr>
+    <tr><td>Jiang et al., 2024. <em>MegaScale: Scaling Large Language Model Training to More Than 10,000 GPUs</em>. NSDI</td><td>Diagnostics, straggler detection and fast recovery at scale (Chapter 8).</td></tr>
+    <tr><td>Kokolis et al., 2024. <em>Revisiting Reliability in Large-Scale Machine Learning Research Clusters</em>. arXiv:2410.21680</td><td>Job failure rates versus GPU count (Chapter 8).</td></tr>
+  </tbody>
+</table>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Dapper, a Large-Scale Distributed Systems Tracing Infrastructure</span>
+    <span class="paper-meta">Sigelman et al., 2010 · Google Technical Report</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Debugging latency in large fan-out services required causal request narratives across processes.</dd>
+    <dt>Previous limitation</dt><dd>Logs and host metrics could not reconstruct critical paths cheaply at Google scale.</dd>
+    <dt>Approach</dt><dd>Always-on distributed tracing with sampling, trace IDs and span trees exported to analysis tools.</dd>
+    <dt>Contribution</dt><dd>Defined the practical tracing model later echoed by Zipkin, Jaeger and OpenTelemetry.</dd>
+    <dt>Practical impact</dt><dd>Chapter 5’s GenAI spans inherit the parent/child and attribute discipline Dapper normalised.</dd>
+    <dt>Limitations</dt><dd>Pre-LLM: no token economics; privacy of prompt attributes needs modern policy.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">BOOK</span>
+    <span class="paper-title">Site Reliability Engineering</span>
+    <span class="paper-meta">Beyer et al., 2016 · O’Reilly</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Organisations lacked a shared language for reliability risk versus change velocity.</dd>
+    <dt>Previous limitation</dt><dd>Availability targets without budgets produced freezes or reckless launches.</dd>
+    <dt>Approach</dt><dd>SLIs/SLOs/SLAs, error budgets, toil reduction, principled incident response.</dd>
+    <dt>Contribution</dt><dd>Industry-standard reliability vocabulary used throughout Chapter 8.</dd>
+    <dt>Practical impact</dt><dd><code>forge.ops.slo</code> encodes budget consumption; freezes fund recovery.</dd>
+    <dt>Limitations</dt><dd>General distributed systems — GPU cold starts and token SLOs need this volume’s adaptations.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Large-scale cluster management at Google with Borg</span>
+    <span class="paper-meta">Verma et al., 2015 · EuroSys</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Warehouse-scale compute needed admission, packing and isolation across thousands of machines.</dd>
+    <dt>Previous limitation</dt><dd>Ad hoc per-team clusters wasted capacity and lacked uniform policy.</dd>
+    <dt>Approach</dt><dd>Borg: centralised scheduling, priorities, allocs and rich workload APIs.</dd>
+    <dt>Contribution</dt><dd>Intellectual ancestor of Kubernetes scheduling concepts used in Chapter 3.</dd>
+    <dt>Practical impact</dt><dd>Motivates queues, priorities and separating production from batch on GPU pools.</dd>
+    <dt>Limitations</dt><dd>Not GPU-specific; gang scheduling and device plugins are later AI-ops layers.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">The Tail at Scale</span>
+    <span class="paper-meta">Dean &amp; Barroso, 2013 · CACM</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Rare slow operations dominate end-to-end latency in large systems.</dd>
+    <dt>Previous limitation</dt><dd>Mean latency hid user experience; naive replication sometimes worsened tails.</dd>
+    <dt>Approach</dt><dd>Analyse tail causes; hedge carefully; shed load; budget latency across components.</dd>
+    <dt>Contribution</dt><dd>Made percentile-oriented operations mainstream.</dd>
+    <dt>Practical impact</dt><dd>Justifies TTFT/TPOT p95 alerts and cautious cross-region hedging in Chapters 6 and 10.</dd>
+    <dt>Limitations</dt><dd>Hedging doubles work — dangerous on scarce GPUs unless bounded.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Carbon Emissions and Large Neural Network Training</span>
+    <span class="paper-meta">Patterson et al., 2021 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Training large models carries substantial energy and carbon cost that teams under-reported.</dd>
+    <dt>Previous limitation</dt><dd>FLOPs and dollars omitted grid intensity and location effects.</dd>
+    <dt>Approach</dt><dd>Estimate emissions from energy, location and training recipes; recommend reductions.</dd>
+    <dt>Contribution</dt><dd>Brought carbon into the ML systems conversation beside accuracy.</dd>
+    <dt>Practical impact</dt><dd>Chapter 9 FinOps reviews can extend the ledger with regional grid factors.</dd>
+    <dt>Limitations</dt><dd>Estimates depend on opaque datacentre factors; inference fleets need separate accounting.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">The Llama 3 Herd of Models</span>
+    <span class="paper-meta">Dubey et al., 2024 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Frontier model development needed a public account of data, training and infrastructure choices.</dd>
+    <dt>Previous limitation</dt><dd>Few end-to-end reports tied model quality to cluster engineering details.</dd>
+    <dt>Approach</dt><dd>Document the Llama 3 training stack, scaling decisions and evaluation suite.</dd>
+    <dt>Contribution</dt><dd>Reference point for modern large-scale training and inference operations.</dd>
+    <dt>Practical impact</dt><dd>Chapters 1 and 10 use it as a documented snapshot of infra at scale.</dd>
+    <dt>Limitations</dt><dd>One organisation’s stack; your quotas, vendors and compliance differ.</dd>
+  </dl>
+</section>
+
+<h2>Interview Questions</h2>
+<ol class="questions">
+  <li>Why can GPU SM utilisation be high while goodput under a TTFT SLO is low?</li>
+  <li>When do you choose a managed model API over raw GPUs on a neocloud?</li>
+  <li>Explain gang scheduling. What fails if a multi-GPU train job partially schedules?</li>
+  <li>Which Prometheus metrics would you scrape from <code>forge.serve</code> on day one?</li>
+  <li>How do OpenTelemetry GenAI attributes differ from generic HTTP spans?</li>
+  <li>Design an alert that pages on quality drop without paging on every PSI blip.</li>
+  <li>An hour burns the monthly error budget. What freezes, and what still ships?</li>
+  <li>List three GPU failure modes that look like model regressions.</li>
+  <li>How would you attribute cost to tenants when both tokens and GPU-seconds matter?</li>
+  <li>When are spot GPUs acceptable for inference? When are they not?</li>
+  <li>Sketch multi-region DR for an LLM API including weight digests and cache miss tax.</li>
+  <li>Where do image and weight digest pins live in the deploy path, and who breaks the glass?</li>
+</ol>
+
+<h2>Glossary</h2>
+<table>
+  <caption>Terms used throughout Volume 22.</caption>
+  <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+  <tbody>
+    <tr><td>HBM</td><td>High-bandwidth GPU memory holding weights and KV</td></tr>
+    <tr><td>MIG</td><td>Hardware-partitioned GPU instances</td></tr>
+    <tr><td>Gang scheduling</td><td>All-or-nothing start for multi-pod GPU jobs</td></tr>
+    <tr><td>TTFT / TPOT</td><td>Time to first token / time per output token</td></tr>
+    <tr><td>Goodput</td><td>Throughput that meets all relevant SLOs</td></tr>
+    <tr><td>Error budget</td><td>Allowed unreliability derived from the SLO</td></tr>
+    <tr><td>PSI</td><td>Population stability index for input mix drift</td></tr>
+    <tr><td>FinOps</td><td>Operational practice for cloud/AI cost accountability</td></tr>
+    <tr><td>OTLP</td><td>OpenTelemetry protocol for exporting telemetry</td></tr>
+    <tr><td>Neocloud</td><td>Specialist GPU cloud with thinner platform services</td></tr>
+  </tbody>
+</table>
+
+<h2>Continuous Project Checkpoint</h2>
+<aside class="callout core"><span class="title">Volume Contract</span>
+  <ul>
+    <li>Python listings in this volume were executed; Compose is intended to run locally.</li>
+    <li>Terraform and Kubernetes manifests are <strong>not executed</strong> against live cloud or clusters.</li>
+    <li>Prices, instance types and SLO numbers are teaching constants unless labelled as measured output.</li>
+    <li><code>forge.ops</code> attribute names follow GenAI conventions still marked Development upstream — expect renames.</li>
+  </ul>
+</aside>
+<ul>
+  <li>Keep <code>tests/</code> covering ledger math, PSI, SLO consume and span parent/child invariants.</li>
+  <li>Export the same metric names from staging and prod so burn alerts transfer.</li>
+  <li>Volume 24’s platform integration will assume <code>deploy/</code> and <code>forge.ops</code> already exist.</li>
+</ul>
+
+<p class="facet">What success looks like</p>
+<ul>
+  <li>On-call can answer “user impact?” from one Grafana board within a minute.</li>
+  <li>A monthly FinOps review names top features and idle waste with ledger evidence.</li>
+  <li>A digests-mismatched deploy is blocked before traffic moves.</li>
+  <li>Error budget exhaustion freezes risky launches without freezing security patches.</li>
+</ul>
+
+<h2>Next Volume</h2>
+<p>Volume 23 turns from operating the platform to the engineer’s tool ecosystem: evaluating AI
+engineering tools critically, and working with coding agents under verification rather than blind
+acceptance. The ops primitives from this volume — traces, eval gates, cost ledgers — become the
+checks you demand from AI-assisted development workflows.</p>
+<p class="facet">Prerequisites from this volume</p>
+<ul>
+  <li>OTel-shaped spans and Prometheus metrics as evidence artefacts (Chapters 5–6).</li>
+  <li>SLO and error-budget language for deciding when generated changes may ship (Chapter 8).</li>
+  <li>Supply-chain digest discipline for images and models (Chapter 11), reused for generated code gates.</li>
+  <li>Cost attribution so tooling choices can be compared on total cost of ownership (Chapter 9).</li>
+</ul>
+
+</section>
+
+</body>
+</html>

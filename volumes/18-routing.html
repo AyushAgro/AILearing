@@ -1,0 +1,2287 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 18 · Model Routing and Decision Systems</title>
+<meta name="volume" content="Volume 18 · Model Routing and Decision Systems">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 18</p>
+  <h1 class="no-toc">Model Routing and Decision Systems</h1>
+  <p class="tp-subtitle">Capability, Cost, Latency, Confidence, Cascades and Ensembles</p>
+</section>
+
+<nav class="toc"></nav>
+
+<!-- Auto-generated TOC is filled by the book build; headings below are the source of truth. -->
+
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Build routing systems progressively: a three-line rule router, then capability, cost and latency
+  constraints, learned routers, confidence-aware cascades, resilient fallbacks, ensembles and
+  contextual bandits.</li>
+  <li>Treat every routing choice as a decision under a quality–cost–latency frontier, not as a
+  hardcoded model name in application code.</li>
+  <li>Ship the continuous package as <code>forge.router</code>: features, rule and capability routers,
+  SLO-constrained selection, classifier and matrix-factorisation routers, confidence estimators,
+  cascade threshold search, circuit-breaker fallbacks, ensemble fusion, LinUCB and abstention.</li>
+  <li>Measure routers with cost–quality curves, expected cascade cost and cumulative regret — the
+  same units you will take into product design in Volume 21.</li>
+  <li>Operate the router as a service: decision logs, golden route tests, promotion packets and an
+  incident runbook — not only a function call.</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>Volume 10: evaluation metrics, calibration intuition and offline vs online measurement.</li>
+  <li>Volume 12: latency SLOs, retries, circuit breakers and the cost of a token at an endpoint.</li>
+  <li>Volume 13: prompt and context shape the request features a router actually sees.</li>
+  <li>You can read a Pareto frontier and a logistic softmax without a tutorial.</li>
+</ul>
+
+<p class="facet">How to read the code</p>
+<ul>
+  <li>Every listing was executed with Python 3.12 and NumPy on macOS. Printed output is real and
+  unedited.</li>
+  <li>Listings seed <code>src/forge/router/</code>. Toy backends are <code>ScriptedModel</code> and
+  <code>CostLatencyModel</code> stubs with explicit dollars and milliseconds — not hosted APIs.</li>
+  <li>Prices and latencies on the three reference tiers are illustrative assumptions for the demos,
+  not quotes from any provider.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1   The routing problem      frontier; route / cascade / ensemble; GPT-5 router
+Chapter 2   Rule-based routing       features, feature contract, policy tables, golden tests
+Chapter 3   Capability routing       profiles, modality and context hard filters
+Chapter 4   Cost and latency         budgets, SLO selection, queue-aware latency
+Chapter 5   Learned routing          classifier and MF routers, training data, RouteLLM
+Chapter 6   Confidence               logprob, consistency, semantic entropy, ECE, conformal
+Chapter 7   Cascades                 escalation, E[cost] and E[latency], dual-constraint tuning
+Chapter 8   Fallbacks                breakers, provider failover, runbook and incidents
+Chapter 9   Ensembles                vote, RRF, MoA, generate-then-rank
+Chapter 10  Adaptive routing         LinUCB, safe arm sets, cost-shaped reward
+Chapter 11  Beyond models            abstention, escalation, utility, full pipeline
+Chapter 12  Evaluating routers       curves, regret, replay, telemetry, cost-optimal packet</pre>
+<figcaption>Map of Volume 18. Each chapter carries its own production depth; there are no
+appendix chapters.</figcaption>
+</figure>
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="routing-problem">The Routing Problem</h2>
+<p class="chapter-lede">No single model is optimal on every request. A frontier API wins hard
+reasoning and multimodal work; a small local model wins chat latency and cost. Routing is the
+system that picks a point on that frontier for each request — or refuses to pretend one model can
+cover all three axes at once.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Product wants "GPT-4 quality at GPT-3.5 cost". Ops wants p95 under a second. Finance wants the
+  bill to stop growing linearly with traffic. Pinning every call to the strongest model solves the
+  first sentence and fails the other two. Pinning everything to the cheapest model does the reverse.
+  You need a policy that is allowed to be different for different requests.</p>
+</div>
+
+<h3>The Quality–Cost–Latency Frontier</h3>
+
+<p>For a fixed workload mix, each always-route-to-<em>M</em> policy is a point
+<span class="math">(c_M, q_M, \ell_M)</span>. The interesting set is the Pareto front: policies
+where you cannot improve one axis without hurting another.</p>
+
+<figure class="listing">
+<figcaption>Three reference tiers and their always-route baselines (<code>models.py</code> seeds
+<code>forge.router.models</code>).</figcaption>
+<pre><code>"""Reference model cards and the always-route cost–quality curve."""
+from forge.router.models import DEFAULT_CATALOGUE
+from forge.router.cost import estimate_request_cost
+from forge.router.evaluate import cost_quality_curve
+
+costs, quals = {}, {}
+for s in DEFAULT_CATALOGUE:
+    costs[s.name] = estimate_request_cost(s, n_in=500, n_out=200)
+    quals[s.name] = s.quality
+    print(f"{s.name:13s}  quality={s.quality:.2f}  $/req≈{costs[s.name]:.3f}  "
+          f"p95={s.latency_p95_ms:.0f}ms  ctx={s.context_limit}")
+
+print("Pareto frontier (cost, quality):")
+for c, q, m in cost_quality_curve(list(costs), costs, quals):
+    print(f"  {m:13s} cost={c:.3f} quality={q:.2f}")</code></pre>
+</figure>
+
+<pre class="output">tiny-local     quality=0.62  $/req≈0.000  p95=80ms  ctx=8192
+mid-open       quality=0.78  $/req≈0.195  p95=900ms  ctx=32768
+frontier-api   quality=0.92  $/req≈4.500  p95=2200ms  ctx=200000
+Pareto frontier (cost, quality):
+  tiny-local    cost=0.000 quality=0.62
+  mid-open      cost=0.195 quality=0.78
+  frontier-api  cost=4.500 quality=0.92</pre>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>A router is valuable only if it lands <em>above</em> the always-route segment joining two
+    tiers: same quality at lower expected cost, or higher quality at the same budget.</li>
+    <li>Latency is a third axis. A cascade that eventually hits the frontier can still miss a TTFT
+    SLO even when average dollars look good.</li>
+  </ul>
+</aside>
+
+<h3>Routing versus Cascading versus Ensembling</h3>
+
+<table>
+  <caption>Three ways to use more than one model. They are not synonyms.</caption>
+  <thead><tr><th>Pattern</th><th>How many models run?</th><th>When to use</th><th>Main risk</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Route</strong></td><td>Exactly one</td><td>Requests are predictable from features; you want minimum spend</td><td>Misroute sends hard work to a weak model</td></tr>
+    <tr><td><strong>Cascade</strong></td><td>One, then maybe more</td><td>Cheap model is often enough; confidence says when to escalate</td><td>Bad confidence → either wasted spend or silent errors</td></tr>
+    <tr><td><strong>Ensemble</strong></td><td>Several in parallel (or MoA layers)</td><td>Hard tasks where diversity beats any single draw</td><td>Cost multiplies; latency is the slowest member</td></tr>
+  </tbody>
+</table>
+
+<figure class="diagram">
+<pre class="ascii">request features ──► router ──► one model ──► answer          (route)
+                 └► cascade: M0 --conf?--► M1 --?--► M2      (cascade)
+                 └► ensemble: M0∥M1∥M2 ──► fuse / MoA         (ensemble)</pre>
+<figcaption>Same catalogue, three control flows. Chapters 2–5 build routers; 6–7 add confidence and
+cascades; 9 adds ensembles; 10 learns the policy online.</figcaption>
+</figure>
+
+<h3>What a Router Needs to See</h3>
+
+<p>A router that only sees the model string in the client SDK cannot help. It needs request
+<em>features</em>: estimated tokens, task class, modality, tenant budget and latency SLO. Chapter 2
+extracts them; later chapters consume the same <code>RequestFeatures</code> object.</p>
+
+<h3>Real Products: Routing in Chat Assistants</h3>
+
+<p>Routing is no longer an internal cost trick; at least one major chat assistant describes it as
+part of the product.</p>
+
+<ul>
+  <li><span class="evidence documented">Documented</span> OpenAI describes GPT-5 in ChatGPT as a
+  unified system: a fast model for most questions, a deeper reasoning model for harder ones, and a
+  real-time router that chooses between them based on conversation type, complexity, tool needs and
+  explicit user intent (for example, asking it to "think hard"). When usage limits are reached, a
+  mini version of each model handles remaining queries (OpenAI, <em>Introducing GPT-5</em>, August
+  2025; <em>GPT-5 System Card</em>, 2025).</li>
+  <li><span class="evidence documented">Documented</span> The same sources state that the router is
+  continuously trained on real signals, including when users switch models, preference rates for
+  responses and measured correctness. Chapter 10 returns to this as online learning from implicit
+  feedback.</li>
+  <li><span class="evidence inferred">Inferred</span> The usage-limit behaviour is a budget
+  constraint in the sense of Chapter 4: when a tenant's allowance is exhausted, the feasible set
+  shrinks to cheaper tiers. The exact features, thresholds and model of the router are not public,
+  and nothing in this volume should be read as a description of them.</li>
+  <li><span class="evidence inferred">Inferred</span> A visible "auto" mode shifts the frontier
+  choice from the user to the system, which makes the router's misroutes user-visible. That is why
+  products that route also tend to expose a manual override: explicit intent is the cheapest,
+  highest-precision feature available.</li>
+</ul>
+
+
+<div class="frame exercise"><p>Plot your production traffic on the three-tier frontier above. What
+fraction of requests could move from frontier to mid without a measurable quality drop on your eval
+set? That fraction is the upper bound on routing savings before you write a line of policy.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="rule-based">Rule-Based Routing</h2>
+<p class="chapter-lede">Most production routers start as three <code>if</code> statements and a
+policy table. That is not embarrassing — it is the right baseline. The failure modes of rules are
+what later chapters fix, not an argument to skip the table.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Every team begins with <code>MODEL = os.getenv("MODEL")</code>. Then code paths hard-code a
+  second model for "hard" tickets, a third for images, and nobody can answer which policy produced
+  yesterday's bill. You need features, an explicit table, and a single <code>route</code> function.</p>
+</div>
+
+<h3>Request Features</h3>
+
+<figure class="listing">
+<figcaption>Feature extraction shared by every router (<code>features.py</code>).</figcaption>
+<pre><code>"""Extract task, token estimate and modality from a raw prompt."""
+from forge.router.features import extract_features
+
+for text in [
+    "hello",
+    "def foo():\\n  pass",
+    "prove the integral of x",
+    "look at this screenshot",
+]:
+    f = extract_features(text)
+    print(f"task={f.task:6s} tok≈{f.n_tokens_est:&lt;5d} modality={f.modality}")</code></pre>
+</figure>
+
+<pre class="output">task=chat   tok≈2     modality=text
+task=code   tok≈5     modality=text
+task=math   tok≈6     modality=text
+task=vision tok≈6     modality=image</pre>
+
+<p>The vision example gets <code>modality=image</code> only because the keyword
+<code>screenshot</code> made the task <code>vision</code> and the extractor derives modality from
+the task when the caller passes none. Keyword hints are a weak signal: an attached image with the
+text “what is this?” would be classed as chat. The client contract should carry modality
+explicitly (see the feature contract below).</p>
+
+<h3>The Three-Line Router</h3>
+
+<figure class="listing">
+<figcaption>Pedagogical three-line policy and the table form (<code>rules.py</code>).</figcaption>
+<pre><code>"""Three-line router and an equivalent policy table."""
+from forge.router.features import extract_features
+from forge.router.rules import three_line_router, policy_table_router
+
+for text in ["hello", "def foo():\\n  pass", "prove the integral of x", "look at this screenshot"]:
+    f = extract_features(text)
+    print(f"task={f.task:6s} tok≈{f.n_tokens_est:&lt;5d} -&gt; {three_line_router(f)}")
+
+table = {
+    "chat": "tiny-local",
+    "code": "mid-open",
+    "math": "frontier-api",
+    "vision": "frontier-api",
+    "tools": "frontier-api",
+}
+router = policy_table_router(table)
+for text in ["hi there", "import numpy as np", "solve equation x^2=1"]:
+    f = extract_features(text)
+    d = router.route(f)
+    print(f"{f.task:6s} -&gt; {d.model}  ({d.reason})")</code></pre>
+</figure>
+
+<pre class="output">task=chat   tok≈2     -&gt; tiny-local
+task=code   tok≈5     -&gt; mid-open
+task=math   tok≈6     -&gt; frontier-api
+task=vision tok≈6     -&gt; frontier-api
+chat   -&gt; tiny-local  (policy_table)
+code   -&gt; mid-open  (policy_table)
+math   -&gt; frontier-api  (policy_table)</pre>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Put the policy in data (<code>table</code>), not in scattered conditionals. The three-line
+    function is for teaching; the table is for changing without redeploying every caller.</li>
+    <li>Always log <code>reason</code>. Without it you cannot debug a misroute.</li>
+  </ul>
+</aside>
+
+<h3>Feature Contract</h3>
+
+<p>A rule router is only as good as its features, and features drift when several teams compute
+them. Fix ownership: each feature has exactly one producer, and some features must never be set by
+the model or by the router itself.</p>
+
+<table>
+  <caption>Who is allowed to set each feature.</caption>
+  <thead><tr><th>Feature</th><th>Set by</th><th>Must not</th></tr></thead>
+  <tbody>
+    <tr><td><code>modality</code></td><td>API gateway / client</td><td>Be inferred only from the word “image”</td></tr>
+    <tr><td><code>n_tokens_est</code></td><td>Shared estimator / tokeniser</td><td>Differ per router copy</td></tr>
+    <tr><td><code>max_cost_usd</code></td><td>Tenant plan</td><td>Be editable by the model</td></tr>
+    <tr><td><code>task</code></td><td>Classifier or rules</td><td>Override capability flags</td></tr>
+    <tr><td><code>tenant</code>, <code>tier</code></td><td>Auth layer</td><td>Come from the prompt body</td></tr>
+  </tbody>
+</table>
+
+<h3>Ordering, Specificity and Golden Routes</h3>
+
+<ul>
+  <li><strong>Order rules by specificity.</strong> Put rare, high-stakes overrides first (VIP tenant,
+  legal hold, multimodal), then task rules, then length heuristics, then the default. Never put the
+  default in the middle of the list.</li>
+  <li><strong>Make the default loud.</strong> Emit <code>reason=default</code> and log the raw task
+  label distribution of default hits every week; a growing default share is the earliest signal of a
+  stale table.</li>
+  <li><strong>Freeze golden routes.</strong> A small set of (prompt, expected model) pairs runs in CI
+  so a table edit cannot silently move a slice of traffic.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Golden-route tests for a policy table.</figcaption>
+<pre><code>"""Freeze expected routes; fail CI if a table edit shifts them silently."""
+from forge.router.features import extract_features
+from forge.router.rules import policy_table_router
+
+table = {
+    "chat": "tiny-local",
+    "code": "mid-open",
+    "math": "frontier-api",
+    "vision": "frontier-api",
+    "tools": "frontier-api",
+}
+router = policy_table_router(table)
+cases = [
+    ("hello there", "tiny-local"),
+    ("import os", "mid-open"),
+    ("prove the lemma", "frontier-api"),
+]
+for text, want in cases:
+    got = router.route(extract_features(text)).model
+    assert got == want, (text, got, want)
+print("golden routes ok:", len(cases))</code></pre>
+</figure>
+
+<pre class="output">golden routes ok: 3</pre>
+
+<aside class="callout warning"><span class="title">Failure Mode</span>
+  <p>Two services each ship their own copy of the three-line function. They drift. Own one
+  <code>RuleRouter</code> package and configure tables per product.</p>
+</aside>
+
+
+<h3>Failure Modes of Rules</h3>
+
+<table>
+  <caption>How rule routers fail in production.</caption>
+  <thead><tr><th>Failure</th><th>Symptom</th><th>Mitigation</th></tr></thead>
+  <tbody>
+    <tr><td>Keyword miss</td><td>Hard maths phrased as chat → tiny model</td><td>Learned router (Ch. 5); cascade on low confidence (Ch. 7)</td></tr>
+    <tr><td>Stale table</td><td>New modality ships, table still text-only</td><td>Capability filter as a hard gate (Ch. 3)</td></tr>
+    <tr><td>No budget</td><td>Table always picks frontier</td><td>SLO-constrained selection (Ch. 4)</td></tr>
+    <tr><td>Silent default</td><td>Unknown task → expensive default</td><td>Explicit default + metric on <code>reason=default</code></td></tr>
+  </tbody>
+</table>
+
+<div class="frame exercise"><p>Add a tenant override column to the policy table. Show that a
+<code>vip</code> tenant can force <code>frontier-api</code> for chat without changing the three-line
+function — only the table lookup. Then add a golden test that fails when <code>vision</code> traffic
+would route to any model lacking the image modality in <code>DEFAULT_CATALOGUE</code>.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="capability">Capability Routing</h2>
+<p class="chapter-lede">Before optimising dollars, eliminate illegal assignments. A model without
+vision must not receive an image. A 8k-context local model must not receive a 50k-token prompt.
+Capability routing is a hard filter; quality ranking happens among the survivors.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>The cost-optimal router picks <code>tiny-local</code> for a screenshot OCR ticket because chat
+  keywords look cheap. The API returns 400. The user sees a failure. Capability constraints are not
+  preferences — they are admissibility.</p>
+</div>
+
+<h3>Capability Profiles</h3>
+
+<p>Each model publishes a profile: modalities, context limit, and capability tags
+(<code>chat</code>, <code>code</code>, <code>math</code>, <code>vision</code>, <code>tools</code>).
+The router returns only models that <code>accepts</code> the request, then picks maximum quality.</p>
+
+<figure class="listing">
+<figcaption>Hard filters then max-quality among eligible models (<code>capability.py</code>).</figcaption>
+<pre><code>"""Capability profiles as hard constraints before quality ranking."""
+from forge.router.models import DEFAULT_CATALOGUE
+from forge.router.features import extract_features
+from forge.router.capability import CapabilityProfile, CapabilityRouter
+
+cap = CapabilityRouter([CapabilityProfile(s) for s in DEFAULT_CATALOGUE])
+cases = [
+    ("summarise this email", None),
+    ("OCR this image of a receipt", "image"),
+    ("x" * 50_000, None),
+]
+for text, mod in cases:
+    f = extract_features(text, modality=mod)
+    d = cap.route(f)
+    print(f"task={f.task:6s} tok≈{f.n_tokens_est:&lt;6d} mod={f.modality:5s} "
+          f"-&gt; {d.model}  elig={list(d.candidates)}")</code></pre>
+</figure>
+
+<pre class="output">task=chat   tok≈5      mod=text  -&gt; frontier-api  elig=['frontier-api', 'mid-open', 'tiny-local']
+task=vision tok≈7      mod=image -&gt; frontier-api  elig=['frontier-api']
+task=chat   tok≈12500  mod=text  -&gt; frontier-api  elig=['frontier-api', 'mid-open']</pre>
+
+<ul>
+  <li>Plain chat: all three are eligible; max quality picks the frontier. Cost routing (next chapter)
+  will re-rank under budget.</li>
+  <li>Image OCR: only <code>frontier-api</code> lists the image modality.</li>
+  <li>Long context: <code>tiny-local</code> drops out at 8&nbsp;192 tokens; mid survives at 32&nbsp;k.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Failure Mode</span>
+  <p>Soft “prefer vision models” in a prompt to the router model is not a capability gate. Gates
+  belong in code that cannot be talked out of a 400.</p>
+</aside>
+
+<div class="frame exercise"><p>Add a <code>tools</code>-only mid-tier model to the catalogue. Route a
+<code>needs_tools=True</code> request and show that <code>tiny-local</code> is excluded even when it
+is the cheapest.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="cost-latency">Cost- and Latency-Aware Routing</h2>
+<p class="chapter-lede">Among capable models, pick by budget. An SLO is a constraint; preference
+among feasible models is an objective — minimise cost, maximise quality, or minimise predicted
+latency including the queue you can see.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Capability routing always selects the frontier when it is eligible. That maximises quality and
+  the invoice. Product has a $0.05 per-request cap and a 1&nbsp;s p95 ceiling. You need the subset of
+  models that satisfy both, then a rule for ties.</p>
+</div>
+
+<h3>Budgets and SLO-Constrained Selection</h3>
+
+<div class="math">
+\mathcal{F}(x) = \{ m : \widehat{c}(m,x) \le B,\; \widehat{\ell}_{p95}(m,x) \le L \}
+\qquad
+m^\star = \arg\operatorname{opt}_{m \in \mathcal{F}(x)} \; \mathrm{obj}(m)
+</div>
+
+<figure class="listing">
+<figcaption>Feasible set under cost and latency, then prefer quality (<code>cost.py</code>).</figcaption>
+<pre><code>"""SLO-constrained selection with optional queue-aware latency."""
+from forge.router.models import DEFAULT_CATALOGUE
+from forge.router.features import extract_features
+from forge.router.cost import Budget, CostLatencyRouter, QueueState
+
+budget = Budget(max_cost_usd=0.05, max_latency_p95_ms=1000, prefer="quality")
+router = CostLatencyRouter(list(DEFAULT_CATALOGUE), budget)
+f = extract_features("write a short email", max_cost_usd=0.05, max_latency_ms=1000)
+d = router.route(f)
+print(f"route -&gt; {d.model} ({d.reason}) candidates={list(d.candidates)}")
+print("feasible:",
+      ", ".join(f"{s.name} cost={c:.4f} lat={l:.0f}" for s, c, l in router.feasible(f)))
+
+q = QueueState(
+    depth={"mid-open": 5, "frontier-api": 0, "tiny-local": 0},
+    service_ms={"mid-open": 200, "frontier-api": 400, "tiny-local": 20},
+)
+router2 = CostLatencyRouter(
+    list(DEFAULT_CATALOGUE),
+    Budget(max_latency_p95_ms=1500, prefer="latency"),
+    queue=q,
+)
+print("queue-aware -&gt;", router2.route(extract_features("hello")).model)
+for s in DEFAULT_CATALOGUE:
+    print(f"  {s.name:13s} pred_p95={q.predicted_latency_ms(s.name, s.latency_p95_ms):.0f}ms")</code></pre>
+</figure>
+
+<pre class="output">route -&gt; tiny-local (slo_quality) candidates=['tiny-local']
+feasible: tiny-local cost=0.0000 lat=80
+queue-aware -&gt; tiny-local
+  tiny-local    pred_p95=80ms
+  mid-open      pred_p95=1900ms
+  frontier-api  pred_p95=2200ms</pre>
+
+<p>Under a tight $0.05 / 1&nbsp;s budget, only the local tier is feasible — mid’s token price alone
+exceeds the cap on this estimate. With a 5-deep mid queue, predicted p95 jumps to 1&nbsp;900&nbsp;ms and mid
+falls out of a 1.5&nbsp;s latency SLO even if dollars allow it.</p>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Separate <em>feasibility</em> from <em>preference</em>. Mixing them into one score hides why a
+    model was dropped.</li>
+    <li>Queue-aware latency is load balancing meeting model routing. Volume 12’s least-load ideas
+    belong in <span class="math">\widehat{\ell}</span>.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>When the feasible set is empty, <code>CostLatencyRouter</code>
+degrades to the cheapest catalogue member. Add an explicit
+<code>reason=budget_infeasible_degraded</code> metric and a page if that reason exceeds 1% of
+traffic.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="learned">Quality-Based and Learned Routing</h2>
+<p class="chapter-lede">Rules and SLOs do not know that this particular paraphrased maths question
+is hard. Learned routers estimate which model will win from features or from preference data —
+matrix factorisation over clusters, or a small classifier over <span class="math">\phi(x)</span>.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Benchmark-driven routing (Shnitzer et al., 2023; Hu et al., 2024) and preference routers
+  (Ong et al., 2024 RouteLLM; Ding et al., 2024 Hybrid LLM) exist because keyword task labels are
+  coarse. You need training signals: pairwise preferences, or per-model correctness on logged
+  prompts — and an offline eval that does not leak the test week into training.</p>
+</div>
+
+<h3>Classifier Router</h3>
+
+<figure class="listing">
+<figcaption>Softmax over linear scores per model (<code>learned.py</code>).</figcaption>
+<pre><code>"""Hand-fit logistic router over task and length features."""
+import numpy as np
+from forge.router.features import extract_features
+from forge.router.learned import ClassifierRouter
+
+clf = ClassifierRouter.fit_demo()
+for text in ["hi", "def sort(xs):", "prove Cauchy-Schwarz", "describe the image"]:
+    f = extract_features(text)
+    p = clf.scores(f)
+    d = clf.route(f)
+    probs = " ".join(f"{m}={v:.3f}" for m, v in zip(clf.models, p))
+    print(f"{f.task:6s} [{probs}] -&gt; {d.model}")</code></pre>
+</figure>
+
+<pre class="output">chat   [tiny-local=0.531 mid-open=0.292 frontier-api=0.177] -&gt; tiny-local
+code   [tiny-local=0.131 mid-open=0.652 frontier-api=0.217] -&gt; mid-open
+math   [tiny-local=0.115 mid-open=0.314 frontier-api=0.571] -&gt; frontier-api
+vision [tiny-local=0.048 mid-open=0.072 frontier-api=0.879] -&gt; frontier-api</pre>
+
+<h3>Preference / Matrix-Factorisation Scores</h3>
+
+<p>RouteLLM-style systems score (prompt cluster, model) pairs. A tiny MF table is enough to see the
+shape: each cluster has a preferred arm.</p>
+
+<figure class="listing">
+<figcaption>Cluster → model preference matrix (<code>PreferenceMatrix</code>).</figcaption>
+<pre><code>"""Matrix-factorisation style scores over prompt clusters."""
+import numpy as np
+from forge.router.learned import PreferenceMatrix
+
+mf = PreferenceMatrix(
+    models=["tiny-local", "mid-open", "frontier-api"],
+    clusters=["short", "code", "math", "long"],
+    scores=np.array([
+        [0.90, 0.60, 0.40],
+        [0.30, 0.85, 0.70],
+        [0.20, 0.55, 0.95],
+        [0.10, 0.70, 0.90],
+    ]),
+)
+for c in mf.clusters:
+    print(f"{c:6s} -&gt; {mf.best(c).model}")</code></pre>
+</figure>
+
+<pre class="output">short  -&gt; tiny-local
+code   -&gt; mid-open
+math   -&gt; frontier-api
+long   -&gt; frontier-api</pre>
+
+<table>
+  <caption>Training data and evaluation for learned routers.</caption>
+  <thead><tr><th>Signal</th><th>Example</th><th>Pitfall</th></tr></thead>
+  <tbody>
+    <tr><td>Pairwise preference</td><td>Arena battles, RouteLLM data</td><td>Preference ≠ task success on your rubric</td></tr>
+    <tr><td>Binary correctness</td><td>RouterBench-style labels</td><td>Label noise; distribution shift</td></tr>
+    <tr><td>Offline replay</td><td>Logged (x, m, reward)</td><td>Counterfactuals unidentified without IPS/oracle</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Learned routers still sit behind capability gates and budget filters. Softmax is not a licence
+    to send images to a text-only model.</li>
+    <li>Evaluate with cost–quality curves and regret against an oracle or strong baseline, not only
+    accuracy of the predicted model id.</li>
+  </ul>
+</aside>
+
+<h3>Real Products: Learned Routers</h3>
+
+<ul>
+  <li><span class="evidence documented">Documented</span> RouteLLM (LMSYS, open source, July 2024;
+  Ong et al., 2024) trains four router types (similarity-weighted ranking, matrix factorisation, a
+  BERT classifier and a causal-LLM classifier) on Chatbot Arena preference data to decide between a
+  strong and a weak model. The LMSYS blog reports cost reductions of over 85% on MT Bench, 45% on
+  MMLU and 35% on GSM8K versus GPT-4 alone while reaching 95% of GPT-4's performance.</li>
+  <li><span class="evidence documented">Documented</span> Commercial router services such as Martian
+  and Not Diamond publicly market per-request model selection across providers as an API product
+  (company websites).</li>
+  <li><span class="evidence inferred">Inferred</span> Their training data, features and objectives are
+  not public. Treat vendor savings claims as the always-route comparison of Chapter 12 on
+  <em>their</em> workload: re-measure on your own traffic and rubric before relying on them.</li>
+</ul>
+
+
+<div class="frame exercise"><p>Replace <code>fit_demo</code> weights with a logistic regression fit on
+200 labelled (features, best_model) rows. Report train accuracy and the cost–quality curve on a held
+out week.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="confidence">Confidence Estimation</h2>
+<p class="chapter-lede">Cascades and abstention need a number in <span class="math">[0,1]</span>
+that correlates with correctness. Log-probabilities, self-consistency, semantic entropy, verbalised
+scores, calibration and conformal thresholds are the toolbox — none is magic; all must be measured.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>You want to run the cheap model first and escalate only when it is unsure. "Unsure" is not a
+  vibe. If your confidence score is miscalibrated, you either escalate constantly (bill looks like
+  frontier-only) or you ship wrong answers with high confidence.</p>
+</div>
+
+<h3>Signals</h3>
+
+<table>
+  <caption>Confidence estimators used in <code>forge.router.confidence</code>.</caption>
+  <thead><tr><th>Method</th><th>Input</th><th>Idea</th><th>Watch-out</th></tr></thead>
+  <tbody>
+    <tr><td>Mean token probability</td><td>token logprobs</td><td><span class="math">\mathbb{E}[e^{\ell_t}]</span></td><td>Fluent wrong answers score high</td></tr>
+    <tr><td>Self-consistency</td><td>N samples</td><td>Plurality fraction (Wang et al., 2022 lineage)</td><td>Exact-string match; cost × N</td></tr>
+    <tr><td>Semantic entropy</td><td>N samples</td><td>Entropy over meaning clusters (Kuhn et al., 2023)</td><td>Needs a similarity function</td></tr>
+    <tr><td>Verbalised</td><td>model text</td><td>Ask for <code>confidence: 0.x</code> (Kadavath et al., 2022)</td><td>Easily gamed; calibrate hard</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>Four estimators, ECE and a conformal threshold (<code>confidence.py</code>).</figcaption>
+<pre><code>"""Confidence signals, calibration ECE and split-conformal threshold."""
+import numpy as np
+from forge.router.confidence import (
+    mean_token_prob, self_consistency, semantic_entropy, verbalised_confidence,
+    expected_calibration_error, conformal_threshold,
+)
+
+lp = mean_token_prob([-0.1, -0.2, -0.05, -0.3])
+print(f"mean_token_prob={lp.value:.4f} ({lp.detail})")
+sc = self_consistency(["Paris", "Paris", "London", "Paris"])
+print(f"self_consistency={sc.value:.2f} ({sc.detail})")
+se = semantic_entropy([
+    "The capital of France is Paris",
+    "Paris is the capital of France",
+    "Berlin is the capital of Germany",
+    "France capital city is Paris",
+])
+print(f"semantic_entropy_conf={se.value:.4f} ({se.detail})")
+print(f"verbalised={verbalised_confidence('I think it is 42. confidence: 0.81').value}")
+
+rng = np.random.default_rng(0)
+conf = rng.uniform(0.5, 1.0, 200)
+correct = (rng.random(200) &lt; conf).astype(float)
+conf_over = np.clip(conf + 0.15, 0, 1)          # systematically overconfident
+rep = expected_calibration_error(conf_over, correct)
+print(f"ECE={rep.ece:.4f} (n={rep.n}, bins={rep.bins})")
+cal = rng.uniform(0.4, 0.95, 100)
+print(f"conformal_threshold(alpha=0.1)={conformal_threshold(cal, alpha=0.1):.4f}")</code></pre>
+</figure>
+
+<pre class="output">mean_token_prob=0.8539 (n=4)
+self_consistency=0.75 (modes=2)
+semantic_entropy_conf=0.5944 (clusters=2 H=0.562)
+verbalised=0.81
+ECE=0.1446 (n=200, bins=10)
+conformal_threshold(alpha=0.1)=0.8887</pre>
+
+<p>Semantic entropy here clusters bag-of-words near-paraphrases: three France/Paris answers versus
+one Berlin outlier → two clusters, confidence <span class="math">1 - H / \log n \approx 0.59</span>.
+Identical answers yield confidence 1. Guo et al. (2017) ECE on deliberately overconfident scores is
+about 0.15 — large enough to wreck a cascade threshold. Angelopoulos &amp; Bates (2021) conformal
+gives a threshold with finite-sample coverage guarantees when exchangeability holds; LLM prompts
+often violate that, so treat the number as a calibrated deferral knob you still monitor online.</p>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Pick one primary signal for deferral and measure ECE on a frozen calibration set weekly.</li>
+    <li>Conformal thresholds buy coverage assumptions, not immunity to distribution shift.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Compare ECE for mean token probability versus self-consistency
+(<span class="math">N=5</span>) on 100 scripted prompts where you know the label. Which signal would
+you trust to drive a cascade?</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="cascades">Cascades</h2>
+<p class="chapter-lede">A cascade tries models in order and stops when confidence clears a
+threshold. FrugalGPT (Chen et al., 2023) made the LLM version mainstream; Viola &amp; Jones (2001)
+had the same control flow for faces. The engineering problem is choosing <span class="math">\tau</span>
+so expected cost falls without giving up the quality floor.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Always-frontier costs $1.80 per request on the toy mix and scores 1.00 quality. Mid alone scores
+  0.75. You want mid’s quality at a fraction of frontier’s bill. A cascade with a deferral threshold
+  is the lever — if you set <span class="math">\tau</span> wrong, you either never escalate or always
+  do.</p>
+</div>
+
+<h3>Sequential Escalation</h3>
+
+<p>A cascade runs stage 0; if its confidence falls below <span class="math">\tau</span> it
+defers to stage 1, and so on. With <span class="math">p_j = \Pr(\mathrm{defer}_j)</span> and the
+empty product equal to 1, expected cost and latency are:</p>
+
+<div class="math">
+\mathbb{E}[C] = \sum_{i=0}^{K-1} c_i \prod_{j=0}^{i-1} p_j
+\qquad
+\mathbb{E}[L] = \sum_{i=0}^{K-1} \ell_i \prod_{j=0}^{i-1} p_j
+</div>
+
+<p>For three stages this is <span class="math">c_0 + p_0 c_1 + p_0 p_1 c_2</span>. Stages on the
+critical path add latency; hedging stage&nbsp;1 while stage&nbsp;0 is still streaming buys latency
+with dollars spent on cancelled work — rarely worth it on GPUs you pay for.</p>
+
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  Q[Request] --> S0[Stage 0: tiny-local]
+  S0 --> C0{"confidence >= tau?"}
+  C0 -->|yes| A0["Return; cost c0"]
+  C0 -->|"no, prob p0"| S1[Stage 1: mid-open]
+  S1 --> C1{"confidence >= tau?"}
+  C1 -->|yes| A1["Return; cost c0 + c1"]
+  C1 -->|"no, prob p1"| S2[Stage 2: frontier-api]
+  S2 --> A2["Return; cost c0 + c1 + c2"]
+</pre>
+<figcaption>Cascade escalation. Each deferral multiplies the probability of paying for the next
+stage; the last stage never defers.</figcaption>
+</figure>
+
+
+<figure class="listing">
+<figcaption>Threshold grid search and cascade versus always-frontier (<code>cascade.py</code>).</figcaption>
+<pre><code>"""Optimise deferral threshold; compare cascade to always-frontier."""
+import numpy as np
+from forge.router.models import TINY, MID, FRONTIER, CostLatencyModel
+from forge.router.cascade import Cascade, optimise_threshold, expected_cascade_cost
+
+def conf_fn(out):
+    if out["model"] == "tiny-local":
+        return 0.9 if out["ok"] else 0.2
+    if out["model"] == "mid-open":
+        return 0.85 if out["ok"] else 0.35
+    return 0.95
+
+easy = [f"easy-{i}" for i in range(8)]
+hard = [f"hard-{i}" for i in range(8)]
+prompts = easy + hard
+
+def models():
+    return [
+        CostLatencyModel(TINY, success_on=frozenset(easy), fail_rate=1.0),
+        CostLatencyModel(MID, success_on=frozenset(easy + hard[:4]), fail_rate=1.0),
+        CostLatencyModel(FRONTIER, success_on=frozenset(easy + hard), fail_rate=1.0),
+    ]
+
+tau, metrics = optimise_threshold(prompts, models(), conf_fn)
+print(f"tau*={tau:.2f} quality={metrics['quality']:.3f} "
+      f"E[cost]={metrics['expected_cost']:.4f} solo_mid={metrics['solo_mid_quality']:.3f}")
+
+casc = Cascade(models(), conf_fn, threshold=tau)
+results = [casc.run(p) for p in prompts]
+print(f"cascade mean_cost={np.mean([r.cost_usd for r in results]):.4f} "
+      f"quality={np.mean([r.ok for r in results]):.3f} "
+      f"mean_steps={np.mean([r.steps for r in results]):.2f}")
+
+af = [CostLatencyModel(FRONTIER, success_on=frozenset(easy + hard), fail_rate=1.0).complete(p)
+      for p in prompts]
+print(f"always_frontier mean_cost={np.mean([x['cost_usd'] for x in af]):.4f} "
+      f"quality={np.mean([x['ok'] for x in af]):.3f}")
+print(f"E[cost] formula (p=[0.4,0.25], c=[0,0.12,1.5]) = "
+      f"{expected_cascade_cost([0.4, 0.25], [0.0, 0.12, 1.5]):.4f}")</code></pre>
+</figure>
+
+<pre class="output">tau*=0.25 quality=0.750 E[cost]=0.0390 solo_mid=0.750
+cascade mean_cost=0.0390 quality=0.750 mean_steps=1.50
+always_frontier mean_cost=1.8000 quality=1.000
+E[cost] formula (p=[0.4,0.25], c=[0,0.12,1.5]) = 0.1980</pre>
+
+<p>On this stub workload the search finds <span class="math">\tau^\star = 0.25</span>: quality matches
+solo mid (0.75) while expected cost is about 2% of always-frontier. Mean steps 1.5 means half the
+requests stop at the first model. The closed-form line shows how deferral probabilities compound
+cost — useful for back-of-envelope design before you have a calibrated <code>conf_fn</code>.</p>
+
+<aside class="callout warning"><span class="title">Failure Mode</span>
+  <p>Optimising <span class="math">\tau</span> on the same prompts you report quality on overfits the
+  threshold. Hold out a week. Hybrid LLM (Ding et al., 2024) and FrugalGPT both stress evaluation
+  under budget, not only average accuracy.</p>
+</aside>
+
+<h3>Checking the Formula</h3>
+
+<p>Before trusting the closed form in a design review, check it against simulation. The formula
+assumes deferral events are independent across stages given the request; correlated difficulty
+(hard prompts defer at every stage) breaks that, which is why the empirical cascade in the listing
+above, not the formula, is what you tune on.</p>
+
+<figure class="listing">
+<figcaption>Monte Carlo check of the expected-cost formula on Bernoulli deferrals.</figcaption>
+<pre><code>"""Monte Carlo check of expected_cascade_cost."""
+import numpy as np
+from forge.router.cascade import expected_cascade_cost
+
+rng = np.random.default_rng(0)
+probs = [0.4, 0.25]
+costs = [0.0, 0.12, 1.5]
+formula = expected_cascade_cost(probs, costs)
+
+def trial():
+    total = costs[0]
+    if rng.random() &lt; probs[0]:
+        total += costs[1]
+        if rng.random() &lt; probs[1]:
+            total += costs[2]
+    return total
+
+mc = np.mean([trial() for _ in range(20_000)])
+print(f"formula={formula:.4f} monte_carlo={mc:.4f} err={abs(formula-mc):.4f}")</code></pre>
+</figure>
+
+<pre class="output">formula=0.1980 monte_carlo=0.1953 err=0.0027</pre>
+
+<h3>Tuning under Dual Constraints</h3>
+
+<p>The grid search above optimises cost subject to a quality floor. Production has two floors:
+quality <span class="math">\ge Q^\star</span> and latency <span class="math">\le L^\star</span>.
+Sweep <span class="math">\tau</span>, keep candidates that satisfy both, and minimise cost among
+survivors. If the set is empty you must raise the budget, lower <span class="math">Q^\star</span>,
+add a faster middle tier, or refuse traffic — not quietly relax the latency SLO in a spreadsheet.</p>
+
+<figure class="listing">
+<figcaption>Sweep τ with a quality floor of 0.90 and a mean-latency ceiling of 500&nbsp;ms.</figcaption>
+<pre><code>"""Sweep tau; keep quality &gt;= Q* and mean latency &lt;= L*; minimise cost."""
+import numpy as np
+from forge.router.models import TINY, MID, FRONTIER, CostLatencyModel
+from forge.router.cascade import Cascade
+
+easy = [f"easy-{i}" for i in range(8)]
+hard = [f"hard-{i}" for i in range(8)]
+prompts = easy + hard
+
+def conf_fn(out):
+    if out["model"] == "tiny-local":
+        return 0.9 if out["ok"] else 0.2
+    if out["model"] == "mid-open":
+        return 0.85 if out["ok"] else 0.35
+    return 0.95
+
+def models():
+    return [
+        CostLatencyModel(TINY, success_on=frozenset(easy), fail_rate=1.0),
+        CostLatencyModel(MID, success_on=frozenset(easy + hard[:4]), fail_rate=1.0),
+        CostLatencyModel(FRONTIER, success_on=frozenset(prompts), fail_rate=1.0),
+    ]
+
+Q_STAR, L_STAR = 0.90, 500.0
+best = None
+print(" tau  quality  E[cost]  mean_lat_ms  feasible")
+for tau in [0.1, 0.3, 0.5, 0.9, 0.99]:
+    casc = Cascade(models(), conf_fn, threshold=tau)
+    rs = [casc.run(p) for p in prompts]
+    q = np.mean([r.ok for r in rs])
+    c = np.mean([r.cost_usd for r in rs])
+    lat = np.mean([r.latency_ms for r in rs])
+    ok = q &gt;= Q_STAR and lat &lt;= L_STAR
+    print(f"{tau:4.2f}  {q:7.3f}  {c:7.4f}  {lat:11.0f}  {ok}")
+    if ok and (best is None or c &lt; best[1]):
+        best = (tau, round(float(c), 4))
+fallback = "none: raise budget, lower Q*, or add a faster tier"
+print("chosen (tau, E[cost]):", best if best else fallback)</code></pre>
+</figure>
+
+<pre class="output"> tau  quality  E[cost]  mean_lat_ms  feasible
+0.10    0.500   0.0000           40  False
+0.30    0.750   0.0390          215  False
+0.50    1.000   0.4890          415  True
+0.90    1.000   0.9390          615  False
+0.99    1.000   1.8780         1190  False
+chosen (tau, E[cost]): (0.5, 0.489)</pre>
+
+<ul>
+  <li>Low <span class="math">\tau</span> stops early: cheap and fast, but quality stays at the
+  tiny or mid solo level.</li>
+  <li>High <span class="math">\tau</span> distrusts every confident answer, so easy prompts pay for
+  all three stages: quality is perfect but latency breaks the ceiling.</li>
+  <li>The feasible band is narrow. On real traffic it moves whenever a model or the traffic mix
+  changes, so re-run the sweep on a fresh held-out week before every threshold change.</li>
+</ul>
+
+<table>
+  <caption>Cascade knobs and the first symptom when mistuned.</caption>
+  <thead><tr><th>Knob</th><th>Too low</th><th>Too high</th></tr></thead>
+  <tbody>
+    <tr><td>τ</td><td>Silent errors; quality ↓</td><td>Over-escalation; bill and latency ↑</td></tr>
+    <tr><td>N samples (consistency)</td><td>Noisy deferral</td><td>Latency × N</td></tr>
+    <tr><td>min_quality</td><td>Savings mirage</td><td>No feasible τ</td></tr>
+    <tr><td>Number of stages</td><td>Large quality jump at the only escalation</td><td>Latency stacks; more thresholds to calibrate</td></tr>
+  </tbody>
+</table>
+
+<div class="frame exercise"><p>Raise the quality floor to 0.90 and re-run
+<code>optimise_threshold</code> with <code>min_quality=0.90</code>. What happens to
+<span class="math">\tau^\star</span> and expected cost? Then add a latency argument to
+<code>optimise_threshold</code> that rejects τ whose cascade mean latency exceeds 1.5× mid solo
+latency, and derive <span class="math">\mathbb{E}[C]</span> for a four-stage cascade.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="fallbacks">Fallbacks and Resilience</h2>
+<p class="chapter-lede">Routing assumes the chosen provider answers. Rate limits, regional outages
+and 503 storms say otherwise. A fallback chain with per-provider circuit breakers — and an explicit
+degraded mode — is routing’s reliability twin from Volume 12.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>Your learned router picks provider A. A returns HTTP 429 for three consecutive calls. Without a
+  breaker, every request still hammers A, burns retry budget, and never tries B. Users see timeouts;
+  dashboards show “router healthy” because the policy function did not throw.</p>
+</div>
+
+<h3>Breakers across Providers</h3>
+
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  R[Routed request] --> BA{"Breaker A open?"}
+  BA -->|closed| CA[Call provider A]
+  CA -->|2xx| OK[Return answer]
+  CA -->|"429 / 5xx / timeout"| FA[Record failure on A]
+  FA --> BB
+  BA -->|open| BB{"Breaker B open?"}
+  BB -->|closed| CB[Call provider B]
+  CB -->|2xx| OK
+  CB -->|error| BC
+  BB -->|open| BC{"Breaker C open?"}
+  BC -->|closed| CC[Call provider C]
+  CC -->|2xx| OK
+  CC -->|error| DG["Degraded mode: cache or template, degraded=true"]
+  BC -->|open| DG
+</pre>
+<figcaption>Fallback chain with one circuit breaker per provider. An open breaker is skipped
+without a network call; exhausting the chain is a named degraded mode, not an exception.</figcaption>
+</figure>
+
+
+<figure class="listing">
+<figcaption>Open breaker skips A; B and C absorb traffic; degraded mode if all fail
+(<code>fallback.py</code>).</figcaption>
+<pre><code>"""Multi-provider fallback with circuit breakers."""
+from forge.router.fallback import FallbackChain, ProviderCall
+
+state = {"B": 0}
+
+def call_fn(name, prompt):
+    if name == "A":
+        raise RuntimeError("rate_limit")
+    if name == "B":
+        state["B"] += 1
+        if state["B"] &lt;= 2:
+            return ProviderCall(name, False, "", error="503")
+        return ProviderCall(name, True, f"ok from {name}")
+    return ProviderCall(name, True, f"ok from {name}")
+
+chain = FallbackChain(["A", "B", "C"], call_fn)
+for _ in range(3):
+    chain.breakers["A"].record_failure(now=0.0)
+print(f"breaker A: {chain.breakers['A'].state.value}")
+for i in range(3):
+    r = chain.execute("hi", now=0.0)
+    print(f"call{i+1}: provider={r.provider} ok={r.ok} degraded={r.degraded} text={r.text!r}")</code></pre>
+</figure>
+
+<pre class="output">breaker A: open
+call1: provider=C ok=True degraded=False text='ok from C'
+call2: provider=C ok=True degraded=False text='ok from C'
+call3: provider=B ok=True degraded=False text='ok from B'</pre>
+
+<p>A is open, so the chain never calls it. B fails closed twice (503), so early calls land on C.
+After B’s failures clear the half-open path, call 3 succeeds on B. If every provider fails, the
+chain returns <code>degraded=True</code> with a cached short answer — a product decision you must
+design, not a silent empty 200.</p>
+
+<table>
+  <caption>Resilience modes for model providers.</caption>
+  <thead><tr><th>Event</th><th>Router response</th><th>User-visible mode</th></tr></thead>
+  <tbody>
+    <tr><td>Rate limit / 429</td><td>Trip breaker; next provider</td><td>Same quality if peer exists</td></tr>
+    <tr><td>Hard outage</td><td>Open breaker for recovery window</td><td>Possible quality drop</td></tr>
+    <tr><td>All providers down</td><td>Degraded template / cache</td><td>Honest limited mode</td></tr>
+    <tr><td>Partial dependency (tools)</td><td>Route to non-tool model + message</td><td>Feature flag off</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Breakers are per provider (or per model endpoint), not one global switch.</li>
+    <li>Degraded mode must be detectable in metrics and in the API contract.</li>
+  </ul>
+</aside>
+
+<h3>Real Products: Provider Failover</h3>
+
+<ul>
+  <li><span class="evidence documented">Documented</span> OpenRouter's provider-routing documentation
+  describes load balancing across providers of the same model that prefers providers without recent
+  significant outages and weights by price, a <code>provider.allow_fallbacks</code> switch for
+  same-model failover, and a <code>models</code> array for falling back to a different model when
+  every provider of the first one fails (OpenRouter docs, <em>Provider Routing</em> and <em>Model
+  Fallbacks</em>).</li>
+  <li><span class="evidence documented">Documented</span> The open-source LiteLLM Router supports
+  retries, fallbacks to other deployments or models, and cooldowns that take a deployment out of
+  rotation after repeated failures — a circuit breaker by another name (LiteLLM docs, <em>Router:
+  Load Balancing, Fallbacks</em>).</li>
+  <li><span class="evidence documented">Documented</span> Hosted model APIs signal pressure with
+  distinct errors; Anthropic's API, for example, documents HTTP 429 <code>rate_limit_error</code> and
+  529 <code>overloaded_error</code> (Anthropic API docs, <em>Errors</em>). Treat them differently:
+  429 is your quota, 529 is the provider's capacity.</li>
+  <li><span class="evidence inferred">Inferred</span> First-party chat assistants run equivalent
+  failover internally across regions and serving clusters. Their mechanisms are not public; the
+  shared lesson is that same-model failover (another provider) and cross-model fallback (a different
+  quality point) are distinct decisions with distinct quality consequences.</li>
+</ul>
+
+<h3>Incidents and the Operator Runbook</h3>
+
+<p>Breakers make the failure <em>bounded</em>; the runbook makes it <em>diagnosable</em>. Every
+routing incident starts from the decision log (Chapter 12) and asks the same questions in the same
+order.</p>
+
+<ol>
+  <li><strong>Quality drop:</strong> pull <code>router_decision_total</code> by reason and slice;
+  diff the active policy table and τ against the last known-good digests.</li>
+  <li><strong>Cost spike:</strong> check escalation rate, τ, and whether open breakers forced traffic
+  onto a more expensive peer.</li>
+  <li><strong>Latency spike:</strong> compare <code>QueueState</code> predictions with measured TTFT;
+  a queue-blind latency model routes into the busiest tier.</li>
+  <li><strong>ECE alert:</strong> freeze τ changes and collect a fresh calibration set before
+  retuning.</li>
+  <li><strong>Provider 5xx:</strong> confirm breaker transitions (closed → open → half-open); never
+  disable fallbacks “to help recovery” — that converts a partial outage into a full one.</li>
+</ol>
+
+<figure class="listing">
+<figcaption>Minimum fields for a routing incident write-up.</figcaption>
+<pre><code>"""Routing incident record (store in your ops doc system)."""
+incident = {
+    "symptom": "p95 quality drop 4pp on code slice",
+    "window": "2026-09-28 14:00–16:00 UTC",
+    "router_version": "rules-table@3.2",
+    "top_reasons": [("default", 0.41), ("task_code", 0.33)],
+    "model_mix_delta": {"mid-open": -0.18, "tiny-local": +0.18},
+    "ECE_deferral": 0.21,
+    "mitigation": "revert table 3.2; freeze tiny for code",
+    "follow_up": "golden route tests for code slice",
+}
+for k, v in incident.items():
+    print(f"{k}: {v}")</code></pre>
+</figure>
+
+<pre class="output">symptom: p95 quality drop 4pp on code slice
+window: 2026-09-28 14:00–16:00 UTC
+router_version: rules-table@3.2
+top_reasons: [('default', 0.41), ('task_code', 0.33)]
+model_mix_delta: {'mid-open': -0.18, 'tiny-local': 0.18}
+ECE_deferral: 0.21
+mitigation: revert table 3.2; freeze tiny for code
+follow_up: golden route tests for code slice</pre>
+
+<p>The record above reads as a story: a table edit raised the default share to 41%, the default is
+<code>tiny-local</code>, and code traffic moved 18 points onto a model that cannot do code. The fix
+is a revert plus the golden test from Chapter 2 that would have caught it.</p>
+
+<div class="frame exercise"><p>Add a half-open probe: after <code>recovery_timeout_s</code>, allow one
+request to A. If it succeeds, close the breaker; if it fails, reopen. Show the state transitions in
+a unit test with a fake clock. Then run a game day: inject a mid-tier 503 rate of 20% for fifteen
+minutes and confirm breakers open, the degraded rate rises, and quality on the answered set stays
+within 2&nbsp;pp.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 9 -->
+<section class="chapter">
+<h2 id="ensembles">Ensembles</h2>
+<p class="chapter-lede">Sometimes one forward pass is not enough. Voting, rank fusion,
+generate-then-rank and mixture-of-agents spend extra compute for diversity. They pay when the error
+modes of members are uncorrelated — and they hurt when you only needed a cascade.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A single mid-tier sample fails a hard coding interview question 30% of the time. Three
+  independent samples majority-vote down to roughly 3% if errors are independent — at 3× cost and
+  latency of the slowest member. Ensembles are a bet that error diversity is worth that multiplier.</p>
+</div>
+
+<h3>Voting and Rank Fusion</h3>
+
+<figure class="listing">
+<figcaption>Majority vote and reciprocal rank fusion (<code>ensemble.py</code>).</figcaption>
+<pre><code>"""Vote and fuse ranked lists from several proposers."""
+from forge.router.ensemble import majority_vote, reciprocal_rank_fusion, EnsembleVoter
+
+winner, conf = majority_vote(["A", "B", "A", "A", "C"])
+print(f"majority -&gt; {winner} conf={conf:.2f}")
+
+rrf = reciprocal_rank_fusion([
+    ["x", "y", "z"],
+    ["y", "x", "w"],
+    ["x", "w", "y"],
+])
+print("RRF:", ", ".join(f"{k}={v:.4f}" for k, v in rrf))
+
+ens = EnsembleVoter(
+    generators=[lambda p: "42", lambda p: "42", lambda p: "7"],
+    ranker=lambda p, ans: sorted(set(ans), key=lambda a: -ans.count(a)),
+)
+w, cf, answers = ens.majority("q")
+print(f"ensemble majority -&gt; {w} conf={cf:.3f} answers={answers}")
+print("MoA -&gt;", ens.mixture_of_agents(
+    "q",
+    lambda p, props: "agg:" + max(set(props), key=props.count),
+))</code></pre>
+</figure>
+
+<pre class="output">majority -&gt; A conf=0.60
+RRF: x=0.0489, y=0.0484, w=0.0320, z=0.0159
+ensemble majority -&gt; 42 conf=0.667 answers=['42', '42', '7']
+MoA -&gt; agg:42</pre>
+
+<h3>Mixture-of-Agents and Generate-then-Rank</h3>
+
+<p>Wang et al. (2024) Mixture-of-Agents stacks proposers and aggregators: several models draft,
+another model synthesises. LLM-Blender (Jiang et al., 2023) is the generate-then-rank cousin —
+propose many, score with a pairwise or pointwise ranker, return the top. Both are ensembles with an
+explicit fusion stage rather than exact-string voting.</p>
+
+<table>
+  <caption>When ensembles earn their keep.</caption>
+  <thead><tr><th>Situation</th><th>Prefer</th><th>Avoid when</th></tr></thead>
+  <tbody>
+    <tr><td>Closed-form / short answers</td><td>Majority vote</td><td>Open-ended prose (strings never match)</td></tr>
+    <tr><td>Retrieval / candidate lists</td><td>RRF or learned fusion</td><td>Lists are already near-duplicates</td></tr>
+    <tr><td>Hard generation</td><td>MoA / generate-then-rank</td><td>Latency SLO forbids slowest member</td></tr>
+    <tr><td>Mostly easy traffic</td><td>Cascade first</td><td>You ensemble every request by default</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Dietterich (2000): ensembles help when members are accurate <em>and</em> diverse. Three copies
+    of the same temperature-0 model are a bill, not an ensemble.</li>
+    <li>Compare ensemble cost–quality to a cascade on the same budget before blessing MoA in
+    production.</li>
+  </ul>
+</aside>
+
+<p class="facet">Implementation notes in <code>forge.router.ensemble</code></p>
+<ul>
+  <li><code>majority_vote</code> — exact string plurality; good for structured fields.</li>
+  <li><code>reciprocal_rank_fusion</code> — <span class="math">\sum_r 1/(k+\mathrm{rank}_r)</span> over
+  ranked lists (Cormack et al. lineage; here with <span class="math">k=60</span>).</li>
+  <li><code>EnsembleVoter.mixture_of_agents</code> — proposers then a caller-supplied aggregator
+  function standing in for the MoA LLM.</li>
+</ul>
+
+<div class="frame exercise"><p>Run generate-then-rank with three <code>ScriptedModel</code> proposers
+and a ranker that prefers answers containing a citation marker. Measure win rate versus majority
+vote on 20 prompts where the correct answer is the minority string but the only cited one.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 10 -->
+<section class="chapter">
+<h2 id="adaptive">Dynamic and Adaptive Routing</h2>
+<p class="chapter-lede">Static tables rot. Traffic shifts, models change, and last month’s
+classifier drifts. Contextual bandits update arm values from feedback while exploration safety stops
+the bandit from sending medical queries to a random new endpoint.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>You shipped a classifier router. Two weeks later the mid-tier model improved on code and the
+  frontier got slower. Offline labels are stale. You need online learning from rewards (thumbs,
+  unit-test pass, escalation rate) without exploring arms that violate policy.</p>
+</div>
+
+<h3>LinUCB</h3>
+
+<p>Disjoint LinUCB (Li et al., 2010) keeps a linear model per arm. For context
+<span class="math">x</span> and arm <span class="math">a</span>:</p>
+
+<div class="math">
+\mathrm{score}_a(x) = \hat\theta_a^\top x + \alpha \sqrt{x^\top A_a^{-1} x}
+</div>
+
+<figure class="listing">
+<figcaption>LinUCB on a mixed chat/math/code stream (<code>bandit.py</code>).</figcaption>
+<pre><code>"""Contextual bandit router with cumulative regret."""
+import numpy as np
+from forge.router.features import extract_features
+from forge.router.bandit import LinUCBRouter
+from forge.router.evaluate import regret
+
+bandit = LinUCBRouter(["tiny-local", "mid-open", "frontier-api"], alpha=0.6)
+texts = ["hello"] * 20 + ["prove theorem"] * 20 + ["def f():"] * 20
+rewards_log, best_log = [], []
+truth_table = {
+    "chat": {"tiny-local": 0.7, "mid-open": 0.75, "frontier-api": 0.8},
+    "math": {"tiny-local": 0.2, "mid-open": 0.5, "frontier-api": 0.9},
+    "code": {"tiny-local": 0.3, "mid-open": 0.8, "frontier-api": 0.85},
+}
+for t in texts:
+    f = extract_features(t)
+    d = bandit.route(f)
+    r = truth_table[f.task][d.model]
+    bandit.update(f, d.model, r)
+    rewards_log.append(r)
+    best_log.append(max(truth_table[f.task].values()))
+
+print(f"pulls={dict(bandit.pulls)}")
+print(f"mean_reward={np.mean(rewards_log):.3f} "
+      f"cumulative_regret={regret(rewards_log, best_log):.2f}")
+for t in ["hello", "prove theorem", "def f():"]:
+    d = bandit.route(extract_features(t))
+    print(f"  {t!r:18s} -&gt; {d.model}")</code></pre>
+</figure>
+
+<pre class="output">pulls={'tiny-local': 23, 'mid-open': 1, 'frontier-api': 36}
+mean_reward=0.777 cumulative_regret=4.35
+  'hello'            -&gt; frontier-api
+  'prove theorem'    -&gt; frontier-api
+  'def f():'         -&gt; frontier-api</pre>
+
+<p>With <span class="math">\alpha=0.6</span> and unbounded exploration, the bandit over-pulls the
+frontier (highest mean reward on every task in this synthetic table). Cumulative regret 4.35 on 60
+rounds is the price of learning. In production you would put cost into the reward
+(<span class="math">r - \lambda c</span>) and constrain arms.</p>
+
+<h3>Exploration Safety</h3>
+
+<ul>
+  <li><strong>Allowlist / denylist</strong> — <code>LinUCBRouter.allowlist</code> and
+  <code>denylist</code> remove illegal arms before scoring.</li>
+  <li><strong>Capability ∩ bandit</strong> — intersect eligible models from Chapter 3 with bandit
+  arms on every request.</li>
+  <li><strong>Cold-start caps</strong> — <code>min_pulls_before_explore</code> forces a minimum sample
+  before trusting UCB bonuses on sensitive tenants.</li>
+  <li><strong>Shadow exploration</strong> — log what the bandit <em>would</em> have picked while the
+  serving path still uses the certified policy (Volume 12 shadow).</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Intersect bandit arms with capability eligibility on each request.</figcaption>
+<pre><code>"""LinUCB with per-request allowlist from capability routing."""
+from forge.router.models import DEFAULT_CATALOGUE
+from forge.router.features import extract_features
+from forge.router.capability import CapabilityProfile, CapabilityRouter
+from forge.router.bandit import LinUCBRouter
+
+cap = CapabilityRouter([CapabilityProfile(s) for s in DEFAULT_CATALOGUE])
+bandit = LinUCBRouter([s.name for s in DEFAULT_CATALOGUE], alpha=0.4)
+
+def safe_route(text: str, modality: str | None = None):
+    feat = extract_features(text, modality=modality)
+    elig = list(cap.route(feat).candidates) or [cap.route(feat).model]
+    bandit.allowlist = set(elig)
+    return bandit.route(feat)
+
+print(safe_route("hello"))
+print(safe_route("OCR this image", modality="image"))</code></pre>
+</figure>
+
+<pre class="output">RouteDecision(model='tiny-local', reason='linucb:0.400', candidates=('tiny-local', 'mid-open', 'frontier-api'))
+RouteDecision(model='frontier-api', reason='linucb:0.566', candidates=('frontier-api',))</pre>
+
+<p>For the image request the allowlist collapses to a singleton — exploration cannot invent a
+text-only arm. That is the correct failure mode: capability wins over curiosity.</p>
+
+<h3>Reward Shaping</h3>
+
+<p>The bandit optimises whatever reward you give it. Pure quality reward converges on the most
+expensive arm whenever it is even slightly better. Shape the reward with a price on dollars:</p>
+
+<div class="math">
+r = q - \lambda\, c_{\mathrm{usd}}
+</div>
+
+<figure class="listing">
+<figcaption>Sweep λ on a shuffled 120-request stream (<code>bandit.py</code> with a shaped
+reward).</figcaption>
+<pre><code>"""LinUCB with a cost-shaped reward r = quality - lam * cost_usd."""
+import numpy as np
+from forge.router.models import DEFAULT_CATALOGUE
+from forge.router.features import extract_features
+from forge.router.cost import estimate_request_cost
+from forge.router.bandit import LinUCBRouter
+
+price = {s.name: estimate_request_cost(s, n_in=500) for s in DEFAULT_CATALOGUE}
+quality = {
+    "chat": {"tiny-local": 0.7, "mid-open": 0.75, "frontier-api": 0.8},
+    "math": {"tiny-local": 0.2, "mid-open": 0.5, "frontier-api": 0.9},
+    "code": {"tiny-local": 0.3, "mid-open": 0.8, "frontier-api": 0.85},
+}
+texts = ["hello"] * 40 + ["prove theorem"] * 40 + ["def f():"] * 40
+order = np.random.default_rng(0).permutation(len(texts))
+
+for lam in [0.0, 0.05, 0.2]:
+    bandit = LinUCBRouter(list(price), alpha=0.6)
+    for i in order:
+        f = extract_features(texts[i])
+        arm = bandit.route(f).model
+        bandit.update(f, arm, quality[f.task][arm] - lam * price[arm])
+    picks = {t: bandit.route(extract_features(t)).model
+             for t in ["hello", "prove theorem", "def f():"]}
+    print(f"lambda={lam:&lt;4} pulls={dict(bandit.pulls)}")
+    print(f"            final picks={picks}")</code></pre>
+</figure>
+
+<pre class="output">lambda=0.0  pulls={'tiny-local': 2, 'mid-open': 36, 'frontier-api': 82}
+            final picks={'hello': 'frontier-api', 'prove theorem': 'frontier-api', 'def f():': 'frontier-api'}
+lambda=0.05 pulls={'tiny-local': 2, 'mid-open': 82, 'frontier-api': 36}
+            final picks={'hello': 'mid-open', 'prove theorem': 'frontier-api', 'def f():': 'mid-open'}
+lambda=0.2  pulls={'tiny-local': 3, 'mid-open': 116, 'frontier-api': 1}
+            final picks={'hello': 'mid-open', 'prove theorem': 'mid-open', 'def f():': 'mid-open'}</pre>
+
+<ul>
+  <li><span class="math">\lambda=0</span> reproduces the collapse: every task goes to the frontier.</li>
+  <li><span class="math">\lambda=0.05</span> is the useful regime: maths keeps the frontier (0.9
+  quality is worth $4.50 at this price), chat and code move to mid.</li>
+  <li><span class="math">\lambda=0.2</span> over-shapes: maths moves to mid and loses 0.4 quality.
+  λ is a product decision — dollars per quality point — and belongs in reviewed config.</li>
+  <li><code>tiny-local</code> is barely pulled at any λ: its chat quality (0.70) is below mid's
+  (0.75) and it is free either way. The bandit is right; if you want chat on tiny, that is a latency
+  or capacity objective, not a quality one, and must appear in the reward or the feasible set.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  X[Request features x] --> G["Capability gate and allowlist"]
+  G --> S["LinUCB score: theta_a . x + alpha * width"]
+  S --> P[Serve chosen arm]
+  P --> O["Observe outcome: thumbs, tests, escalation"]
+  O --> RW["Shaped reward r = q - lambda * cost"]
+  RW --> U["Update A_a and b_a"]
+  U --> S
+  P --> LG[Decision log]
+  LG --> OR["Offline replay and regret"]
+  OR -->|"tune alpha, lambda; promote or roll back"| G
+</pre>
+<figcaption>The bandit feedback loop. The inner loop updates arm statistics per request; the outer
+loop, through logs and replay, changes the safety envelope and reward price.</figcaption>
+</figure>
+
+<h3>Real Products: Learning from Implicit Feedback</h3>
+
+<ul>
+  <li><span class="evidence documented">Documented</span> OpenAI states that the GPT-5 router in
+  ChatGPT is continuously trained on real signals, including when users switch models, preference
+  rates for responses and measured correctness (OpenAI, <em>Introducing GPT-5</em>, 2025).</li>
+  <li><span class="evidence inferred">Inferred</span> These are the same reward sources as this
+  chapter — explicit preference, correction by switching, and graded correctness — and carry the same
+  risks: users who switch models are not a random sample, and a router trained on its own traffic
+  sees only outcomes for arms it chose. Whether OpenAI uses a bandit, periodic supervised retraining
+  or something else is not public.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Failure Mode</span>
+  <p>Optimising only task reward makes the bandit converge to the most expensive arm whenever that
+  arm is slightly better. Put dollars in the reward or in the feasible set, and document the λ sweep
+  in release notes rather than leaving it as a magic number in a pull request.</p>
+</aside>
+
+<div class="frame exercise"><p>Add a latency term to the reward
+(<span class="math">r = q - \lambda c - \mu \ell</span>) and find a (λ, μ) pair that sends chat to
+<code>tiny-local</code> while maths stays on the frontier. Report pulls and cumulative regret after
+120 steps, and compare against the capability-intersected bandit.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 11 -->
+<section class="chapter">
+<h2 id="decision-systems">Decision Systems Beyond Models</h2>
+<p class="chapter-lede">Sometimes the right model decision is not to answer. Selective prediction,
+abstention and human escalation turn the router into a decision system: maximise expected utility
+under the cost of being wrong, silent or escalating.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>A support bot is 70% confident about a refund eligibility answer. Wrong answers create chargebacks;
+  abstaining creates tickets; escalating costs agent time. “Always call the LLM” is not a policy —
+  it is an abdication of the utility function.</p>
+</div>
+
+<h3>Utility Framing</h3>
+
+<div class="math">
+U_{\mathrm{answer}}(p) = u_+ p - u_-(1-p) - c_{\mathrm{model}},\quad
+U_{\mathrm{abstain}} = u_0,\quad
+U_{\mathrm{escalate}} = u_h - c_h
+</div>
+
+<p>Geifman &amp; El-Yaniv (2017) selective classification is the ML ancestor: answer only when
+confidence clears a coverage constraint. Here we compare three actions explicitly.</p>
+
+<figure class="listing">
+<figcaption>Answer, abstain or escalate by expected utility (<code>decision.py</code>).</figcaption>
+<pre><code>"""Selective prediction with abstention and human escalation."""
+from forge.router.decision import AbstainPolicy, decide
+
+pol = AbstainPolicy()  # u_correct=1, u_wrong=2, escalate_utility=0.85, escalate_cost=0.3
+for p in [0.95, 0.70, 0.50, 0.30]:
+    o = decide(p, pol)
+    print(f"p={p:.2f} -&gt; {o.action.value:8s} U={o.utility:.3f}")
+
+print("no_escalate:")
+for p in [0.95, 0.70, 0.50, 0.30]:
+    o = decide(p, pol, allow_escalate=False)
+    print(f"p={p:.2f} -&gt; {o.action.value:8s} U={o.utility:.3f}")</code></pre>
+</figure>
+
+<pre class="output">p=0.95 -&gt; answer   U=0.850
+p=0.70 -&gt; escalate U=0.550
+p=0.50 -&gt; escalate U=0.550
+p=0.30 -&gt; escalate U=0.550
+no_escalate:
+p=0.95 -&gt; answer   U=0.850
+p=0.70 -&gt; answer   U=0.100
+p=0.50 -&gt; abstain  U=0.000
+p=0.30 -&gt; abstain  U=0.000</pre>
+
+<p>With human escalation available, medium confidence prefers a person (<span class="math">U=0.55</span>)
+over answering at <span class="math">p=0.7</span> (<span class="math">U=0.1</span>) because wrongs are
+costly (<span class="math">u_-=2</span>). Without escalation, the policy abstains below the
+<code>min_confidence</code> floor instead of guessing.</p>
+
+<table>
+  <caption>Decision actions beyond “pick a model”.</caption>
+  <thead><tr><th>Action</th><th>When</th><th>Systems consequence</th></tr></thead>
+  <tbody>
+    <tr><td>Answer</td><td>High calibrated confidence</td><td>Normal route / cascade path</td></tr>
+    <tr><td>Abstain</td><td>Low confidence, no human path</td><td>Return structured “cannot answer”</td></tr>
+    <tr><td>Escalate</td><td>Mid confidence, high stakes</td><td>Ticket / Volume 16 approval gate</td></tr>
+    <tr><td>Degrade</td><td>Providers down</td><td>Chapter 8 cached mode</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Routing chooses <em>which</em> model; decision systems also choose <em>whether</em> to act.</li>
+    <li>Utility parameters are product choices. Encode them in config next to the policy table, and
+    review them when chargeback or CSAT moves.</li>
+  </ul>
+</aside>
+
+<h3>Real Products: Support-Bot Escalation</h3>
+
+<ul>
+  <li><span class="evidence documented">Documented</span> Klarna reported that its OpenAI-powered
+  customer-service assistant handled 2.3 million conversations — two-thirds of its customer-service
+  chats — in its first month, with resolution time falling from 11 minutes to under 2 (Klarna press
+  release, 27 February 2024).</li>
+  <li><span class="evidence documented">Documented</span> In 2025 Klarna publicly said it was again
+  recruiting human customer-service agents after its AI-first push (reported by CX Dive and others,
+  May 2025).</li>
+  <li><span class="evidence inferred">Inferred</span> Read through this chapter, that is a change in
+  the utility parameters rather than in the model: when the perceived cost of a wrong or frustrating
+  automated answer (<span class="math">u_-</span>) rises relative to handle cost
+  (<span class="math">c_h</span>), the escalate region widens. Klarna's actual escalation logic is
+  not public.</li>
+  <li><span class="evidence inferred">Inferred</span> Support platforms that advertise AI agents with
+  human hand-off implement some version of answer / clarify / escalate. The load-bearing design
+  choices are the confidence signal, the thresholds and whether the hand-off carries the
+  conversation state so the human does not start from zero.</li>
+</ul>
+
+<h3>Composing the Full Pipeline</h3>
+
+<p>Every chapter so far contributed one stage. Composed, the router is a decision pipeline in which
+hard gates run before soft scores and the final action is chosen by utility, not by the model.</p>
+
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  R[Request] --> F[Extract features]
+  F --> C{"Capability gate"}
+  C -->|"no eligible model"| X["Reject: unsupported request"]
+  C --> B{"Budget and SLO feasible?"}
+  B -->|"empty set"| DG["Degraded: cheapest eligible, reason logged"]
+  B --> P["Policy: rules, learned or bandit"]
+  P --> M["Call model through breaker chain"]
+  M --> K[Estimate confidence]
+  K --> U{"Expected utility"}
+  U -->|answer| A[Return answer]
+  U -->|escalate| H[Human queue]
+  U -->|abstain| N["Structured cannot-answer"]
+  A --> L[Decision log]
+  H --> L
+  N --> L
+</pre>
+<figcaption>The <code>forge.router</code> decision pipeline. Soft scores rank only survivors of the
+capability and budget gates; every terminal action writes a decision log record.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption>Reference composition used in the practical project.</figcaption>
+<pre><code>"""Compose capability → budget → classifier → confidence → decide."""
+from forge.router.models import DEFAULT_CATALOGUE, CostLatencyModel
+from forge.router.features import extract_features
+from forge.router.capability import CapabilityProfile, CapabilityRouter
+from forge.router.cost import Budget, CostLatencyRouter
+from forge.router.learned import ClassifierRouter
+from forge.router.confidence import estimate_confidence
+from forge.router.decision import AbstainPolicy, decide
+
+cap = CapabilityRouter([CapabilityProfile(s) for s in DEFAULT_CATALOGUE])
+cost = CostLatencyRouter(list(DEFAULT_CATALOGUE), Budget(max_cost_usd=1.0, prefer="quality"))
+clf = ClassifierRouter.fit_demo()
+policy = AbstainPolicy(min_confidence=0.55)
+
+def handle(text: str, samples: list[str] | None = None):
+    feat = extract_features(text)
+    eligible = set(cap.route(feat).candidates) or {cap.route(feat).model}
+    # intersect classifier pick with capability and budget feasibles
+    pick = clf.route(feat).model
+    feas = {s.name for s, _, _ in cost.feasible(feat)}
+    if pick not in eligible &amp; feas:
+        pick = cost.route(feat).model
+    conf = estimate_confidence(samples=samples or [text], method="self_consistency")
+    outcome = decide(conf.value, policy)
+    return pick, conf.value, outcome.action.value
+
+print(handle("def sort(xs):", samples=["ok", "ok", "ok"]))
+print(handle("prove Cauchy-Schwarz", samples=["a", "b", "c", "d"]))</code></pre>
+</figure>
+
+<pre class="output">('mid-open', 1.0, 'answer')
+('mid-open', 0.25, 'escalate')</pre>
+
+<p>Self-consistency 1.0 on identical samples answers via mid for code. The maths prompt's classifier
+pick (frontier) exceeds the $1 budget, so the budget router substitutes mid; its diverse samples
+score 0.25 and the decision layer escalates under default utilities — even though the model pick
+cleared every gate.</p>
+
+<div class="frame exercise"><p>Fit <span class="math">(u_+, u_-, c_h)</span> from last quarter’s
+chargeback rate and mean handle time. Recompute the confidence thresholds where
+<code>decide</code> switches action. Then wire <code>handle</code> to <code>FallbackChain</code> so
+provider failures flip <code>action</code> to <code>degraded</code> without raising to the
+client.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 12 -->
+<section class="chapter">
+<h2 id="evaluating-routers">Evaluating Routers</h2>
+<p class="chapter-lede">A router without an eval is a config file with opinions. Cost–quality
+curves, area under the budget curve, cumulative regret and offline replay are how you prove that
+routing beats always-frontier and always-mid — with significance, not anecdotes.</p>
+
+<h3>The Engineering Problem</h3>
+
+<div class="frame problem">
+  <p>The classifier routes 40% of traffic to <code>tiny-local</code>. Finance celebrates. Quality on
+  the golden set drops two points and nobody can say whether the router, the model update or the
+  traffic mix caused it. You need counterfactual-aware offline metrics and an online holdout.</p>
+</div>
+
+<h3>Cost–Quality Curves and AUC over Budgets</h3>
+
+<p>For each policy <span class="math">\pi</span> (always-<span class="math">m</span>, rules,
+cascade, learned), plot mean cost against mean quality on a fixed eval mix. The cascade should
+dominate the line segments between always-route points. Integrating quality over a cost budget axis
+gives a single scalar akin to AUC — useful for RouterBench-style comparisons (Hu et al., 2024).</p>
+
+<figure class="listing">
+<figcaption>Always-route Pareto points and offline replay summary
+(<code>evaluate.py</code>).</figcaption>
+<pre><code>"""Cost–quality frontier and a logged-policy replay sketch."""
+from forge.router.models import DEFAULT_CATALOGUE
+from forge.router.cost import estimate_request_cost
+from forge.router.evaluate import (
+    LoggedRequest, OfflineReplay, cost_quality_curve,
+)
+from forge.router.features import extract_features
+
+costs = {s.name: estimate_request_cost(s, 500) for s in DEFAULT_CATALOGUE}
+quals = {s.name: s.quality for s in DEFAULT_CATALOGUE}
+print("always-route frontier:")
+for c, q, m in cost_quality_curve(list(costs), costs, quals):
+    print(f"  {m:13s} cost={c:.3f} quality={q:.2f}")
+
+# Toy log: what a rule router did last week
+log = [
+    LoggedRequest("hello", "tiny-local", 1.0, 0.0),
+    LoggedRequest("def f():", "mid-open", 1.0, 0.12),
+    LoggedRequest("prove it", "frontier-api", 1.0, 1.8),
+    LoggedRequest("hi again", "tiny-local", 0.0, 0.0),
+]
+catalogue = {s.name: s for s in DEFAULT_CATALOGUE}
+replay = OfflineReplay(catalogue)
+# Counterfactual: force everything through mid
+summary = replay.summarise(log, ["mid-open"] * len(log))
+print(f"replay always-mid: mean_cost={summary['mean_cost']:.4f} "
+      f"mean_quality={summary['mean_quality']:.3f} (no oracle — IPS-naive)")</code></pre>
+</figure>
+
+<pre class="output">always-route frontier:
+  tiny-local    cost=0.000 quality=0.62
+  mid-open      cost=0.195 quality=0.78
+  frontier-api  cost=4.500 quality=0.92
+replay always-mid: mean_cost=0.1203 mean_quality=0.250 (no oracle — IPS-naive)</pre>
+
+<p>Without an oracle or inverse-propensity scoring, replaying a different model on logged data underestimates
+quality whenever the log’s chosen model differs from the candidate — the 0.25 figure is a warning,
+not a mid-tier score. Collect oracle labels on a sample, or run a shadow parallel call, before you
+trust counterfactual curves.</p>
+
+<h3>Regret and Online Gates</h3>
+
+<ul>
+  <li><strong>Cumulative regret</strong> — <span class="math">\sum_t (r^\star_t - r_t)</span>
+  against the best arm in hindsight or an oracle model (Chapter 10).</li>
+  <li><strong>Online A/B</strong> — sticky assignment by session; primary metric task success;
+  guardrails on p95 latency and $/request.</li>
+  <li><strong>Slice metrics</strong> — report curves per task class; a router can win on average and
+  fail on vision.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Publish the always-route frontier every release. A new router that does not beat it on at
+    least one budget is not a promotion candidate.</li>
+    <li>Naive offline replay without propensity weights is exploratory only.</li>
+  </ul>
+</aside>
+
+<h3>Operating the Router in Production</h3>
+
+<div class="frame problem">
+  <p>The cascade saved 40% in a notebook. Two months later the bill is back. Nobody changed the
+  threshold file — traffic shifted toward tool-calling agents, ECE drifted, and the mid-tier model
+  was silently swapped by the provider. Evaluation that runs once is a one-off optimisation; a
+  router needs continuous telemetry and a change process.</p>
+</div>
+
+<table>
+  <caption>Minimum metrics on every routed request.</caption>
+  <thead><tr><th>Metric</th><th>Labels</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td><code>router_decision_total</code></td><td>model, reason, task, tenant</td><td>Policy debugging</td></tr>
+    <tr><td><code>router_cost_usd_sum</code></td><td>model, task</td><td>Finance and curves</td></tr>
+    <tr><td><code>router_latency_ms</code></td><td>model, stage</td><td>Cascade vs ensemble</td></tr>
+    <tr><td><code>router_confidence</code></td><td>method</td><td>Deferral health</td></tr>
+    <tr><td><code>router_degraded_total</code></td><td>reason</td><td>Breaker / budget empty</td></tr>
+    <tr><td><code>router_abstain_total</code></td><td>action</td><td>Decision systems</td></tr>
+  </tbody>
+</table>
+
+<p>Metrics tell you <em>that</em> something moved; the per-request decision log tells you
+<em>why</em>, and it is the training and replay dataset for the next router.</p>
+
+<figure class="listing">
+<figcaption>Structured decision log line (emit beside traces from Volume 16).</figcaption>
+<pre><code>"""Emit one JSON decision record per request for offline replay."""
+import json
+from dataclasses import asdict, dataclass
+
+@dataclass
+class DecisionLog:
+    request_id: str
+    task: str
+    model: str
+    reason: str
+    confidence: float | None
+    cost_usd: float
+    latency_ms: float
+    action: str  # answer | abstain | escalate | degraded
+
+def emit(log: DecisionLog) -&gt; str:
+    line = json.dumps(asdict(log), sort_keys=True)
+    print(line)
+    return line
+
+emit(DecisionLog(
+    request_id="req-1", task="code", model="mid-open", reason="clf_p=0.652",
+    confidence=0.81, cost_usd=0.12, latency_ms=420, action="answer",
+))</code></pre>
+</figure>
+
+<pre class="output">{"action": "answer", "confidence": 0.81, "cost_usd": 0.12, "latency_ms": 420, "model": "mid-open", "reason": "clf_p=0.652", "request_id": "req-1", "task": "code"}</pre>
+
+<p class="facet">Change management</p>
+<ul>
+  <li><strong>Policy as data.</strong> Tables, τ, λ, utilities and allowlists live in versioned
+  config with review, not only in Python.</li>
+  <li><strong>Shadow then canary.</strong> Log disagreements for 24–72&nbsp;h; canary 5% sticky by
+  session; auto-rollback on quality or cost guardrails (Volume 12).</li>
+  <li><strong>Model card sync.</strong> When a provider changes context limits or modalities, update
+  <code>ModelSpec</code> in the same change as the traffic shift.</li>
+  <li><strong>Weekly ECE job.</strong> Fail the release train if deferral ECE doubles.</li>
+  <li><strong>Log propensities.</strong> Record the probability with which the serving policy chose
+  each arm; without it, later inverse-propensity replay is impossible.</li>
+</ul>
+
+<h3>Worked Evaluation: The Cost-Optimal Assistant</h3>
+
+<p>Stakeholders will not accept “the cascade looks good in a notebook”. They want a frontier plot,
+a significance test on the saving, a degraded-mode drill and a one-page decision. Build that packet
+once on stubs so its <em>shape</em> is tested in CI; production logs fill in the numbers later.</p>
+
+<p class="facet">Step 1 — oracle matrix and always-route baselines</p>
+
+<figure class="listing">
+<figcaption>Oracle success for three tiers on a 24-prompt mix.</figcaption>
+<pre><code>"""Build an oracle matrix and always-route baselines."""
+import numpy as np
+from forge.router.models import TINY, MID, FRONTIER, CostLatencyModel, DEFAULT_CATALOGUE
+from forge.router.cost import estimate_request_cost
+from forge.router.evaluate import cost_quality_curve
+
+easy = [f"easy-{i}" for i in range(12)]
+hard = [f"hard-{i}" for i in range(12)]
+prompts = easy + hard
+solves = {"tiny-local": easy, "mid-open": easy + hard[:6], "frontier-api": prompts}
+specs = {"tiny-local": TINY, "mid-open": MID, "frontier-api": FRONTIER}
+oracle_models = {
+    n: CostLatencyModel(specs[n], success_on=frozenset(solves[n]), fail_rate=1.0)
+    for n in specs
+}
+
+qualities, costs = {}, {}
+for name, m in oracle_models.items():
+    outs = [m.complete(p) for p in prompts]
+    qualities[name] = float(np.mean([o["ok"] for o in outs]))
+    costs[name] = float(np.mean([o["cost_usd"] for o in outs]))
+    print(f"{name:13s} quality={qualities[name]:.3f} mean_cost={costs[name]:.4f}")
+
+print("frontier:")
+for c, q, m in cost_quality_curve(list(costs), costs, qualities):
+    print(f"  {m:13s} cost={c:.4f} quality={q:.3f}")</code></pre>
+</figure>
+
+<pre class="output">tiny-local    quality=0.500 mean_cost=0.0000
+mid-open      quality=0.750 mean_cost=0.0780
+frontier-api  quality=1.000 mean_cost=1.8000
+frontier:
+  tiny-local    cost=0.0000 quality=0.500
+  mid-open      cost=0.0780 quality=0.750
+  frontier-api  cost=1.8000 quality=1.000</pre>
+
+<p class="facet">Step 2 — policies under comparison, with a paired bootstrap on the saving</p>
+
+<figure class="listing">
+<figcaption>Always-mid, three-line rules, cost preference and the tuned cascade on the same oracle
+mix.</figcaption>
+<pre><code>"""Compare four policies on one oracle mix, with bootstrap CIs on cost."""
+import numpy as np
+from forge.router.features import extract_features
+from forge.router.rules import three_line_router
+from forge.router.cascade import Cascade, optimise_threshold
+from forge.router.cost import Budget, CostLatencyRouter
+from forge.router.models import TINY, MID, FRONTIER, CostLatencyModel, DEFAULT_CATALOGUE
+
+easy = [f"easy-{i}" for i in range(12)]
+hard = [f"hard-{i}" for i in range(12)]
+prompts = easy + hard
+SPECS = {"tiny-local": TINY, "mid-open": MID, "frontier-api": FRONTIER}
+SOLVES = {"tiny-local": easy, "mid-open": easy + hard[:6], "frontier-api": prompts}
+
+def stub(name):  # fresh oracle stub per tier
+    solves = frozenset(SOLVES[name])
+    return CostLatencyModel(SPECS[name], success_on=solves, fail_rate=1.0)
+
+def conf_fn(out):
+    if out["model"] == "tiny-local":
+        return 0.9 if out["ok"] else 0.2
+    if out["model"] == "mid-open":
+        return 0.85 if out["ok"] else 0.35
+    return 0.95
+
+tiers = lambda: [stub(n) for n in SPECS]
+tau, _ = optimise_threshold(prompts, tiers(), conf_fn)
+cascade = Cascade(tiers(), conf_fn, threshold=tau)
+cost_router = CostLatencyRouter(list(DEFAULT_CATALOGUE), Budget(prefer="cost"))
+
+def by_name(name):
+    return lambda p: stub(name).complete(p)
+
+def run_cascade(p):
+    r = cascade.run(p)
+    return {"cost_usd": r.cost_usd, "ok": r.ok}
+
+policies = {
+    "always_mid": by_name("mid-open"),
+    "three_line": lambda p: stub(three_line_router(extract_features(p))).complete(p),
+    "cost_pref": lambda p: stub(cost_router.route(extract_features(p)).model)
+    .complete(p),
+    "cascade": run_cascade,
+}
+rng = np.random.default_rng(0)
+per_prompt = {}
+for name, run in policies.items():
+    outs = [run(p) for p in prompts]
+    cost = np.array([o["cost_usd"] for o in outs])
+    per_prompt[name] = cost
+    print(f"{name:11s} quality={np.mean([o['ok'] for o in outs]):.3f} "
+          f"mean_cost={cost.mean():.4f}")
+
+# paired bootstrap on the saving of cascade versus always-mid
+diff = per_prompt["always_mid"] - per_prompt["cascade"]
+boots = [diff[rng.integers(0, len(diff), len(diff))].mean() for _ in range(2000)]
+lo, hi = np.percentile(boots, [2.5, 97.5])
+print(f"tau*={tau:.2f}  saving vs mid={diff.mean():.4f} 95% CI=[{lo:.4f}, {hi:.4f}]")</code></pre>
+</figure>
+
+<pre class="output">always_mid  quality=0.750 mean_cost=0.0780
+three_line  quality=0.500 mean_cost=0.0000
+cost_pref   quality=0.500 mean_cost=0.0000
+cascade     quality=0.750 mean_cost=0.0390
+tau*=0.25  saving vs mid=0.0390 95% CI=[0.0228, 0.0553]</pre>
+
+<ul>
+  <li>Every synthetic prompt string is labelled <code>chat</code> by the feature extractor, so
+  <code>three_line</code> and <code>cost_pref</code> collapse to tiny and lose a quarter of quality.
+  That is intentional: a cost-only objective on weak features buys savings by failing the hard
+  slice.</li>
+  <li>The cascade matches mid quality at half mid's spend, and the paired bootstrap interval on the
+  per-prompt saving excludes zero. Pairing matters: both policies see the same prompts, so the
+  variance of the difference is far smaller than that of either mean.</li>
+  <li>On 24 prompts the interval is still wide. The practical project repeats this on 200 prompts and
+  reports the interval for quality as well as cost.</li>
+</ul>
+
+<p class="facet">Step 3 — the promotion packet</p>
+
+<table>
+  <caption>One-page contents for the cost-optimal assistant launch review.</caption>
+  <thead><tr><th>Section</th><th>Evidence</th></tr></thead>
+  <tbody>
+    <tr><td>Frontier plot</td><td>Always-route points + candidate policy point with CI</td></tr>
+    <tr><td>Slice table</td><td>Quality and cost for easy vs hard prompts, per task class</td></tr>
+    <tr><td>Deferral health</td><td>ECE, τ, escalation rate, held-out week used for tuning</td></tr>
+    <tr><td>Resilience drill</td><td>Breaker open → degraded rate under load test (Chapter 8)</td></tr>
+    <tr><td>Decision</td><td>Ship / iterate / reject with a named owner</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Stubs make the packet’s shape testable in CI; production fills the numbers.</li>
+    <li>Reject a policy that beats cost only by missing the hard slice.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Build an oracle matrix for 50 prompts × 3 models using
+<code>CostLatencyModel</code>. Compare rule, cascade and LinUCB policies on cost–quality and
+regret, with paired bootstrap intervals on both cost and quality. Promote only if the cascade
+dominates mid on cost at equal quality and the cost interval excludes zero.</p></div>
+</section>
+
+<section class="review">
+<h1>Review and Next Steps</h1>
+
+<h2>What You Learned</h2>
+<ul>
+  <li>No single model owns the quality–cost–latency frontier. Routing, cascading and ensembling are
+  different control flows over the same catalogue (Chapter 1).</li>
+  <li>Rule routers need explicit features, policy tables and logged reasons; keyword miss and silent
+  defaults are the main failure modes (Chapter 2).</li>
+  <li>Capability profiles are hard gates on modality, context and tools before any soft score
+  (Chapter 3).</li>
+  <li>Budgets define a feasible set; preference among survivors is a separate objective; queues belong
+  in latency predictions (Chapter 4).</li>
+  <li>Learned routers (classifiers, preference / MF scores) need preference or correctness labels and
+  still sit behind gates (Chapter 5).</li>
+  <li>Confidence for deferral must be calibrated: logprob, self-consistency, semantic entropy,
+  verbalised scores, ECE and conformal thresholds (Chapter 6).</li>
+  <li>Cascades minimise expected cost subject to a quality floor by searching deferral thresholds
+  (Chapter 7).</li>
+  <li>Fallbacks use per-provider breakers and an explicit degraded mode (Chapter 8).</li>
+  <li>Ensembles (vote, RRF, MoA, generate-then-rank) buy diversity at multiplied cost — compare to
+  cascades on the same budget (Chapter 9).</li>
+  <li>LinUCB adapts online; exploration safety and cost-aware rewards stop it from collapsing to
+  frontier-only (Chapter 10).</li>
+  <li>Abstention and escalation are first-class actions under a utility function (Chapter 11).</li>
+  <li>Evaluate with cost–quality curves, regret, paired bootstrap intervals and careful offline
+  replay; operate with decision logs, telemetry and versioned policy config (Chapter 12).</li>
+  <li>Real products route too: ChatGPT's GPT-5 router, RouteLLM, OpenRouter and LiteLLM failover
+  and support-bot escalation are documented at the level of behaviour; their internals are
+  inferred at best (Chapters 1, 5, 8, 10, 11).</li>
+</ul>
+
+<h3>Glossary</h3>
+<table>
+  <caption>Terms used throughout Volume 18.</caption>
+  <thead><tr><th>Term</th><th>Meaning here</th></tr></thead>
+  <tbody>
+    <tr><td>Pareto frontier</td><td>Policies not dominated on quality, cost and latency together</td></tr>
+    <tr><td>Capability profile</td><td>Hard admissibility card for a model</td></tr>
+    <tr><td>Deferral</td><td>Cascade stage declines to stop; escalates to the next model</td></tr>
+    <tr><td>Calibration / ECE</td><td>Agreement between stated confidence and empirical accuracy</td></tr>
+    <tr><td>Semantic entropy</td><td>Uncertainty over meaning clusters, not string surface forms</td></tr>
+    <tr><td>Conformal threshold</td><td>Score cutoff with finite-sample coverage under exchangeability</td></tr>
+    <tr><td>Mixture-of-Agents</td><td>Layered propose-and-aggregate ensemble</td></tr>
+    <tr><td>Contextual bandit</td><td>Online arm selection given request features and partial feedback</td></tr>
+    <tr><td>Selective prediction</td><td>Answer only on a high-confidence subset; else abstain/escalate</td></tr>
+    <tr><td>Offline replay</td><td>Score a new policy on logged traffic (needs care with counterfactuals)</td></tr>
+  </tbody>
+</table>
+
+<p class="facet">How this volume connects</p>
+<ul>
+  <li>Volume 10 supplies evaluation vocabulary: calibration, slices, significance.</li>
+  <li>Volume 12 supplies breakers, SLOs and token economics at the endpoint.</li>
+  <li>Volume 13 shapes the prompts whose features the router consumes.</li>
+  <li>Volume 16’s harness owns human escalation once <code>decide</code> chooses it.</li>
+  <li>Volume 17’s guardrails still wrap content after a model is chosen.</li>
+</ul>
+
+<h2>What You Built</h2>
+<ul>
+  <li><code>forge.router.models</code> — <code>ModelSpec</code>, <code>ScriptedModel</code>,
+  <code>CostLatencyModel</code>, three reference tiers.</li>
+  <li><code>forge.router.features</code> — token estimate, task classification, <code>RequestFeatures</code>.</li>
+  <li><code>forge.router.rules</code> — three-line router, policy tables, <code>RouteDecision</code>.</li>
+  <li><code>forge.router.capability</code> — profiles and max-quality among eligible models.</li>
+  <li><code>forge.router.cost</code> — budgets, SLO selection, queue-aware latency.</li>
+  <li><code>forge.router.learned</code> — classifier router and preference matrix.</li>
+  <li><code>forge.router.confidence</code> — logprob, consistency, semantic entropy, ECE, conformal.</li>
+  <li><code>forge.router.cascade</code> — sequential escalation and threshold optimisation.</li>
+  <li><code>forge.router.fallback</code> — circuit breakers and degraded fallback chains.</li>
+  <li><code>forge.router.ensemble</code> — majority vote, RRF, MoA-style aggregation.</li>
+  <li><code>forge.router.bandit</code> — LinUCB with allow/deny exploration safety.</li>
+  <li><code>forge.router.decision</code> — abstain / escalate utility policy.</li>
+  <li><code>forge.router.evaluate</code> — cost–quality curves, regret, offline replay.</li>
+</ul>
+
+<h3>Reading Order for the Code</h3>
+<ol>
+  <li><code>models.py</code> and <code>features.py</code> — the shared vocabulary.</li>
+  <li><code>rules.py</code> → <code>capability.py</code> → <code>cost.py</code> — hard then soft.</li>
+  <li><code>learned.py</code> and <code>confidence.py</code> — scores.</li>
+  <li><code>cascade.py</code>, <code>fallback.py</code>, <code>ensemble.py</code> — multi-call control.</li>
+  <li><code>bandit.py</code>, <code>decision.py</code>, <code>evaluate.py</code> — online and offline loops.</li>
+  <li><code>tests/test_router.py</code> — the invariants CI must keep green.</li>
+</ol>
+
+<h2>Important Code</h2>
+<table>
+  <caption>Listings that seed <code>src/forge/router/</code>.</caption>
+  <thead><tr><th>Piece</th><th>Path</th><th>Invariant</th></tr></thead>
+  <tbody>
+    <tr><td>Feature extract</td><td><code>features.py</code></td><td>Same object consumed by every router.</td></tr>
+    <tr><td>Policy table</td><td><code>rules.py</code></td><td>First match wins; default is explicit.</td></tr>
+    <tr><td>Capability gate</td><td><code>capability.py</code></td><td>Ineligible models never win.</td></tr>
+    <tr><td>SLO filter</td><td><code>cost.py</code></td><td>Infeasible ⇒ degraded reason, not silent frontier.</td></tr>
+    <tr><td>Cascade τ*</td><td><code>cascade.py</code></td><td>Quality floor respected on the search set.</td></tr>
+    <tr><td>Breaker</td><td><code>fallback.py</code></td><td>Open provider is skipped.</td></tr>
+    <tr><td>LinUCB update</td><td><code>bandit.py</code></td><td>Denied arms are never scored.</td></tr>
+    <tr><td>Decide</td><td><code>decision.py</code></td><td>Below min confidence never answers.</td></tr>
+  </tbody>
+</table>
+
+<h2>Important Architecture</h2>
+<figure class="diagram">
+  <div class="arch">
+    <div class="arch-layer" data-label="Edge">
+      <div class="node client">Chat UI · API clients</div>
+      <div class="node gateway">API gateway<small>auth · tenant budget · modality</small></div>
+    </div>
+    <div class="arch-layer" data-label="Router">
+      <div class="node service">Feature extractor</div>
+      <div class="node guard">Capability + SLO gates</div>
+      <div class="node service">Policy<small>rules · learned · LinUCB</small></div>
+      <div class="node service">Cascade + confidence</div>
+      <div class="node guard">Decide<small>answer · abstain · escalate</small></div>
+    </div>
+    <div class="arch-layer" data-label="Resilience">
+      <div class="node service">Breaker chain<small>one breaker per provider</small></div>
+      <div class="node store">Degraded cache</div>
+      <div class="node queue">Human escalation queue</div>
+    </div>
+    <div class="arch-layer" data-label="Models">
+      <div class="node model">tiny-local</div>
+      <div class="node gpu">mid-open<small>self-hosted vLLM</small></div>
+      <div class="node external">frontier-api<small>hosted, multi-provider</small></div>
+    </div>
+    <div class="arch-layer" data-label="Data · Ops">
+      <div class="node store">Decision log</div>
+      <div class="node obs">Metrics · traces</div>
+      <div class="node eval">Replay · regret · ECE jobs</div>
+      <div class="node store">Versioned policy config<small>tables · τ · λ · utilities</small></div>
+    </div>
+  </div>
+  <figcaption>HLD of <code>forge.router</code> as a service. Gates sit before soft scores; the breaker
+  chain sits between the router and every model; the decision log feeds offline evaluation, which
+  changes only versioned config.</figcaption>
+</figure>
+
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  REQ[Request] --> GATE["Features, capability and budget gates"]
+  GATE --> POL["Policy picks model or cascade"]
+  POL --> BRK["Breaker chain calls provider"]
+  BRK --> CONF["Confidence and utility decide action"]
+  CONF --> OUT["Answer, abstain, escalate or degraded"]
+  OUT --> LOG[Decision log]
+  LOG --> EVAL["Offline replay, curves, regret, ECE"]
+  EVAL --> CFG["Versioned policy config"]
+  CFG --> GATE
+  CFG --> POL
+</pre>
+<figcaption>Online path (top) and the offline loop that changes it. No evaluation result reaches
+serving except through reviewed config.</figcaption>
+</figure>
+
+<aside class="callout core"><span class="title">Volume Contract</span>
+  <ul>
+    <li>Every router returns a <code>RouteDecision</code> with a reason string suitable for metrics.</li>
+    <li>Capability and breakers are non-bypassable. Soft scores may only rank survivors.</li>
+    <li>Printed listing outputs in this volume come from <code>forge.router</code> stubs executed on
+    the authoring machine; they are not provider benchmarks.</li>
+    <li>Prices and latencies on the three tiers are illustrative teaching constants.</li>
+  </ul>
+</aside>
+
+<p>If you remember one control loop: extract features, apply hard gates, choose among feasible models,
+estimate confidence, decide whether to answer, and log everything for the next evaluation cycle.</p>
+
+<h2>Failure Modes</h2>
+<table>
+  <caption>Routing failures mapped to chapters and first fixes — use in design reviews and
+  incident retros.</caption>
+  <thead><tr><th>Symptom</th><th>Likely cause</th><th>Chapter</th><th>First fix</th></tr></thead>
+  <tbody>
+    <tr><td>Bill approaches always-frontier</td><td>τ too high / bandit λ≈0</td><td>7, 10</td><td>Retune τ on held-out data; shape reward</td></tr>
+    <tr><td>Quality cliff on one task</td><td>Mislabelled task / stale table</td><td>2, 3</td><td>Slice metrics; golden routes</td></tr>
+    <tr><td>400s on images or long prompts</td><td>No modality or context gate</td><td>3</td><td>Capability profile</td></tr>
+    <tr><td>Timeouts under load</td><td>Queue ignored in latency prediction</td><td>4</td><td><code>QueueState</code></td></tr>
+    <tr><td>Confident wrong answers</td><td>Poor calibration (high ECE)</td><td>6</td><td>Recalibrate; change signal</td></tr>
+    <tr><td>Quality floor missed after cascade launch</td><td>τ too low, or tuned on test set</td><td>7</td><td>Held-out week; dual-constraint sweep</td></tr>
+    <tr><td>Retry storms</td><td>No per-provider breaker</td><td>8</td><td><code>FallbackChain</code></td></tr>
+    <tr><td>Latency ×3, quality +1%</td><td>Ensemble on easy traffic</td><td>9</td><td>Cascade first</td></tr>
+    <tr><td>Random model on a VIP tenant</td><td>Unchecked exploration</td><td>10</td><td>Allowlist / shadow</td></tr>
+    <tr><td>Chargebacks or angry escalations</td><td>No abstain/escalate path</td><td>11</td><td>Utility policy</td></tr>
+    <tr><td>Offline win, online loss</td><td>Naive replay</td><td>12</td><td>Oracle labels / IPS / A/B</td></tr>
+  </tbody>
+</table>
+
+<ul class="failure-modes">
+  <li>Hard-coding a model name in every service instead of a router with logged reasons.</li>
+  <li>Treating cascades, ensembles and routers as interchangeable in design docs.</li>
+  <li>One global breaker for all providers, or no degraded-mode contract in the API.</li>
+  <li>Confusing same-model provider failover with cross-model fallback, and shipping a quality drop
+  as an availability fix.</li>
+  <li>Training an adaptive router on its own traffic without logging propensities, so replay cannot
+  correct for what it never tried.</li>
+  <li>Copying a vendor's or product's published savings figure as if it held on your workload.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<ul>
+  <li>Unit-test capability exclusions, breaker skips, abstention below <code>min_confidence</code>, and
+  cascade quality floors on stub models.</li>
+  <li>Publish always-route cost–quality frontiers on every router change.</li>
+  <li>Track ECE for the deferral signal weekly; page if it doubles.</li>
+  <li>Online: sticky A/B with guardrails on $/request and p95; slice by task.</li>
+  <li>Report savings with paired bootstrap intervals, not point estimates (Chapter 12).</li>
+  <li>Game-day the fallback chain each quarter and walk the Chapter 8 runbook against the result;
+  measure degraded rate and answered-set quality during the drill.</li>
+</ul>
+
+<h2>Practical Project</h2>
+<div class="frame exercise" data-title="Cost-optimal assistant">
+  <p>Route a mixed workload across the three Forge tiers to hit a quality target at minimum cost.</p>
+  <ol>
+    <li>Build a 200-prompt mix (chat, code, maths) with oracle correctness from
+    <code>CostLatencyModel</code> success sets.</li>
+    <li>Implement rule, capability+cost, cascade and LinUCB policies behind one
+    <code>route(features) -&gt; Decision</code> API.</li>
+    <li>Plot cost–quality curves; prove the cascade dominates the mid–frontier segment on expected
+    cost at equal quality, with a bootstrap confidence interval.</li>
+    <li>Add breakers and an abstain path for confidence below 0.4; show degraded and escalated rates
+    under an injected provider outage.</li>
+  </ol>
+</div>
+
+<h3>What Success Looks Like</h3>
+<ul>
+  <li>A mixed workload meets a documented quality floor at materially lower mean cost than
+  always-frontier, with confidence intervals that do not include zero saving.</li>
+  <li>Hard gates never ship an image to a text-only model, even when a bandit or classifier asks.</li>
+  <li>Provider outages open breakers and enter a named degraded mode instead of retry storms.</li>
+  <li>Low-confidence, high-stakes queries abstain or escalate rather than bluff.</li>
+  <li>Decision logs replay into next week’s router training without hand-copied spreadsheets.</li>
+</ul>
+
+<p>That is the bar for the cost-optimal assistant project and for every later product volume that
+imports <code>forge.router</code>.</p>
+
+<p class="facet">Continuous project checkpoint</p>
+<ul>
+  <li>Import <code>forge.router</code> from application code; do not copy three-line routers into services.</li>
+  <li>Keep <code>tests/test_router.py</code> green on every table or τ change.</li>
+  <li>Export decision logs in the same shape Volume 21 will reuse for product unit economics.</li>
+  <li>When Volume 19 adds multimodal endpoints, extend <code>ModelSpec.modalities</code> before traffic.</li>
+</ul>
+
+<h2>Exercises</h2>
+<ol>
+  <li>Extend the policy table with tenant overrides without changing <code>three_line_router</code>.</li>
+  <li>Add image modality to mid-tier and show capability eligibility change.</li>
+  <li>Put queue depth into a Prometheus gauge and feed <code>QueueState</code> from it.</li>
+  <li>Fit a real logistic router on RouterBench-style labels; compare to the hand-fit demo.</li>
+  <li>Swap bag-of-words semantic clustering for embedding cosine; re-measure ECE.</li>
+  <li>Derive <span class="math">\mathbb{E}[\mathrm{cost}]</span> for a four-stage cascade and verify
+  with Monte Carlo.</li>
+  <li>Implement half-open breaker probes with a fake clock.</li>
+  <li>Compare MoA aggregator quality to majority vote at equal total token budget.</li>
+  <li>Train LinUCB with <span class="math">r - \lambda c</span>; sweep <span class="math">\lambda</span>.</li>
+  <li>Calibrate abstain utilities from historic chargeback costs.</li>
+</ol>
+
+<h2>Research Papers</h2>
+<table>
+  <caption>Papers this volume depends on. Numbers in listings are Forge stubs, not paper reproductions.</caption>
+  <thead><tr><th>Source</th><th>Why it is here</th></tr></thead>
+  <tbody>
+    <tr><td>Viola &amp; Jones, 2001. Rapid object detection using a boosted cascade.</td><td>Cascade control flow (Chapter 7).</td></tr>
+    <tr><td>Dietterich, 2000. Ensemble methods in machine learning.</td><td>Diversity and when ensembles help (Chapter 9).</td></tr>
+    <tr><td>Geifman &amp; El-Yaniv, 2017. Selective classification for deep neural networks.</td><td>Abstention / selective prediction (Chapter 11).</td></tr>
+    <tr><td>Guo et al., 2017. On calibration of modern neural networks.</td><td>ECE (Chapter 6).</td></tr>
+    <tr><td>Angelopoulos &amp; Bates, 2021. A gentle introduction to conformal prediction.</td><td>Deferral thresholds with coverage (Chapter 6).</td></tr>
+    <tr><td>Li et al., 2010. A contextual-bandit approach to personalized news article recommendation (LinUCB).</td><td>Chapter 10.</td></tr>
+    <tr><td>Kadavath et al., 2022. Language models (mostly) know what they know.</td><td>Verbalised confidence (Chapter 6).</td></tr>
+    <tr><td>Kuhn et al., 2023. Semantic uncertainty: linguistic invariances for uncertainty estimation.</td><td>Semantic entropy (Chapter 6).</td></tr>
+    <tr><td>Chen et al., 2023. FrugalGPT.</td><td>LLM cascades and budgeted quality (Chapter 7).</td></tr>
+    <tr><td>Jiang et al., 2023. LLM-Blender.</td><td>Generate-then-rank (Chapter 9).</td></tr>
+    <tr><td>Shnitzer et al., 2023. Large language model routing with benchmark datasets.</td><td>Benchmark-driven routing (Chapter 5).</td></tr>
+    <tr><td>Ding et al., 2024. Hybrid LLM.</td><td>Quality/cost routing (Chapters 5, 7).</td></tr>
+    <tr><td>Ong et al., 2024. RouteLLM.</td><td>Preference-trained routers (Chapter 5).</td></tr>
+    <tr><td>Hu et al., 2024. RouterBench.</td><td>Router evaluation suites (Chapter 12).</td></tr>
+    <tr><td>Wang et al., 2024. Mixture-of-Agents.</td><td>MoA ensembles (Chapter 9).</td></tr>
+  </tbody>
+</table>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance</span>
+    <span class="paper-meta">Chen et al., 2023 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>LLM quality scales with cost; always using the strongest model is unaffordable at traffic.</dd>
+    <dt>Previous limitation</dt><dd>Ad hoc model choice without a budgeted cascade framework.</dd>
+    <dt>Approach</dt><dd>Learn when to stop in a cascade of increasingly strong models under a spending budget.</dd>
+    <dt>Contribution</dt><dd>Showed large cost reductions at matched quality versus always-GPT-4 style baselines.</dd>
+    <dt>Practical impact</dt><dd>Chapter 7’s deferral threshold search and expected-cost formula.</dd>
+    <dt>Limitations</dt><dd>Needs a reliable scoring signal; distribution shift breaks the learned stop rule.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">RouteLLM: Learning to Route LLMs with Preference Data</span>
+    <span class="paper-meta">Ong et al., 2024 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Choosing between strong and weak models per query without always paying for strong.</dd>
+    <dt>Previous limitation</dt><dd>Heuristic routers and benchmark-only labels generalised poorly.</dd>
+    <dt>Approach</dt><dd>Train routers from human preference data to send easy queries to weaker models.</dd>
+    <dt>Contribution</dt><dd>Large cost reductions while preserving preference win rates on held-out battles.</dd>
+    <dt>Practical impact</dt><dd>Chapter 5’s preference / MF framing and the insistence on preference-shaped labels.</dd>
+    <dt>Limitations</dt><dd>Preference ≠ your task rubric; still needs capability and SLO gates in production.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Semantic Uncertainty: Linguistic Invariances for Uncertainty Estimation in Natural Language Generation</span>
+    <span class="paper-meta">Kuhn et al., 2023 · ICLR</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Token-level likelihoods miss that many strings share one meaning.</dd>
+    <dt>Previous limitation</dt><dd>Uncertainty metrics that treat paraphrases as disagreement.</dd>
+    <dt>Approach</dt><dd>Cluster samples by meaning; compute entropy over clusters (semantic entropy).</dd>
+    <dt>Contribution</dt><dd>Better uncertainty for free-form generation than token likelihood alone.</dd>
+    <dt>Practical impact</dt><dd>Chapter 6’s semantic entropy estimator and cascade deferral signal.</dd>
+    <dt>Limitations</dt><dd>Clustering quality and sample count dominate; still costs N generations.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">A Gentle Introduction to Conformal Prediction and Distribution-Free Uncertainty Quantification</span>
+    <span class="paper-meta">Angelopoulos &amp; Bates, 2021 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Modern predictors lack finite-sample coverage guarantees for their confidence sets.</dd>
+    <dt>Previous limitation</dt><dd>Heuristic thresholds without exchangeability-aware calibration.</dd>
+    <dt>Approach</dt><dd>Split-conformal and related methods producing prediction sets with coverage <span class="math">1-\alpha</span>.</dd>
+    <dt>Contribution</dt><dd>Accessible theory that Chapter 6 uses for deferral thresholds.</dd>
+    <dt>Practical impact</dt><dd><code>conformal_threshold</code> as a calibrated knob, monitored under shift.</dd>
+    <dt>Limitations</dt><dd>Exchangeability fails under prompt distribution shift; LLM deployment must re-calibrate.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Mixture-of-Agents Enhances Large Language Model Capabilities</span>
+    <span class="paper-meta">Wang et al., 2024 · arXiv</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Single-sample generation underuses complementary strengths of different LLMs.</dd>
+    <dt>Previous limitation</dt><dd>Simple voting fails on open-ended text; single-model sampling plateaus.</dd>
+    <dt>Approach</dt><dd>Layers of proposer agents and aggregators that synthesise multi-model drafts.</dd>
+    <dt>Contribution</dt><dd>Strong benchmark gains from structured multi-agent generation.</dd>
+    <dt>Practical impact</dt><dd>Chapter 9’s MoA combiner and the cost warning versus cascades.</dd>
+    <dt>Limitations</dt><dd>Latency and dollar multipliers; overkill when a cascade meets the quality floor.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">A Contextual-Bandit Approach to Personalized News Article Recommendation</span>
+    <span class="paper-meta">Li et al., 2010 · WWW (LinUCB)</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Choose actions under partial feedback with contextual features, balancing explore/exploit.</dd>
+    <dt>Previous limitation</dt><dd>Non-contextual bandits ignored per-request features.</dd>
+    <dt>Approach</dt><dd>Linear payoff models per arm with UCB-style bonuses (LinUCB).</dd>
+    <dt>Contribution</dt><dd>Practical contextual bandit algorithm widely reused beyond news.</dd>
+    <dt>Practical impact</dt><dd>Chapter 10’s <code>LinUCBRouter</code> and regret reporting.</dd>
+    <dt>Limitations</dt><dd>Linear payoffs; must add cost to reward and hard safety constraints for LLM routing.</dd>
+  </dl>
+</section>
+
+<h2>Interview Questions</h2>
+<ol class="questions">
+  <li>Draw the quality–cost–latency frontier for three tiers. Where does a useful router sit relative to the always-route segments?</li>
+  <li>When is a cascade preferable to a router? To an ensemble?</li>
+  <li>Why must capability checks run before a learned softmax?</li>
+  <li>How do you incorporate queue depth into model selection without conflating LB and routing?</li>
+  <li>What preference data would you collect to train a RouteLLM-style router for support tickets?</li>
+  <li>Compare semantic entropy to mean token probability for deferral. Failure modes of each?</li>
+  <li>Derive expected cascade cost given deferral probabilities. How do you choose τ?</li>
+  <li>Design multi-provider breakers for two regions and one degraded cache. What do clients see?</li>
+  <li>When does MoA beat generate-then-rank? When does either lose to a cascade?</li>
+  <li>How do you stop LinUCB from always selecting the most expensive arm?</li>
+  <li>Write the utility inequality that prefers escalation to answering at confidence p.</li>
+  <li>Why is naive offline replay a biased estimate of a new router’s quality?</li>
+  <li>Sketch the promotion packet for a cascade that claims 30% cost reduction.</li>
+  <li>How would you A/B a LinUCB policy against a frozen classifier without harming VIP tenants?</li>
+  <li>Where do Volume 17 guardrails sit relative to the router’s decide() call?</li>
+  <li>Give two reasons a MoA win on a public benchmark might still lose in your product.</li>
+  <li>What alert fires if reason=budget_infeasible_degraded exceeds 1% for an hour?</li>
+</ol>
+
+<h2>Next Volume</h2>
+<p>Volume 19 leaves text-only routing and enters multimodal understanding: Vision Transformers,
+CLIP-style contrastive training, vision–language adapters, OCR, speech and video. The router’s
+capability profiles from this volume become load-bearing — modality gates are no longer optional
+keywords. <code>forge.router</code> still chooses among text and multimodal endpoints;
+<code>forge.multimodal</code> builds the models those endpoints serve.</p>
+<p class="facet">Prerequisites from this volume</p>
+<ul>
+  <li>Capability profiles with explicit modalities (Chapter 3).</li>
+  <li>Cost and latency budgets that survive longer multimodal prefills (Chapter 4).</li>
+  <li>Confidence and abstention when OCR or ASR is uncertain (Chapters 6 and 11).</li>
+  <li>Fallback across providers when a vision endpoint trips a breaker (Chapter 8).</li>
+</ul>
+</section>
+
+
+<!-- end of Volume 18 · Model Routing and Decision Systems -->
+<p class="no-toc" hidden>Volume 18 complete.</p>
+<!-- forge.router seeds: models features rules capability cost learned confidence cascade fallback ensemble bandit decision evaluate -->
+
+</body>
+</html>

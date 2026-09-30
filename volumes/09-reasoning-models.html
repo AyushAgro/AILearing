@@ -1,0 +1,1957 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 9 · Reasoning Models and Test-Time Compute</title>
+<meta name="volume" content="Volume 9 · Reasoning Models and Test-Time Compute">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 9</p>
+  <h1 class="no-toc">Reasoning Models and Test-Time Compute</h1>
+  <p class="tp-subtitle">Verifiable Rewards, Search, Distillation and Thinking Budgets</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Define "reasoning" operationally, as something you can measure and pay for, not as a property of a model.</li>
+  <li>Treat inference-time sampling, voting, verification and search as a compute budget with an explicit return curve.</li>
+  <li>Build programmatic verifiers and understand outcome versus process reward models.</li>
+  <li>Derive and implement GRPO, and understand why RL with verifiable rewards (RLVR) produced the 2024–2025 reasoning models.</li>
+  <li>Serve reasoning models with budgets, cost-per-solved-task accounting and latency SLOs, and know when not to reason at all.</li>
+  <li>Understand what reasoning traces do and do not tell you: faithfulness, reward hacking and monitoring.</li>
+  <li>Ship the continuous package as <code>forge.reasoning</code> (verifiers, GRPO, test-time compute, budgets).</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>Transformer internals and sampling (Volumes 2 and 4); SFT and preference optimisation (Volume 8 / <code>forge.posttrain</code>: PPO, DPO, KL-regularised RL).</li>
+  <li>Evaluation discipline from Volume 10: confidence intervals, held-out sets, contamination. Reasoning claims are easy to fool yourself with.</li>
+</ul>
+
+<p class="facet">How to read the code</p>
+<ul>
+  <li>Every listing was executed on an Apple laptop CPU (Python 3.12, PyTorch 2.10, NumPy 2.3), each in under 30 seconds. Printed output is real.</li>
+  <li>Listings seed <code>src/forge/reasoning/</code>; swap <code>Policy</code> for a Transformer to scale to Tier G.</li>
+  <li>No model downloads. The trainers use toy policies on verifiable arithmetic so that the <em>algorithm</em> is visible; the same code structure scales to a transformer policy by swapping <code>Policy</code>.</li>
+  <li>Prices in the serving chapter are illustrative round numbers, not quotes from any provider.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1  Operational reasoning   verifiability, answer vs trace quality
+Chapter 2  Prompted reasoning      CoT, zero-shot CoT, self-consistency, ToT
+Chapter 3  Test-time compute       voting maths, best-of-N, pass@k, allocation
+Chapter 4  Verifiers               maths checker, sandboxed tests, ORM vs PRM
+Chapter 5  Bootstrapped reasoning  STaR, rejection-sampling fine-tuning
+Chapter 6  RLVR and GRPO           derivation, implementation, DAPO fixes
+Chapter 7  Training recipes        R1, Tulu 3, Kimi k1.5, distillation
+Chapter 8  Serving                 budgets, cost per solved task, latency
+Chapter 9  Faithfulness and safety unfaithful CoT, reward hacking, monitors</pre>
+<figcaption>Map of Volume 9.</figcaption>
+</figure>
+
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  A[Base model] --> B[Prompted CoT and sampling]
+  B --> C[Verifier: rules, tests, reward model]
+  C --> D[Test-time: vote, best-of-N, search]
+  C --> E[Training: STaR / rejection sampling]
+  C --> F[Training: RLVR with GRPO]
+  E --> G[Reasoning model]
+  F --> G
+  G --> H[Distil into smaller models]
+  G --> I[Serve with thinking budgets]
+  I --> J[Monitor traces and cost]</pre>
+<figcaption>The verifier sits at the centre: it powers test-time selection and training-time reward alike.</figcaption>
+</figure>
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="operational">What "Reasoning" Means Operationally</h2>
+<p class="chapter-lede">"Reasoning" is used as a marketing word, a cognitive-science word and an
+engineering word. Only the engineering sense is useful here: a model reasons when spending more
+tokens or more samples on a problem measurably raises the probability of a verifiably correct
+answer. Everything in this volume follows from treating that probability as a function of
+compute.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>A model answers "What is 17 × 24?" instantly and correctly, but fails a three-step word problem,
+  a scheduling constraint puzzle, or a refactor that touches five files. A single forward pass per
+  token has a fixed compute budget per output token; problems whose solution needs more serial
+  computation than that budget must spread the work across generated tokens, across samples, or
+  across both.</p>
+</div>
+
+<h3>An Operational Definition</h3>
+<ul>
+  <li><strong>Multi-step</strong>: the answer depends on intermediate results the model must produce and use (carry digits, sub-goals, partial proofs, test failures).</li>
+  <li><strong>Verifiable</strong>: there is a cheap procedure <span class="math">V(x, y) \in \{0, 1\}</span> (or a score) that checks an answer without re-solving the problem. Arithmetic, unit tests, type checkers, SAT constraints and proof checkers qualify; "write a good essay" does not.</li>
+  <li><strong>Compute-elastic</strong>: accuracy <span class="math">A(C)</span> increases with inference compute <span class="math">C</span> (tokens per sample times samples) over a useful range.</li>
+</ul>
+<div class="math">\text{reasoning gain}(C_1 \to C_2) = A(C_2) - A(C_1), \qquad \text{efficiency} = \frac{A(C_2) - A(C_1)}{\text{cost}(C_2) - \text{cost}(C_1)}</div>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>A reasoning model is a model whose <span class="math">A(C)</span> curve keeps rising for thousands to tens of thousands of thinking tokens, because it was <em>trained</em> to use them (Chapters 5–7).</li>
+    <li>A non-reasoning model can still buy accuracy with compute, but mostly through sampling and selection (Chapter 3), not longer single traces.</li>
+    <li>Both are only as good as the verifier used to select or train.</li>
+  </ul>
+</aside>
+
+<h3>Answer Quality versus Trace Quality</h3>
+<p>Two different things are routinely conflated:</p>
+<table>
+  <caption>Answer quality and trace quality are separate measurements.</caption>
+  <thead><tr><th></th><th>Answer correct</th><th>Answer wrong</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Trace valid</strong></td><td>The goal</td><td>Final slip (copy error, formatting); cheap to fix with a checker</td></tr>
+    <tr><td><strong>Trace invalid</strong></td><td>Right for the wrong reasons: lucky guess, memorised answer, cancelling errors</td><td>Honest failure</td></tr>
+  </tbody>
+</table>
+<ul>
+  <li>Outcome-based evaluation (exact match on the final answer) sees only the columns: a valid derivation and a lucky guess with the same final answer score identically.</li>
+  <li>Right-for-wrong-reasons samples are dangerous in <em>training</em>: rejection sampling and RL reinforce them (Chapter 5 measures this).</li>
+  <li>A plausible trace is not evidence that the trace <em>caused</em> the answer (Chapter 9).</li>
+</ul>
+
+<h3>Where Serial Computation Comes From</h3>
+<figure class="diagram">
+<pre class="ascii">                       one forward pass            T generated tokens
+compute per answer     ~2 N FLOPs per token        ~2 N T FLOPs
+serial depth           L layers                    L x T layers (via the KV cache)
+working memory         residual stream             residual stream + visible scratchpad
+
+Direct answer:   [prompt] -&gt; "408"                       depth L
+Chain of thought:[prompt] -&gt; "17*24 = 17*20 + 17*4 ..."  depth L per token, T tokens
+                            each token conditions on all earlier intermediate results</pre>
+<figcaption>Generated tokens are the only way a fixed-depth transformer adds serial steps at inference time.</figcaption>
+</figure>
+<ul>
+  <li>Theory backs the intuition: constant-depth transformers without intermediate tokens are limited to shallow circuit classes, and allowing a polynomial number of intermediate tokens strictly increases what they can compute <cite>(Merrill and Sabharwal, 2024; Feng et al., 2023)</cite>.</li>
+  <li>Parallel samples add breadth, not depth: they help when the model sometimes gets the answer right, and a selector can find that sample.</li>
+</ul>
+
+<h3>Task Taxonomy for Engineers</h3>
+<table>
+  <caption>Which tasks benefit from reasoning compute, and why.</caption>
+  <thead><tr><th>Task class</th><th>Verifier</th><th>Benefit from thinking</th><th>Typical approach</th></tr></thead>
+  <tbody>
+    <tr><td>Competition maths, arithmetic word problems</td><td>Exact answer match</td><td>High</td><td>Reasoning model; self-consistency</td></tr>
+    <tr><td>Code with tests</td><td>Test execution</td><td>High</td><td>Generate, run, retry; RLVR-trained coder</td></tr>
+    <tr><td>Planning, constraint satisfaction</td><td>Constraint checker</td><td>High</td><td>Search (ToT, beam) with checker</td></tr>
+    <tr><td>Multi-hop QA over documents</td><td>Partial (citations)</td><td>Medium</td><td>Retrieval plus short CoT</td></tr>
+    <tr><td>Extraction, classification, rewriting</td><td>Labels, schema</td><td>Low; often negative</td><td>Fast model, no thinking</td></tr>
+    <tr><td>Open-ended writing</td><td>Judge or human only</td><td>Low to medium</td><td>Planning prompt; no long traces</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout warning"><span class="title">Pitfall</span>
+  <ul>
+    <li>"The model reasons" is not a claim you can ship. "Raising thinking budget from 2k to 8k tokens moves pass@1 on our 400-item held-out set from 0.61 to 0.70 (95% CI ±0.04) at 3.1× cost" is.</li>
+  </ul>
+</aside>
+
+<h3>Measuring A(C)</h3>
+<ul>
+  <li>Fix a held-out, decontaminated evaluation set with a programmatic verifier.</li>
+  <li>Sweep one compute axis at a time: thinking budget (serial), samples <span class="math">N</span> (parallel), search width (structured).</li>
+  <li>Report accuracy with confidence intervals and cost in tokens and dollars at each point; plot on a log-compute axis.</li>
+  <li>Record trace-level signals too: truncation rate, answer-format failures, mean thinking length for correct and incorrect answers (incorrect answers are usually longer).</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="prompted">Prompted Reasoning</h2>
+<p class="chapter-lede">Before any training, prompting alone can make a model spend tokens on
+intermediate steps. The four techniques in this chapter are still the baseline every trained
+reasoning system must beat, and their measured gains and costs set expectations for the rest of the
+volume.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>A general instruction-tuned model answers maths and logic questions directly and gets many of them
+  wrong. You cannot fine-tune it (API model, or no data). What can prompting buy, what does each
+  technique cost in tokens, and what does it leave unsolved?</p>
+</div>
+
+<p class="facet">Possible solutions and what each does not solve</p>
+<ul>
+  <li><strong>Few-shot chain-of-thought</strong>: shows worked solutions. Does not fix errors inside a trace; needs exemplars per domain.</li>
+  <li><strong>Zero-shot CoT</strong>: one trigger phrase. Weaker than good exemplars; no control of trace format.</li>
+  <li><strong>Self-consistency</strong>: sample many traces, vote. Multiplies cost by <span class="math">N</span>; useless when answers are free-form and cannot be compared.</li>
+  <li><strong>Tree of Thoughts</strong>: explicit search over partial solutions with self-evaluation. Many calls per problem; the self-evaluator is often the weak link.</li>
+</ul>
+
+<h3>Chain-of-Thought Prompting</h3>
+<ul>
+  <li><cite>Wei et al. (2022)</cite> put worked, step-by-step solutions in few-shot exemplars. With PaLM 540B and eight exemplars, GSM8K accuracy reached the then state of the art, above fine-tuned GPT-3 with a verifier.</li>
+  <li>Documented: the gain appears only at large scale (roughly 100B parameters in 2022-era models); smaller models produced fluent but wrong chains and sometimes got worse.</li>
+  <li>Mechanism in engineering terms: exemplars set the <em>format</em> of intermediate computation so the model conditions later tokens on earlier results.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>A few-shot CoT prompt with an explicit, parseable answer line.</figcaption>
+<pre><code>SYSTEM: Solve the problem. Think step by step, then finish with a line
+        "Answer: &lt;number&gt;".
+
+Q: A shop sells pens at 3 for $2. How much do 12 pens cost?
+A: 12 pens is 12 / 3 = 4 groups of 3. Each group costs $2, so 4 * 2 = 8.
+Answer: 8
+
+Q: {question}
+A:</code></pre>
+</figure>
+
+<h3>Zero-Shot Chain of Thought</h3>
+<ul>
+  <li><cite>Kojima et al. (2022)</cite>: appending "Let's think step by step" with no exemplars raised text-davinci-002 from 17.7% to 78.7% on MultiArith and from 10.4% to 40.7% on GSM8K.</li>
+  <li>Two-stage extraction: first generate the reasoning, then prompt again with "Therefore, the answer is" to extract a clean answer. Modern practice replaces stage two with a required answer format plus a parser (Chapter 4).</li>
+  <li>For current instruction-tuned and reasoning models the trigger phrase adds little: they already reason by default. For reasoning models, detailed "how to think" instructions can <em>hurt</em>; state the goal and constraints instead.</li>
+</ul>
+
+<h3>Self-Consistency</h3>
+<ul>
+  <li><cite>Wang et al. (2022)</cite>: sample several CoT traces at temperature &gt; 0, extract each final answer, return the most frequent one. It marginalises over reasoning paths.</li>
+  <li>Documented gains over greedy CoT: +17.9 points absolute on GSM8K with PaLM 540B, with gains increasing with the number of samples and saturating after roughly 20–40.</li>
+  <li>Requires answers that can be canonicalised and compared (numbers, options, normalised strings). For code, compare behaviour on inputs, not text.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Self-consistency sampler (interface sketch; <code>generate</code> is any sampling client).</figcaption>
+<pre><code>from collections import Counter
+
+def self_consistency(generate, prompt, n=16, temperature=0.7, parse=None):
+    """Sample n traces, parse answers, return (answer, vote share, traces)."""
+    traces = [generate(prompt, temperature=temperature) for _ in range(n)]
+    answers = [parse(t) for t in traces]
+    votes = Counter(a for a in answers if a is not None)
+    if not votes:
+        return None, 0.0, traces
+    answer, count = votes.most_common(1)[0]
+    return answer, count / n, traces        # vote share is a usable confidence signal</code></pre>
+</figure>
+<ul>
+  <li>The vote share is a well-behaved confidence score: low agreement predicts errors, which makes it a routing signal (escalate to a stronger model, or to a human).</li>
+  <li>Chapter 3 derives exactly when voting helps and when it hurts.</li>
+</ul>
+
+<h3>Tree of Thoughts</h3>
+<ul>
+  <li><cite>Yao et al. (2023)</cite>: decompose a problem into "thought" steps; at each node, propose several continuations, have the model evaluate them ("sure / maybe / impossible"), and run BFS or DFS with pruning.</li>
+  <li>Documented: on Game of 24, GPT-4 with CoT solved 4% of problems; ToT with breadth 5 solved 74%.</li>
+  <li>Cost: tens to hundreds of model calls per problem. Gains are largest when partial states can be evaluated reliably (arithmetic feasibility, crossword letter constraints).</li>
+</ul>
+
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  R[Problem state] --> A1[Thought a]
+  R --> A2[Thought b]
+  R --> A3[Thought c]
+  A1 --> E1{Evaluate: sure / maybe / impossible}
+  A2 --> E2{Evaluate}
+  A3 --> E3{Evaluate}
+  E1 -->|keep top b| B1[Expand a]
+  E2 -->|prune| X[Discard]
+  E3 -->|keep top b| B3[Expand c]
+  B1 --> S[Solution check]
+  B3 --> S</pre>
+<figcaption>Tree of Thoughts as beam search with a model-based state evaluator.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption>Tree of Thoughts as generic beam search (interface sketch).</figcaption>
+<pre><code>def tree_of_thoughts(propose, score, is_solution, root, width=5, beam=3, depth=4):
+    """propose(state) -&gt; list of child states; score(state) -&gt; float (higher is better)."""
+    frontier = [root]
+    for _ in range(depth):
+        children = [c for s in frontier for c in propose(s)[:width]]
+        for c in children:
+            if is_solution(c):
+                return c
+        frontier = sorted(children, key=score, reverse=True)[:beam]
+    return max(frontier, key=score, default=None)</code></pre>
+</figure>
+
+<h3>Measured Gains and Costs</h3>
+<table>
+  <caption>Prompted reasoning techniques: documented headline results and token cost (per problem).</caption>
+  <thead><tr><th>Technique</th><th>Headline result (source)</th><th>Relative token cost</th><th>Main limitation</th></tr></thead>
+  <tbody>
+    <tr><td>Few-shot CoT</td><td>GSM8K SOTA with PaLM 540B (Wei 2022)</td><td class="num">3–10×</td><td>Needs scale; exemplars per domain</td></tr>
+    <tr><td>Zero-shot CoT</td><td>GSM8K 10.4 → 40.7% (Kojima 2022)</td><td class="num">3–10×</td><td>Weaker than good exemplars</td></tr>
+    <tr><td>Self-consistency</td><td>+17.9 pts GSM8K, PaLM (Wang 2022)</td><td class="num">N × CoT</td><td>Comparable answers only</td></tr>
+    <tr><td>Tree of Thoughts</td><td>Game of 24: 4 → 74% (Yao 2023)</td><td class="num">50–200× calls</td><td>Evaluator quality, latency</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout warning"><span class="title">Self-correction is not free</span>
+  <ul>
+    <li><cite>Huang et al. (2023)</cite>: asking a model to review and fix its own reasoning <em>without external feedback</em> frequently turns right answers into wrong ones; reported gains often relied on oracle labels deciding when to stop.</li>
+    <li><cite>Madaan et al. (2023)</cite> (Self-Refine) shows gains mainly on tasks with soft criteria (style, readability). For reasoning, add an external signal: a test, a checker, a vote.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="test-time">Test-Time Compute Scaling</h2>
+<p class="chapter-lede">Given a fixed model, you can trade inference compute for accuracy by sampling
+more, selecting better and searching deeper. This chapter derives the return curves for the main
+strategies, implements the standard metrics, and shows how to allocate a compute budget across
+problems of different difficulty.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>You have a budget of, say, eight samples per question on average. Should you spend them on
+  majority voting, on best-of-N with a reward model, on sampling until a test passes, or on a single
+  longer trace? Should every question get eight? The answer depends on per-question accuracy, on the
+  shape of the wrong-answer distribution and on the quality of your verifier, all of which you can
+  model.</p>
+</div>
+
+<h3>Majority Voting: The Analysis</h3>
+<h4>Binary outcomes</h4>
+<ul>
+  <li>Model each sample as correct with probability <span class="math">p</span>, independently, and every wrong sample as the <em>same</em> wrong answer (the worst case for voting).</li>
+  <li>With <span class="math">N</span> odd, the vote is correct when more than half the samples are correct:</li>
+</ul>
+<div class="math">A_N(p) = \sum_{k=\lceil (N+1)/2 \rceil}^{N} \binom{N}{k} p^k (1-p)^{N-k}</div>
+<ul>
+  <li>This is Condorcet's jury theorem. By Hoeffding's inequality on the fraction of correct votes <span class="math">\bar X</span>:</li>
+</ul>
+<div class="math">p &gt; \tfrac12:\quad 1 - A_N(p) \le \exp\!\big(-2N(p-\tfrac12)^2\big) \qquad\qquad p &lt; \tfrac12:\quad A_N(p) \le \exp\!\big(-2N(\tfrac12-p)^2\big)</div>
+<ul>
+  <li>So voting amplifies whatever is already the majority behaviour: towards 1 when <span class="math">p &gt; 1/2</span>, towards 0 when <span class="math">p &lt; 1/2</span>, exponentially fast in <span class="math">N</span> with rate set by the margin.</li>
+</ul>
+
+<h4>Plurality over many answers</h4>
+<ul>
+  <li>Real wrong answers are spread over many values. Let the correct answer have probability <span class="math">p</span> and wrong answers probabilities <span class="math">q_1 \ge q_2 \ge \dots</span>.</li>
+  <li>By the law of large numbers the vote counts approach <span class="math">N p</span> and <span class="math">N q_j</span>, so</li>
+</ul>
+<div class="math">\lim_{N\to\infty} A_N = \begin{cases} 1 &amp; p &gt; q_1 \\ 0 &amp; p &lt; q_1 \end{cases}</div>
+<ul>
+  <li>The <strong>plurality threshold</strong> is <span class="math">q_1</span>, the probability of the most common wrong answer, not 1/2. A question with <span class="math">p = 0.3</span> is solved by voting if wrong answers are scattered, and made <em>worse</em> by voting if one systematic error has probability 0.4.</li>
+  <li>For a benchmark with per-question rates <span class="math">(p_i, q_{1,i})</span>, the infinite-sample ceiling is the fraction of questions with <span class="math">p_i &gt; q_{1,i}</span>. Voting cannot help questions below their threshold; it can only reveal them.</li>
+</ul>
+
+<h4>Simulation</h4>
+<figure class="listing">
+<figcaption>Majority-vote accuracy versus N: exact binary formula, plurality simulation and a benchmark mix. (<code>vote.py</code>)</figcaption>
+<pre><code># Majority-vote accuracy vs N: exact (binary), simulated (plurality), and a dataset mix.
+import numpy as np
+from math import comb
+
+def maj_binary(p, n):
+    """P(majority correct), n independent samples, 2 outcomes; ties split 50/50."""
+    acc = 0.0
+    for k in range(n + 1):
+        pk = comb(n, k) * p**k * (1 - p)**(n - k)
+        acc += pk if 2 * k &gt; n else (0.5 * pk if 2 * k == n else 0.0)
+    return acc
+
+def maj_sim(probs, n, trials=20_000, rng=np.random.default_rng(0)):
+    """Plurality vote; probs[0] is the correct answer. Ties broken uniformly."""
+    counts = rng.multinomial(n, probs, size=trials)        # (trials, K)
+    winners = counts == counts.max(axis=1, keepdims=True)  # (trials, K)
+    return float((winners[:, 0] / winners.sum(axis=1)).mean())
+
+Ns = [1, 3, 5, 9, 17, 33, 65]
+print("binary exact    N:" + "".join(f"{n:&gt;6d}" for n in Ns))
+for p in [0.3, 0.5, 0.6, 0.8]:
+    print(f"  p={p:.1f}          " + "".join(f"{maj_binary(p, n):6.3f}" for n in Ns))
+
+cases = {"p=.30, 7 wrong @ .10": [0.30] + [0.10] * 7,     # correct answer is the mode
+         "p=.30, 1 wrong @ .40": [0.30, 0.40, 0.15, 0.15],  # a wrong answer is the mode
+         "p=.30, 2 wrong @ .28": [0.30, 0.28, 0.28, 0.14]}  # thin margin
+print("plurality sim   N:" + "".join(f"{n:&gt;6d}" for n in Ns))
+for name, pr in cases.items():
+    print(f"  {name}" + "".join(f"{maj_sim(np.array(pr), n):6.3f}" for n in Ns))
+
+# A benchmark is a mix of easy and hard problems: p_i ~ Beta(a, b).
+print("dataset mix     N:" + "".join(f"{n:&gt;6d}" for n in Ns))
+for a, b in [(0.6, 0.6), (2.0, 1.0)]:
+    ps = np.random.default_rng(1).beta(a, b, size=2000)
+    accs = "".join(f"{np.mean([maj_binary(p, n) for p in ps]):6.3f}" for n in Ns)
+    print(f"  Beta({a},{b})     {accs}   ceiling frac(p&gt;.5)={np.mean(ps &gt; 0.5):.3f}")</code></pre>
+</figure>
+<pre class="output">binary exact    N:     1     3     5     9    17    33    65
+  p=0.3           0.300 0.216 0.163 0.099 0.040 0.008 0.000
+  p=0.5           0.500 0.500 0.500 0.500 0.500 0.500 0.500
+  p=0.6           0.600 0.648 0.683 0.733 0.801 0.879 0.949
+  p=0.8           0.800 0.896 0.942 0.980 0.997 1.000 1.000
+plurality sim   N:     1     3     5     9    17    33    65
+  p=.30, 7 wrong @ .10 0.302 0.341 0.428 0.548 0.713 0.882 0.980
+  p=.30, 1 wrong @ .40 0.301 0.308 0.312 0.311 0.284 0.235 0.169
+  p=.30, 2 wrong @ .28 0.301 0.307 0.328 0.347 0.368 0.390 0.421
+dataset mix     N:     1     3     5     9    17    33    65
+  Beta(0.6,0.6)      0.505 0.505 0.505 0.505 0.505 0.505 0.505   ceiling frac(p&gt;.5)=0.504
+  Beta(2.0,1.0)      0.666 0.699 0.713 0.726 0.736 0.742 0.746   ceiling frac(p&gt;.5)=0.751</pre>
+
+<p class="facet">Reading the output</p>
+<ul>
+  <li><strong>Voting hurts below threshold.</strong> Binary <span class="math">p=0.3</span> goes to 0; the "one wrong answer at 0.40" case falls from 0.30 to 0.17 at <span class="math">N=65</span>. Systematic errors (a common misconception, a misread question) are amplified.</li>
+  <li><strong>Voting helps above threshold</strong>, even with <span class="math">p &lt; 1/2</span>: 0.30 → 0.98 when wrong answers are scattered.</li>
+  <li><strong>Thin margins converge slowly</strong>: 0.30 versus 0.28 still sits at 0.42 after 65 samples. The Hoeffding rate depends on the squared margin.</li>
+  <li><strong>At benchmark level, gains are the difference between winners and losers.</strong> With a symmetric difficulty mix the improvement on easy questions exactly cancels the loss on hard ones (flat at 0.505). With a mostly-easy mix, accuracy climbs towards the ceiling 0.751 and saturates. This is the concave, saturating curve reported by <cite>Wang et al. (2022)</cite>.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Majority voting is a denoiser, not a solver. It converts the model's modal answer into its answer; it cannot create correctness the model does not already favour.</li>
+    <li>Samples from one model are positively correlated, so the real curve saturates earlier than the independent-sample analysis; measure it.</li>
+  </ul>
+</aside>
+
+<h3>pass@k and Coverage</h3>
+<ul>
+  <li><strong>pass@k</strong>: the probability that at least one of <span class="math">k</span> samples is correct. It measures <em>coverage</em>, the ceiling reachable by a perfect selector.</li>
+  <li><cite>Brown et al. (2024)</cite> ("Large Language Monkeys") show coverage keeps rising roughly log-linearly with samples over several orders of magnitude on code and maths; turning coverage into accuracy is the verifier's job.</li>
+  <li>Naive estimation (draw exactly <span class="math">k</span> samples, or plug <span class="math">\hat p = c/n</span> into <span class="math">1-(1-\hat p)^k</span>) is high-variance or biased. <cite>Chen et al. (2021)</cite> give the unbiased estimator from <span class="math">n \ge k</span> samples with <span class="math">c</span> correct:</li>
+</ul>
+<div class="math">\widehat{\text{pass@}k} = 1 - \frac{\binom{n-c}{k}}{\binom{n}{k}} = 1 - \prod_{i=n-c+1}^{n}\left(1 - \frac{k}{i}\right)</div>
+<ul>
+  <li>Interpretation: the probability that a random size-<span class="math">k</span> subset of the <span class="math">n</span> samples contains at least one correct one. The product form avoids huge binomials.</li>
+  <li>The plug-in estimator is biased low because <span class="math">1-(1-x)^k</span> is concave (Jensen).</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Unbiased pass@k versus the plug-in estimate. (<code>passk.py</code>)</figcaption>
+<pre><code># pass@k: unbiased estimator (Chen et al., 2021) vs the naive plug-in estimate.
+import numpy as np
+
+def pass_at_k(n, c, k):
+    """1 - C(n-c, k)/C(n, k), computed as a stable product."""
+    if n - c &lt; k:
+        return 1.0
+    return 1.0 - np.prod(1.0 - k / np.arange(n - c + 1, n + 1))
+
+def naive(n, c, k):
+    return 1.0 - (1.0 - c / n) ** k
+
+rng = np.random.default_rng(0)
+p_true, n, k, reps = 0.05, 20, 10, 50_000
+truth = 1 - (1 - p_true) ** k
+c = rng.binomial(n, p_true, size=reps)                     # correct samples per problem
+unb = np.array([pass_at_k(n, ci, k) for ci in c])
+nai = naive(n, c, k)
+print(f"true pass@{k} = {truth:.4f}")
+print(f"unbiased mean = {unb.mean():.4f}   naive mean = {nai.mean():.4f}")
+print(f"pass@1 == c/n ? {np.allclose([pass_at_k(n, ci, 1) for ci in c], c / n)}")</code></pre>
+</figure>
+<pre class="output">true pass@10 = 0.4013
+unbiased mean = 0.4033   naive mean = 0.3381
+pass@1 == c/n ? True</pre>
+<ul>
+  <li>The plug-in estimate understates pass@10 by six points at <span class="math">n=20</span>; the unbiased estimator matches the truth within Monte Carlo error.</li>
+  <li>Use <span class="math">n</span> well above <span class="math">k</span> (Codex used <span class="math">n=200</span> for <span class="math">k \le 100</span>) and average over problems; report confidence intervals by bootstrapping problems.</li>
+</ul>
+<aside class="callout warning"><span class="title">pass@k is not a product metric</span>
+  <ul>
+    <li>pass@k with <span class="math">k &gt; 1</span> assumes an oracle picks the right sample. Users get pass@1 (or the accuracy of your selector). Report both, and never compare a pass@8 number to someone else's pass@1.</li>
+  </ul>
+</aside>
+
+<h3>Best-of-N with a Verifier</h3>
+<ul>
+  <li>Sample <span class="math">N</span> candidates, score each with a verifier or reward model, return the argmax. <cite>Cobbe et al. (2021)</cite> introduced GSM8K and showed that a trained verifier with best-of-100 gave a gain roughly equivalent to a 30× larger fine-tuned generator.</li>
+  <li>Variants: <strong>weighted voting</strong> sums verifier scores per distinct answer (combines agreement and verifier); <strong>stop-on-success</strong> samples sequentially until a hard verifier accepts.</li>
+  <li>An imperfect verifier has its own ceiling: as <span class="math">N</span> grows, the argmax increasingly selects wrong samples that the verifier happens to over-score (reward-model over-optimisation; <cite>Gao et al., 2023</cite>).</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Best-of-N, majority vote and verifier-weighted vote on the same samples. (<code>bon.py</code>)</figcaption>
+<pre><code># Best-of-N with an imperfect verifier vs majority vote, same N samples.
+import numpy as np
+rng = np.random.default_rng(0)
+
+def run(p, n, auc_sep, trials=20_000, k_wrong=4):
+    """Correct w.p. p, else a uniform distractor. Verifier score ~ N(sep*y, 1)."""
+    correct = rng.random((trials, n)) &lt; p                      # (T, N)
+    ans = np.where(correct, 0, rng.integers(1, k_wrong + 1, (trials, n)))
+    score = rng.normal(auc_sep * correct, 1.0)                 # (T, N)
+    bon = correct[np.arange(trials), score.argmax(1)].mean()
+    counts = np.stack([(ans == a).sum(1) for a in range(k_wrong + 1)], 1)
+    jitter = rng.random(counts.shape) * 0.1                    # random tie-break
+    vote = ((counts + jitter).argmax(1) == 0).mean()
+    # weighted vote: sum verifier scores per answer (Uesato/Li-style)
+    w = np.stack([np.where(ans == a, np.exp(score), 0).sum(1)
+                  for a in range(k_wrong + 1)], 1)
+    wvote = (w.argmax(1) == 0).mean()
+    return bon, vote, wvote
+
+print(" p    sep    N   best-of-N  majority  weighted-vote")
+for p in [0.2, 0.5]:
+    for sep in [0.5, 2.0]:
+        for n in [4, 16, 64]:
+            b, v, w = run(p, n, sep)
+            print(f"{p:.1f}  {sep:4.1f}  {n:3d}     {b:.3f}     {v:.3f}     {w:.3f}")</code></pre>
+</figure>
+<pre class="output"> p    sep    N   best-of-N  majority  weighted-vote
+0.2   0.5    4     0.283     0.200     0.277
+0.2   0.5   16     0.367     0.199     0.371
+0.2   0.5   64     0.436     0.197     0.541
+0.2   2.0    4     0.515     0.202     0.505
+0.2   2.0   16     0.842     0.199     0.824
+0.2   2.0   64     0.969     0.200     0.994
+0.5   0.5    4     0.624     0.661     0.668
+0.5   0.5   16     0.709     0.939     0.907
+0.5   0.5   64     0.767     1.000     0.998
+0.5   2.0    4     0.876     0.658     0.878
+0.5   2.0   16     0.984     0.941     0.998
+0.5   2.0   64     0.997     1.000     1.000</pre>
+<ul>
+  <li><span class="math">p = 0.2</span> with four distractors at 0.2 each sits exactly on the plurality threshold, so majority vote is stuck at 0.20 whatever <span class="math">N</span>. Only the verifier adds information.</li>
+  <li>A weak verifier (separation 0.5, AUC ≈ 0.64) loses to plain voting when <span class="math">p=0.5</span>: 0.767 versus 1.000 at <span class="math">N=64</span>. Best-of-N trusts one noisy score; voting pools <span class="math">N</span> weak signals.</li>
+  <li>Weighted voting is the robust default: never much worse than the better of the two, and best in most rows.</li>
+</ul>
+
+<h3>Beam and Tree Search with Process Rewards</h3>
+<ul>
+  <li>Instead of scoring complete solutions, score partial ones with a process reward model (PRM, Chapter 4) and expand the best prefixes: beam search over steps, lookahead search, or MCTS.</li>
+  <li><cite>Snell et al. (2024)</cite> compare best-of-N, beam search against a PRM, and sequential self-revision at matched compute. Documented findings:
+    <ul>
+      <li>The best strategy depends on question difficulty: beam search helps on harder questions at low budgets but over-optimises the PRM on easy questions; sequential revisions help easy and medium questions.</li>
+      <li>A difficulty-adaptive "compute-optimal" policy improved efficiency by more than 4× over a best-of-N baseline.</li>
+      <li>At matched FLOPs, test-time compute on a smaller model could beat a 14× larger model on questions where the small model already had non-trivial success, but not on the hardest questions.</li>
+    </ul>
+  </li>
+  <li>DeepSeek-AI (2025) report MCTS as an unsuccessful attempt for R1 training: the token-level search space is too large and a fine-grained value model is hard to train. Search remains useful at inference for structured domains.</li>
+</ul>
+
+<h3>Compute-Optimal Allocation</h3>
+<p>With a total budget <span class="math">B</span> samples over <span class="math">Q</span> questions and a perfect verifier, question <span class="math">i</span> is solved with probability <span class="math">1-(1-p_i)^{n_i}</span>. Maximise</p>
+<div class="math">\max_{n_1..n_Q} \sum_i \big[1-(1-p_i)^{n_i}\big] \quad \text{s.t.} \quad \sum_i n_i = B</div>
+<ul>
+  <li>The marginal gain of one more sample is <span class="math">p_i(1-p_i)^{n_i}</span>, decreasing in <span class="math">n_i</span>; the objective is separable and concave, so greedy allocation by marginal gain is optimal.</li>
+  <li>Implication: very easy questions need one sample, impossible ones (<span class="math">p_i \approx 0</span>) deserve none, the budget goes to the middle.</li>
+  <li>The catch: you do not know <span class="math">p_i</span>. You must predict difficulty (probe samples, a learned difficulty model, verifier confidence), and probes cost budget.</li>
+  <li>With a <em>hard</em> verifier (tests, exact checker) there is a better policy: sample sequentially and stop at the first verified success. It allocates adaptively without knowing <span class="math">p_i</span>.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Uniform, difficulty-adaptive and stop-on-success allocation at the same budget. (<code>alloc.py</code>)</figcaption>
+<pre><code># Compute-optimal allocation: spend a fixed sample budget where it buys most accuracy.
+import heapq
+import numpy as np
+rng = np.random.default_rng(0)
+Q = 1000
+p = rng.beta(0.5, 1.5, size=Q)             # per-question success rate (skewed hard)
+B = 8 * Q                                  # budget: 8 samples per question on average
+
+def acc(p, n):                   # oracle verifier: solved if any sample is correct
+    return np.mean(1 - (1 - p) ** n)
+
+def greedy(p_hat, budget, n0=0):
+    """Allocate one sample at a time to the largest marginal gain p(1-p)^n."""
+    n = np.full(len(p_hat), n0)
+    heap = [(-ph * (1 - ph) ** n0, i) for i, ph in enumerate(p_hat)]
+    heapq.heapify(heap)
+    for _ in range(budget - n0 * len(p_hat)):
+        _, i = heapq.heappop(heap)
+        n[i] += 1
+        heapq.heappush(heap, (-p_hat[i] * (1 - p_hat[i]) ** n[i], i))
+    return n
+
+uniform = np.full(Q, 8)
+print(f"uniform N=8           acc={acc(p, uniform):.3f}")
+for k in [1, 2, 4]:                                       # probe samples per question
+    probe = rng.binomial(k, p)
+    p_hat = np.clip((probe + 1) / (k + 2), 1e-3, 1 - 1e-3)   # Laplace-smoothed estimate
+    n_est = greedy(p_hat, B, n0=k)                        # probes count against budget
+    print(f"adaptive ({k} probes)   acc={acc(p, n_est):.3f}  max N={n_est.max()}")
+n_orc = greedy(p, B)
+print(f"adaptive (oracle p)   acc={acc(p, n_orc):.3f}  max N={n_orc.max()}")
+print(f"questions with p&lt;0.01: {np.mean(p &lt; 0.01):.3f}  "
+      f"(oracle gives them {n_orc[p &lt; 0.01].mean():.1f} samples on average)")
+
+# With a reliable verifier, stop at the first verified success (sequential sampling).
+for cap in [8, 16, 32, 64]:
+    used = np.sum((1 - p[:, None]) ** np.arange(cap)[None, :], axis=1)   # E[samples]
+    print(f"stop-on-success cap={cap:2d}  acc={acc(p, cap):.3f}  "
+          f"mean samples={used.mean():.2f}")</code></pre>
+</figure>
+<pre class="output">uniform N=8           acc=0.623
+adaptive (1 probes)   acc=0.620  max N=10
+adaptive (2 probes)   acc=0.622  max N=10
+adaptive (4 probes)   acc=0.624  max N=11
+adaptive (oracle p)   acc=0.677  max N=18
+questions with p&lt;0.01: 0.131  (oracle gives them 0.0 samples on average)
+stop-on-success cap= 8  acc=0.623  mean samples=4.74
+stop-on-success cap=16  acc=0.724  mean samples=7.34
+stop-on-success cap=32  acc=0.802  mean samples=11.07
+stop-on-success cap=64  acc=0.859  mean samples=16.37</pre>
+<ul>
+  <li>Oracle difficulty buys 5.4 points over uniform at the same budget; the ideal policy abandons the 13% of near-impossible questions.</li>
+  <li>Difficulty estimated from 1–4 probe samples buys nothing: the estimate is too noisy and the probes consume budget. Compute-optimal allocation is only as good as the difficulty predictor, which is why <cite>Snell et al. (2024)</cite> use model-predicted difficulty bins.</li>
+  <li>Stop-on-success with cap 16 reaches 0.724 while spending 7.34 samples on average, beating even the oracle allocation. With a hard verifier, sequential sampling is the first thing to try.</li>
+</ul>
+
+<h3>Choosing a Test-Time Strategy</h3>
+<table>
+  <caption>Test-time strategies by verifier availability.</caption>
+  <thead><tr><th>Verifier</th><th>Strategy</th><th>Scales with N until</th></tr></thead>
+  <tbody>
+    <tr><td>None; answers comparable</td><td>Self-consistency; vote share as confidence</td><td>Plurality ceiling</td></tr>
+    <tr><td>Hard, cheap (tests, checker)</td><td>Sample until pass; pass@k is achievable</td><td>Coverage ceiling (and test quality)</td></tr>
+    <tr><td>Learned ORM</td><td>Weighted vote or best-of-N with small N</td><td>Reward-model over-optimisation</td></tr>
+    <tr><td>Learned PRM</td><td>Beam / lookahead search on hard questions</td><td>PRM exploitation on easy questions</td></tr>
+    <tr><td>Reasoning model</td><td>Single long trace; raise budget; vote over 2–8 traces</td><td>Budget saturation (Chapter 8)</td></tr>
+  </tbody>
+</table>
+
+<div class="frame simple"><p><strong>Simple version.</strong> Sample N answers, take the majority.</p></div>
+<div class="frame production"><p><strong>Production version.</strong> Route by predicted difficulty; for verifiable tasks sample sequentially with a hard checker and a cap; otherwise weighted-vote with a calibrated reward model; log vote share and verifier scores; escalate low-agreement items; account for cost per solved task.</p></div>
+<div class="frame why-complex"><p><strong>Why it is complicated.</strong> Samples are correlated; verifiers are exploitable; difficulty is unknown in advance; latency grows with sequential strategies; and the right strategy changes as the base model changes.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="verifiers">Verifiers and Reward Models for Reasoning</h2>
+<p class="chapter-lede">Every technique in this volume, from best-of-N to GRPO, is bounded by its
+verifier. A verifier that can be fooled will be fooled, first by sampling at scale and then, much
+faster, by reinforcement learning. This chapter builds programmatic verifiers, breaks one, hardens
+it, and compares outcome and process reward models.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>You need a function <span class="math">r(x, y)</span> that says whether a completion
+  <span class="math">y</span> solves problem <span class="math">x</span>. It will be called millions of
+  times during RL, on outputs produced by an optimiser actively searching for high reward. It must be
+  fast, deterministic, hard to game and correct on edge cases like formatting, equivalent forms and
+  hedged answers.</p>
+</div>
+
+<p class="facet">Verifier families</p>
+<table>
+  <caption>Verifier types and their failure modes.</caption>
+  <thead><tr><th>Type</th><th>Examples</th><th>Strength</th><th>Typical failure</th></tr></thead>
+  <tbody>
+    <tr><td>Rule-based answer check</td><td>Numeric match, symbolic equivalence (SymPy), multiple-choice letter</td><td>Cheap, exact</td><td>Parsing: wrong span extracted; hedged answers credited</td></tr>
+    <tr><td>Execution</td><td>Unit tests, property tests, compilers, SQL result match</td><td>Checks behaviour</td><td>Weak tests; sandbox escape; test-output spoofing</td></tr>
+    <tr><td>Constraint checker</td><td>IFEval-style format rules, schedules, SAT</td><td>Exact for stated constraints</td><td>Only checks what is written down</td></tr>
+    <tr><td>Formal proof checker</td><td>Lean, Isabelle</td><td>Sound</td><td>Autoformalisation gap; slow</td></tr>
+    <tr><td>Outcome reward model (ORM)</td><td>Classifier on (problem, solution)</td><td>Works for any task with labels</td><td>Exploitable; distribution shift</td></tr>
+    <tr><td>Process reward model (PRM)</td><td>Score per reasoning step</td><td>Dense signal; catches bad steps</td><td>Expensive labels; step segmentation; exploitable</td></tr>
+    <tr><td>LLM judge</td><td>Rubric-prompted model</td><td>Flexible</td><td>Bias, verbosity preference, prompt injection from the policy</td></tr>
+  </tbody>
+</table>
+
+<h3>A Maths Answer Checker</h3>
+<ul>
+  <li>Require a canonical answer format in the prompt (<code>\boxed{}</code> or <code>Answer:</code>), then parse with a priority order and compare values, not strings.</li>
+  <li><code>Fraction</code> makes <code>0.5</code>, <code>1/2</code> and <code>0.50</code> equal without floating-point tolerance issues. For algebraic answers, use symbolic equivalence (SymPy <code>simplify(a - b) == 0</code>) with a timeout.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Programmatic verifiers: a maths checker and two unit-test runners. (<code>verifiers.py</code>)</figcaption>
+<pre><code># Programmatic verifiers: a maths answer checker and a sandboxed unit-test runner.
+import re, subprocess, sys, tempfile, time
+from fractions import Fraction
+from pathlib import Path
+
+NUM = r"-?\d[\d,]*(?:\.\d+)?(?:/\d+)?"
+
+def extract_answer(text):
+    """Prefer \\boxed{...}, then 'answer is X', then the last number in the text."""
+    for pat in (r"\\boxed\{(" + NUM + r")\}", r"answer is\s*\$?(" + NUM + ")"):
+        m = re.findall(pat, text)
+        if m:
+            return m[-1]
+    m = re.findall(NUM, text)
+    return m[-1] if m else None
+
+def to_fraction(s):
+    try:
+        return Fraction(s.replace(",", ""))
+    except (ValueError, ZeroDivisionError):
+        return None
+
+def math_reward(completion, gold):
+    a = extract_answer(completion)
+    return float(a is not None and to_fraction(a) == to_fraction(gold))
+
+cases = [("... so 12*7 = 84. The answer is 84.", "84"),
+         ("We get \\boxed{0.5}", "1/2"),
+         ("Total: 1,234 apples", "1234"),
+         ("I think 42, no wait, it is 41", "42"),
+         ("The answer is 7 (or maybe 8)", "8")]
+for c, g in cases:
+    print(f"{math_reward(c, g):.0f}  gold={g:&gt;5}  {c!r}")
+
+def run_tests(code, tests, timeout=2.0):
+    """Run candidate code + asserts in a fresh interpreter. Returns (reward, reason)."""
+    src = code + "\n\n" + tests + "\nprint('ALL_PASSED')\n"
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "cand.py"
+        f.write_text(src)
+        try:
+            r = subprocess.run([sys.executable, "-I", "-S", str(f)], cwd=d,
+                               capture_output=True, text=True, timeout=timeout,
+                               env={"PATH": "/usr/bin:/bin"})
+        except subprocess.TimeoutExpired:
+            return 0.0, "timeout"
+    if r.returncode == 0 and r.stdout.strip().endswith("ALL_PASSED"):
+        return 1.0, "pass"
+    return 0.0, (r.stderr.strip().splitlines() or ["no output"])[-1][:60]
+
+tests = "assert add(2, 3) == 5\nassert add(-1, 1) == 0"
+cands = {"correct": "def add(a, b):\n    return a + b",
+         "wrong":   "def add(a, b):\n    return a - b",
+         "loops":   "def add(a, b):\n    while True: pass",
+         "hack":    "import sys\ndef add(a, b): return 0\n"
+                    "print('ALL_PASSED'); sys.exit(0)"}
+for name, code in cands.items():
+    t0 = time.perf_counter()
+    rew, why = run_tests(code, tests)
+    print(f"{name:8s} reward={rew:.0f}  {time.perf_counter() - t0:4.2f}s  {why}")
+
+import secrets
+def run_tests_v2(code, tests, timeout=2.0):
+    """Candidate is a module; the harness imports it, runs asserts, prints a nonce."""
+    nonce = secrets.token_hex(8)
+    harness = ("import sys; sys.path.insert(0, '.')\nfrom cand import *\n"
+               f"{tests}\nprint('{nonce}')\n")
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "cand.py").write_text(code)
+        (Path(d) / "harness.py").write_text(harness)
+        try:
+            r = subprocess.run([sys.executable, "-I", "-S", "harness.py"], cwd=d,
+                               capture_output=True, text=True, timeout=timeout,
+                               env={"PATH": "/usr/bin:/bin"})
+        except subprocess.TimeoutExpired:
+            return 0.0, "timeout"
+    ok = r.returncode == 0 and r.stdout.strip().splitlines()[-1:] == [nonce]
+    return float(ok), "pass" if ok else "fail"
+
+print("v2:", {n: run_tests_v2(c, tests)[0] for n, c in cands.items()})</code></pre>
+</figure>
+<pre class="output">1  gold=   84  '... so 12*7 = 84. The answer is 84.'
+1  gold=  1/2  'We get \\boxed{0.5}'
+1  gold= 1234  'Total: 1,234 apples'
+0  gold=   42  'I think 42, no wait, it is 41'
+0  gold=    8  'The answer is 7 (or maybe 8)'
+correct  reward=1  0.02s  pass
+wrong    reward=0  0.02s  AssertionError
+loops    reward=0  2.00s  timeout
+hack     reward=1  0.02s  pass
+v2: {'correct': 1.0, 'wrong': 0.0, 'loops': 0.0, 'hack': 0.0}</pre>
+
+<ul>
+  <li>The maths checker credits equivalent forms and takes the <em>first</em> "answer is" match, so the hedge "7 (or maybe 8)" is scored as 7. A last-number rule would have credited it as 8: under RL the policy would learn to list several numbers.</li>
+  <li>The first test runner is <strong>reward-hackable</strong>: the candidate prints the success marker and exits before any assertion runs. An RL policy will find exploits of this kind; it only needs to sample one once.</li>
+  <li>The second runner separates harness from candidate and requires a per-run nonce printed only after all asserts pass. The candidate cannot know the nonce in advance.</li>
+</ul>
+
+<aside class="callout security"><span class="title">Sandboxing is part of the verifier</span>
+  <ul>
+    <li>v2 is still not a sandbox: the candidate can read <code>harness.py</code> from disk, monkeypatch <code>builtins</code>, fork, or use the network. Run candidates in a container or microVM (gVisor, Firecracker) with no network, read-only filesystem except a scratch dir, CPU/memory/pids limits and a wall-clock timeout.</li>
+    <li>Run tests from a separate process that talks to the candidate through a narrow interface; never trust exit codes or stdout produced by the candidate's process.</li>
+    <li>Hide the tests from the policy, and keep held-out tests that are never used for reward to detect overfitting to the visible ones.</li>
+  </ul>
+</aside>
+
+<h3>Outcome versus Process Reward Models</h3>
+<ul>
+  <li><strong>ORM</strong> <cite>(Cobbe et al., 2021)</cite>: a classifier <span class="math">r_\phi(x, y) \approx P(\text{final answer correct})</span> trained on model samples labelled by a checker. Cheap labels; supervises only the outcome.</li>
+  <li><strong>PRM</strong>: scores each step <span class="math">s_t</span>. <cite>Uesato et al. (2022)</cite> found process and outcome supervision gave similar final-answer error rates on GSM8K, but process supervision was needed to reduce reasoning-trace errors. <cite>Lightman et al. (2023)</cite> collected PRM800K (about 800,000 human step-level labels) and reported a PRM selecting from 1,860 samples solved 78.2% of a representative MATH subset, above an ORM and majority voting.</li>
+  <li>Aggregating step scores into a solution score: minimum over steps, product of step correctness probabilities, or last-step score. Min/product are standard.</li>
+</ul>
+<div class="math">\text{ORM: } s(y) = r_\phi(x, y) \qquad \text{PRM: } s(y) = \prod_{t=1}^{T} r_\psi(x, s_{1..t}) \;\;\text{or}\;\; \min_t r_\psi(x, s_{1..t})</div>
+<ul>
+  <li>Automatic process labels: Math-Shepherd <cite>(Wang et al., 2024)</cite> labels a step by whether rollouts from it reach the right answer, a Monte Carlo value estimate that avoids human labels at the cost of many rollouts.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>ORM versus PRM reranking on synthetic multi-step solutions. (<code>orm_prm.py</code>)</figcaption>
+<pre><code># ORM vs PRM reranking on synthetic multi-step solutions.
+import numpy as np
+rng = np.random.default_rng(0)
+T, N, S = 5000, 16, 6            # problems, samples per problem, steps per solution
+q, lucky, noise = 0.85, 0.15, 1.0
+
+step_ok = rng.random((T, N, S)) &lt; q                        # (T, N, S)
+trace_ok = step_ok.all(-1)                                 # (T, N) every step valid
+final_ok = trace_ok | (rng.random((T, N)) &lt; lucky)         # right answer, maybe by luck
+orm = rng.normal(2.0 * final_ok, noise)                    # sees only the outcome
+prm_steps = rng.normal(2.0 * step_ok, noise)               # one score per step
+prm_min = prm_steps.min(-1)                                # weakest step
+ix = np.arange(T)
+
+for name, s in [("random", rng.random((T, N))), ("ORM", orm), ("PRM-min", prm_min)]:
+    pick = s.argmax(1)
+    print(f"{name:8s} answer acc={final_ok[ix, pick].mean():.3f}  "
+          f"valid trace={trace_ok[ix, pick].mean():.3f}  "
+          f"right-for-wrong-reasons={(final_ok &amp; ~trace_ok)[ix, pick].mean():.3f}")</code></pre>
+</figure>
+<pre class="output">random   answer acc=0.480  valid trace=0.384  right-for-wrong-reasons=0.097
+ORM      answer acc=0.983  valid trace=0.786  right-for-wrong-reasons=0.196
+PRM-min  answer acc=0.880  valid trace=0.854  right-for-wrong-reasons=0.027</pre>
+<ul>
+  <li>Same noise per score, different targets. The ORM maximises final-answer accuracy but one in five selected solutions reached the answer through an invalid step.</li>
+  <li>The PRM selects the most valid traces but loses answer accuracy here: the minimum of six noisy step scores is a noisier solution score than one outcome score.</li>
+  <li>The choice depends on what you ship: an answer (ORM or hard checker) or an explanation a human will rely on (PRM, or both combined).</li>
+</ul>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">PRM advantages</p><ul>
+    <li>Dense credit assignment; enables step-level search.</li>
+    <li>Penalises right-for-wrong-reasons traces.</li>
+    <li>Early termination of doomed partial solutions saves compute.</li>
+  </ul></div>
+  <div class="cons"><p class="facet">PRM disadvantages</p><ul>
+    <li>Step labels are expensive (human) or noisy (Monte Carlo).</li>
+    <li>"Step" is ill-defined for long free-form traces with backtracking.</li>
+    <li>DeepSeek-AI (2025) report PRMs as an unsuccessful attempt at scale: reward hacking and retraining overhead.</li>
+  </ul></div>
+</div>
+
+<h3>Evaluating a Verifier</h3>
+<ul>
+  <li><strong>Precision on accepted outputs</strong> matters most: a false accept becomes a positive training example. Audit a sample of accepted outputs by hand, stratified by task.</li>
+  <li><strong>Recall on correct outputs</strong>: false rejects waste compute and bias the policy towards formats the parser likes.</li>
+  <li><strong>Adversarial suite</strong>: hedged answers, multiple boxed answers, the gold answer quoted from the prompt, early exits, huge outputs, test-file tampering. Add every exploit found in training to this suite.</li>
+  <li><strong>Throughput and latency</strong>: RL issues thousands of verifications per step; a 2-second sandbox start per sample dominates wall-clock time. Pool warm sandboxes.</li>
+</ul>
+
+<ul class="failure-modes">
+  <li>Answer extraction picks the wrong span; hedging rewarded.</li>
+  <li>Unit tests too weak: a constant function passes.</li>
+  <li>Candidate writes the success marker, edits tests or reads expected outputs.</li>
+  <li>Non-deterministic tests produce noisy rewards and unstable RL.</li>
+  <li>Learned reward model over-optimised: scores rise, true accuracy falls.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="bootstrapped">Bootstrapped Reasoning</h2>
+<p class="chapter-lede">If a verifier can tell good solutions from bad ones, a model can generate its
+own training data: sample reasoning traces, keep the verified ones, fine-tune, repeat. This is the
+simplest form of learning from verifiable rewards and remains a workhorse inside larger recipes,
+including the rejection-sampling stage of DeepSeek-R1.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Human-written step-by-step solutions are expensive and few. You have many problems with known
+  final answers but no traces. You want a model that produces good traces for them, without paying
+  annotators to write them.</p>
+</div>
+
+<p class="facet">Possible solutions and what each does not solve</p>
+<ul>
+  <li><strong>SFT on final answers only</strong>: teaches answers, not procedures; no trace to generalise from.</li>
+  <li><strong>Distil traces from a stronger model</strong>: works well (Chapter 7) but needs a stronger model and inherits its errors and licence.</li>
+  <li><strong>Self-generated traces filtered by correctness (STaR, RFT)</strong>: needs no stronger model, but learns only from problems the model already sometimes solves and admits right-for-wrong-reasons traces.</li>
+</ul>
+
+<h3>STaR</h3>
+<ul>
+  <li><cite>Zelikman et al. (2022)</cite>, Self-Taught Reasoner. Loop: generate rationale and answer for each problem with few-shot prompting; keep rationales whose answer is correct; fine-tune the <em>original</em> model on all kept rationales; repeat with the new model as generator.</li>
+  <li><strong>Rationalisation</strong>: for problems the model gets wrong, give it the correct answer as a hint and ask for a rationale that reaches it; keep it if it does, and train on it <em>without</em> the hint. This supplies signal on problems the model cannot yet solve.</li>
+  <li>Documented: on CommonsenseQA, GPT-J with STaR performed comparably to a roughly 30× larger fine-tuned model.</li>
+  <li>STaR is expectation-maximisation-like and can be read as a policy gradient with a 0/1 reward where negatives are discarded.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>STaR and rejection-sampling fine-tuning (pseudocode).</figcaption>
+<pre><code>M0 = pretrained_model
+M = M0
+for iteration in range(K):
+    D = []
+    for x, y_gold in problems:
+        for _ in range(samples_per_problem):            # RFT: several; STaR: one
+            r, y = M.sample(x)                           # rationale, answer
+            if verify(y, y_gold):
+                D.append((x, r, y)); break
+        else:
+            if rationalise:                              # hint with the gold answer
+                r, y = M.sample(x, hint=y_gold)
+                if verify(y, y_gold):
+                    D.append((x, r, y))                  # stored WITHOUT the hint
+    D = dedupe_by_trace(D)                               # RFT: keep distinct traces
+    M = finetune(M0, D)                                  # restart from M0 each round</code></pre>
+</figure>
+
+<h3>Rejection-Sampling Fine-Tuning (RFT)</h3>
+<ul>
+  <li><cite>Yuan et al. (2023)</cite>: sample many traces per problem from an SFT model, keep correct ones, deduplicate by distinct equation sequences, fine-tune. More distinct correct paths per problem improved GSM8K more than more problems with one path.</li>
+  <li>RFT is one step of STaR with many samples. Iterated RFT is sometimes called expert iteration.</li>
+  <li>DeepSeek-R1 used it at scale: after reasoning RL, about 600k reasoning samples were produced by rejection sampling from the RL checkpoint (plus about 200k non-reasoning samples) for the next SFT round (Documented, DeepSeek-AI 2025).</li>
+</ul>
+
+<h3>A Toy STaR Run</h3>
+<ul>
+  <li>The "model" chooses one of four rationale strategies for an addition problem: correct column addition with carries, column addition forgetting carries, adding leading digits only, or guessing.</li>
+  <li>It conditions on a context (number of digits, whether a carry occurs). The base model almost never uses the correct strategy on long problems.</li>
+  <li>This isolates the data-selection dynamics of STaR from language modelling.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Toy STaR with and without rationalisation. (<code>star.py</code>)</figcaption>
+<pre><code># Toy STaR: sample rationales, keep those reaching the right answer, fine-tune, repeat.
+import numpy as np
+rng = np.random.default_rng(0)
+
+def column_add(a, b, carry=True):
+    out, c, place = 0, 0, 1
+    while a or b or c:
+        s = a % 10 + b % 10 + (c if carry else 0)
+        out += (s % 10) * place
+        c, a, b, place = s // 10, a // 10, b // 10, place * 10
+    return out
+
+PROCS = {  # "rationale strategies" the model can emit
+    "column+carry": lambda a, b: column_add(a, b, True),
+    "column-nocarry": lambda a, b: column_add(a, b, False),
+    "leading-only": lambda a, b: (a // 10 + b // 10) * 10,
+    "guess": lambda a, b: int(rng.integers(0, 2 * max(a, b) + 2)),
+}
+K = len(PROCS)
+
+def context(a, b):          # 6 contexts: digit count (1..3) x carry present (0/1)
+    d = len(str(max(a, b)))
+    return (d - 1) * 2 + int(column_add(a, b) != column_add(a, b, False))
+
+def sample_problems(n):
+    d = rng.integers(1, 4, n)
+    lo_hi = [(10 ** (k - 1), 10 ** k) for k in d]
+    return [(int(rng.integers(lo, hi)), int(rng.integers(lo, hi))) for lo, hi in lo_hi]
+
+# Base model: the correct strategy is rarer on longer problems. (ctx, K) logits.
+base = np.log(np.array([[p, 0.6 - p, 0.2, 0.2] for p in (0.3, 0.3, 0.03, 0.03,
+                                                       0.003, 0.003)]))
+
+def softmax(z):
+    e = np.exp(z - z.max(-1, keepdims=True)); return e / e.sum(-1, keepdims=True)
+
+def evaluate(logits, probs):
+    P = softmax(logits); hit = 0.0
+    for a, b in probs:
+        c = context(a, b)
+        hit += sum(P[c, k] * (f(a, b) == a + b) for k, f in enumerate(PROCS.values())
+                   if k != 3)                               # guess ~ 0 on average
+    return hit / len(probs)
+
+def fine_tune(dataset, steps=40, lr=0.5):
+    """Restart from the base model (as in STaR); fit NLL on the kept rationales."""
+    W = base.copy()
+    ctx = np.array([c for c, _ in dataset]); ks = np.array([k for _, k in dataset])
+    for _ in range(steps):
+        g = softmax(W[ctx]); g[np.arange(len(ks)), ks] -= 1     # dNLL/dlogits
+        np.add.at(W, ctx, -lr * g / len(ks) * 6)
+    return W
+
+def star(iters=6, n=600, rationalise=False):
+    W, test = base.copy(), sample_problems(2000)
+    hard = [(a, b) for a, b in test if context(a, b) == 5]         # 3 digits, carry
+    print(f"  iter 0  test acc={evaluate(W, test):.3f}  hard={evaluate(W, hard):.3f}")
+    for it in range(1, iters + 1):
+        kept, lucky = [], 0
+        P = softmax(W)
+        for a, b in sample_problems(n):
+            c = context(a, b)
+            k = rng.choice(K, p=P[c])
+            if list(PROCS.values())[k](a, b) == a + b:
+                kept.append((c, k)); lucky += k == 3
+            elif rationalise:        # hint = gold answer; keep a strategy that fits
+                fits = [j for j, f in enumerate(PROCS.values())
+                        if j != 3 and f(a, b) == a + b]
+                if fits: kept.append((c, fits[0]))
+        W = fine_tune(kept)
+        print(f"  iter {it}  kept={len(kept):3d}  lucky-guess rationales={lucky:2d}  "
+              f"test acc={evaluate(W, test):.3f}  hard={evaluate(W, hard):.3f}")
+    return W
+
+print("STaR without rationalisation"); star()
+print("STaR with rationalisation");    W = star(rationalise=True)
+print("final P(strategy | 3 digits, carry):",
+      {k: round(float(v), 3) for k, v in zip(PROCS, softmax(W)[5])})</code></pre>
+</figure>
+<pre class="output">STaR without rationalisation
+  iter 0  test acc=0.240  hard=0.006
+  iter 1  kept=137  lucky-guess rationales= 3  test acc=0.618  hard=0.014
+  iter 2  kept=366  lucky-guess rationales= 0  test acc=0.690  hard=0.006
+  iter 3  kept=399  lucky-guess rationales= 0  test acc=0.689  hard=0.008
+  iter 4  kept=414  lucky-guess rationales= 0  test acc=0.690  hard=0.006
+  iter 5  kept=423  lucky-guess rationales= 0  test acc=0.690  hard=0.007
+  iter 6  kept=404  lucky-guess rationales= 0  test acc=0.690  hard=0.007
+STaR with rationalisation
+  iter 0  test acc=0.223  hard=0.004
+  iter 1  kept=600  lucky-guess rationales= 4  test acc=0.945  hard=0.974
+  iter 2  kept=600  lucky-guess rationales= 0  test acc=0.951  hard=0.970
+  iter 3  kept=600  lucky-guess rationales= 0  test acc=0.955  hard=0.974
+  iter 4  kept=600  lucky-guess rationales= 0  test acc=0.956  hard=0.974
+  iter 5  kept=600  lucky-guess rationales= 0  test acc=0.957  hard=0.970
+  iter 6  kept=600  lucky-guess rationales= 0  test acc=0.959  hard=0.972
+final P(strategy | 3 digits, carry): {'column+carry': 0.972, 'column-nocarry': 0.01, 'leading-only': 0.009, 'guess': 0.009}</pre>
+
+<p class="facet">Reading the output</p>
+<ul>
+  <li><strong>Plain STaR stalls where the model starts near zero.</strong> Easy contexts improve fast (0.24 → 0.69 overall), but on three-digit problems with carries accuracy stays below 1%: almost no correct samples, so almost no training data. Filtering can only sharpen what the model can already do.</li>
+  <li><strong>Rationalisation unlocks the hard context</strong> (0.004 → 0.97) because the hint supplies a correct rationale the model can then imitate. In real models the risk is rationalisations that <em>reach</em> the hinted answer through unjustified steps.</li>
+  <li><strong>Lucky guesses enter the training set</strong> (3–4 in round one). Here they are rare because guessing seldom hits; on multiple-choice data a guess is right 25% of the time, and those traces are reinforced.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Failure modes of filtering on outcomes</span>
+  <ul>
+    <li><strong>False positives</strong>: right answer, wrong trace (guessing on multiple choice, cancelling errors). Mitigate with open-ended answers, PRM filtering or trace checks.</li>
+    <li><strong>Easy-problem bias</strong>: kept data over-represents problems the model already solves; weight by inverse pass rate or cap samples per problem.</li>
+    <li><strong>Diversity collapse</strong>: repeated rounds converge on one trace style; deduplicate and keep multiple distinct correct traces.</li>
+    <li><strong>No negative signal</strong>: discarded failures teach nothing. RL with baselines (Chapter 6) uses them.</li>
+  </ul>
+</aside>
+
+<h3>From STaR to Policy Gradient</h3>
+<p>Fine-tuning on kept samples maximises <span class="math">\sum_{y:\,r(y)=1}\log\pi_\theta(y\mid x)</span>. Its gradient, in expectation over samples from <span class="math">\pi_\theta</span>, is</p>
+<div class="math">\mathbb{E}_{y\sim\pi_\theta}\big[r(y)\,\nabla_\theta\log\pi_\theta(y\mid x)\big] = \nabla_\theta\, \mathbb{E}_{y\sim\pi_\theta}[r(y)]</div>
+<ul>
+  <li>which is REINFORCE with reward in {0, 1} and no baseline. Subtracting a baseline gives failures a negative weight and reduces variance. Doing so with a group mean is GRPO.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="rlvr">Reinforcement Learning with Verifiable Rewards</h2>
+<p class="chapter-lede">RL with verifiable rewards (RLVR) is the technique behind the open reasoning
+models of 2025: sample several solutions per problem, score them with a programmatic verifier, and
+push the policy towards the better ones relative to their siblings. This chapter derives Group
+Relative Policy Optimisation (GRPO), implements it end to end on a verifiable toy task, and covers
+the failure modes that the DAPO recipe was designed to fix.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Rejection sampling ignores failures and learns only from problems the model already solves.
+  PPO with a learned value network (Volume 8) uses failures but doubles the memory footprint (a
+  critic as large as the policy), and a per-token value function is hard to learn for long
+  reasoning traces whose reward arrives only at the end. You want an on-policy RL algorithm that uses
+  both successes and failures, needs no critic and no learned reward model, and scales to traces of
+  tens of thousands of tokens.</p>
+</div>
+
+<h3>Deriving GRPO</h3>
+<h4>Objective</h4>
+<p>For prompts <span class="math">q</span> and completions <span class="math">o \sim \pi_\theta(\cdot\mid q)</span> with verifiable reward <span class="math">r(q, o)</span>, maximise the KL-regularised expected reward</p>
+<div class="math">J(\theta) = \mathbb{E}_{q}\Big[\mathbb{E}_{o\sim\pi_\theta(\cdot\mid q)}\big[r(q,o)\big] - \beta\, D_{\mathrm{KL}}\big(\pi_\theta(\cdot\mid q)\,\|\,\pi_{\text{ref}}(\cdot\mid q)\big)\Big]</div>
+
+<h4>Policy gradient with a baseline</h4>
+<div class="math">\nabla_\theta \mathbb{E}_{o}[r] = \mathbb{E}_{o}\Big[\big(r(q,o) - b(q)\big)\sum_{t=1}^{|o|}\nabla_\theta\log\pi_\theta(o_t\mid q, o_{&lt;t})\Big]</div>
+<ul>
+  <li>Any baseline <span class="math">b(q)</span> that does not depend on <span class="math">o</span> leaves the gradient unbiased, since <span class="math">\mathbb{E}_o[\nabla\log\pi_\theta(o)] = 0</span>.</li>
+  <li>A good choice is <span class="math">b(q) = V(q) = \mathbb{E}_o[r(q,o)]</span>, the prompt's success rate. PPO learns it with a critic.</li>
+  <li><strong>GRPO's move</strong> <cite>(Shao et al., 2024)</cite>: sample a <em>group</em> of <span class="math">G</span> completions per prompt and use their mean reward as a Monte Carlo estimate of <span class="math">V(q)</span>. No critic.</li>
+</ul>
+
+<h4>Group-relative advantage</h4>
+<div class="math">\hat A_i = \frac{r_i - \operatorname{mean}(r_1,\dots,r_G)}{\operatorname{std}(r_1,\dots,r_G) + \epsilon_{\text{std}}}, \qquad \hat A_{i,t} = \hat A_i \;\;\forall t</div>
+<ul>
+  <li>Every token in completion <span class="math">i</span> receives the same advantage (outcome supervision). DeepSeekMath also describes a process-supervision variant that assigns step-level advantages.</li>
+  <li>With binary rewards and group success fraction <span class="math">\hat p</span>, <span class="math">\operatorname{std} = \sqrt{\hat p(1-\hat p)}</span>, giving</li>
+</ul>
+<div class="math">\hat A_{\text{correct}} = \sqrt{\frac{1-\hat p}{\hat p}}, \qquad \hat A_{\text{wrong}} = -\sqrt{\frac{\hat p}{1-\hat p}}</div>
+<ul>
+  <li>A single success among 16 samples gets advantage <span class="math">\sqrt{15} \approx 3.9</span>; each of the 15 failures gets <span class="math">-0.26</span>. Rare successes are strongly amplified: this is what lets RLVR learn on hard problems.</li>
+  <li>If all <span class="math">G</span> rewards are equal (<span class="math">\hat p \in \{0, 1\}</span>), every advantage is zero and the group contributes <strong>no gradient</strong> (except through the KL term).</li>
+  <li>Including sample <span class="math">i</span> in its own baseline shrinks the gradient by <span class="math">(G-1)/G</span>; the leave-one-out baseline (RLOO; <cite>Ahmadian et al., 2024</cite>) removes this. Std normalisation is a per-prompt reweighting, not part of the unbiased estimator, which is why Dr. GRPO <cite>(Liu et al., 2025)</cite> argues for dropping it.</li>
+</ul>
+
+<h4>Clipped surrogate and KL</h4>
+<p>To reuse each batch of rollouts for several gradient steps, GRPO keeps PPO's clipped importance ratio against the sampling policy <span class="math">\pi_{\theta_{\text{old}}}</span>:</p>
+<div class="math">\rho_{i,t} = \frac{\pi_\theta(o_{i,t}\mid q, o_{i,&lt;t})}{\pi_{\theta_{\text{old}}}(o_{i,t}\mid q, o_{i,&lt;t})}</div>
+<div class="math">J_{\text{GRPO}}(\theta) = \mathbb{E}\Bigg[\frac{1}{G}\sum_{i=1}^{G}\frac{1}{|o_i|}\sum_{t=1}^{|o_i|}\Big(\min\big(\rho_{i,t}\hat A_{i,t},\ \operatorname{clip}(\rho_{i,t}, 1-\varepsilon, 1+\varepsilon)\,\hat A_{i,t}\big) - \beta\,\mathbb{D}_{i,t}\Big)\Bigg]</div>
+<ul>
+  <li>The KL is added directly to the loss rather than folded into the reward (as in RLHF-style PPO), using the per-token "k3" estimator, which is unbiased and always non-negative:</li>
+</ul>
+<div class="math">\mathbb{D}_{i,t} = \frac{\pi_{\text{ref}}(o_{i,t}\mid\cdot)}{\pi_\theta(o_{i,t}\mid\cdot)} - \log\frac{\pi_{\text{ref}}(o_{i,t}\mid\cdot)}{\pi_\theta(o_{i,t}\mid\cdot)} - 1 \;\ge 0</div>
+<ul>
+  <li>Typical published settings: <span class="math">G</span> from 8 to 64, <span class="math">\varepsilon = 0.2</span>, <span class="math">\beta</span> from 0 to 0.04 (DeepSeekMath used 0.04). Several recent recipes set <span class="math">\beta = 0</span> for reasoning RL, because the policy is <em>meant</em> to move far from the reference.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  A[Batch of B prompts] --> B[Sample G completions each from pi_old]
+  B --> C[Verifier rewards r_i]
+  C --> D[Group mean and std per prompt]
+  D --> E[Advantage A_i broadcast to tokens]
+  B --> F[Log-probs under pi_old and pi_ref]
+  E --> G[Clipped surrogate minus beta KL]
+  F --> G
+  G --> H[mu gradient steps on the same rollouts]
+  H --> I[pi_old := pi_theta]
+  I --> A</pre>
+<figcaption>One GRPO iteration. No value network and no learned reward model.</figcaption>
+</figure>
+
+<h3>Implementation on a Toy Verifiable Task</h3>
+<ul>
+  <li><strong>Task</strong>: two-digit plus two-digit addition. The policy emits the three answer digits one token at a time, least significant first (so each digit depends on a carry the model has already emitted). Reward is 1 for an exact match, else 0.</li>
+  <li><strong>Policy</strong>: an MLP over one-hot operand digits, position and previously emitted digits: an autoregressive model small enough for CPU. Replace <code>Policy</code> with a transformer and the trainer is unchanged.</li>
+  <li><strong>Cold start</strong>: from random initialisation the success rate is about 1 in 1,000, so almost every group is flat and GRPO has no signal. As in DeepSeek-R1, a brief SFT on a few hundred worked examples gives a policy that sometimes succeeds (about 10%); RL takes it from there.</li>
+  <li>Hyperparameters: <span class="math">B = 32</span> prompts, <span class="math">G = 16</span>, <span class="math">\mu = 2</span> inner steps, <span class="math">\varepsilon = 0.2</span>, <span class="math">\beta = 0.04</span>, Adam at <span class="math">10^{-3}</span>, 1,500 steps.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>GRPO trainer with KL to a frozen reference, plus a DAPO-style variant. (<code>grpo.py</code>)</figcaption>
+<pre><code># GRPO on a toy verifiable task: 2-digit + 2-digit addition, one digit per token.
+import sys, time, torch, torch.nn as nn, torch.nn.functional as F
+torch.manual_seed(0); torch.set_num_threads(2)
+L = 3                                     # answer digits, least significant first
+
+def make_batch(n):
+    a, b = torch.randint(10, 100, (n,)), torch.randint(10, 100, (n,))
+    return a, b, a + b
+
+def digits(x, k):                                        # (n,) -&gt; (n, k), LSB first
+    return torch.stack([(x // 10 ** i) % 10 for i in range(k)], 1)
+
+class Policy(nn.Module):
+    """p(y_t | a, b, y_&lt;t): an MLP over one-hot inputs, position and previous digits."""
+    def __init__(self, h=256):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(40 + L + 10 * L, h), nn.ReLU(),
+                                 nn.Linear(h, h), nn.ReLU(), nn.Linear(h, 10))
+    def logits(self, a, b, y):            # y: (n, L) teacher-forced digits
+        n = a.shape[0]
+        x = F.one_hot(torch.cat([digits(a, 2), digits(b, 2)], 1), 10).view(n, 40)
+        outs = []
+        for t in range(L):
+            prev = F.one_hot(y, 10).float() * (torch.arange(L) &lt; t).view(1, L, 1)
+            pos = F.one_hot(torch.full((n,), t), L).float()
+            outs.append(self.net(torch.cat([x.float(), pos, prev.view(n, -1)], 1)))
+        return torch.stack(outs, 1)                      # (n, L, 10)
+
+    @torch.no_grad()
+    def sample(self, a, b, greedy=False):
+        y = torch.zeros(a.shape[0], L, dtype=torch.long)
+        for t in range(L):
+            lg = self.logits(a, b, y)[:, t]
+            y[:, t] = (lg.argmax(-1) if greedy
+                       else torch.multinomial(lg.softmax(-1), 1)[:, 0])
+        return y
+
+def reward(y, s):                                        # verifiable: exact match, 0/1
+    return (y == digits(s, L)).all(1).float()
+
+def accuracy(pi, n=2000):
+    a, b, s = make_batch(n)
+    return reward(pi.sample(a, b, greedy=True), s).mean().item()
+
+def cold_start(pi, n_examples=400, steps=150):
+    """Small SFT on a handful of worked answers: the 'cold start' before RL."""
+    a, b, s = make_batch(n_examples)
+    opt = torch.optim.Adam(pi.parameters(), 1e-3)
+    for _ in range(steps):
+        loss = F.cross_entropy(pi.logits(a, b, digits(s, L)).reshape(-1, 10),
+                               digits(s, L).reshape(-1))
+        opt.zero_grad(); loss.backward(); opt.step()
+
+def token_logp(m, a, b, y):
+    return m.logits(a, b, y).log_softmax(-1).gather(-1, y[..., None])[..., 0]
+
+def rollout(pi, B, G):
+    a, b, s = make_batch(B)
+    a, b, s = (t.repeat_interleave(G) for t in (a, b, s))   # (B*G,), G per prompt
+    y = pi.sample(a, b)                                       # (B*G, L)
+    return a, b, y, reward(y, s).view(B, G)
+
+def grpo(pi, ref, steps=1500, B=32, G=16, mu=2, lr=1e-3, eps_lo=0.2, eps_hi=0.2,
+         beta=0.04, dynamic=False, log_every=150):
+    opt = torch.optim.Adam(pi.parameters(), lr)
+    for step in range(steps + 1):
+        a, b, y, r = rollout(pi, B, G)
+        if dynamic:                       # DAPO: resample until B groups vary
+            for _ in range(3):
+                if (r.std(1) &gt; 0).sum() &gt;= B: break
+                a2, b2, y2, r2 = rollout(pi, B, G)
+                a, b, y, r = torch.cat([a, a2]), torch.cat([b, b2]), \
+                    torch.cat([y, y2]), torch.cat([r, r2])
+        adv = (r - r.mean(1, keepdim=True)) / (r.std(1, keepdim=True) + 1e-4)
+        keep = (r.std(1) &gt; 0).repeat_interleave(G)   # informative groups only
+        flat = 1 - keep.float().mean()
+        adv = adv.view(-1)
+        if dynamic:
+            if not keep.any(): continue              # nothing to learn from this batch
+            a, b, y, adv = a[keep], b[keep], y[keep], adv[keep]
+        with torch.no_grad():
+            logp_old = token_logp(pi, a, b, y)                   # (n, L)
+            logp_ref = token_logp(ref, a, b, y)
+        for _ in range(mu):                                      # reuse the rollouts
+            lp_all = pi.logits(a, b, y).log_softmax(-1)              # (n, L, 10)
+            logp = lp_all.gather(-1, y[..., None])[..., 0]           # (n, L)
+            ratio = (logp - logp_old).exp()
+            A = adv[:, None]
+            surr = torch.min(ratio * A, ratio.clamp(1 - eps_lo, 1 + eps_hi) * A)
+            kl = (logp_ref - logp).exp() - (logp_ref - logp) - 1  # k3 estimator, &gt;= 0
+            per_tok = -(surr - beta * kl)                            # (n, L)
+            loss = per_tok.mean()                        # every answer has length L
+            opt.zero_grad(); loss.backward(); opt.step()
+        if step % log_every == 0:
+            ent = -(lp_all.exp() * lp_all).sum(-1).mean().item()
+            print(f"step {step:4d}  reward {r.mean():.3f}  flat groups "
+                  f"{flat:.2f}  entropy {ent:.3f}  "
+                  f"kl {kl.mean():.4f}  greedy acc {accuracy(pi):.3f}")
+
+if __name__ == "__main__":
+    import copy
+    t0 = time.time()
+    pi = Policy(); cold_start(pi)
+    ref = copy.deepcopy(pi).requires_grad_(False)
+    print(f"after cold-start SFT: greedy acc {accuracy(pi):.3f}")
+    variant = sys.argv[1] if len(sys.argv) &gt; 1 else "grpo"
+    if variant == "grpo":
+        grpo(pi, ref)
+    else:                                 # DAPO-style: clip-higher, no KL
+        grpo(pi, ref, eps_hi=0.28, beta=0.0, dynamic=True)
+    print(f"wall time {time.time() - t0:.1f}s")</code></pre>
+</figure>
+<pre class="output">$ python3 grpo.py
+after cold-start SFT: greedy acc 0.105
+step    0  reward 0.117  flat groups 0.53  entropy 0.863  kl 0.0557  greedy acc 0.110
+step  150  reward 0.174  flat groups 0.53  entropy 0.789  kl 0.3412  greedy acc 0.179
+step  300  reward 0.201  flat groups 0.59  entropy 0.561  kl 0.5855  greedy acc 0.274
+step  450  reward 0.326  flat groups 0.31  entropy 0.467  kl 0.7459  greedy acc 0.425
+step  600  reward 0.344  flat groups 0.38  entropy 0.285  kl 0.8674  greedy acc 0.514
+step  750  reward 0.689  flat groups 0.28  entropy 0.175  kl 1.2628  greedy acc 0.671
+step  900  reward 0.674  flat groups 0.53  entropy 0.126  kl 1.2936  greedy acc 0.772
+step 1050  reward 0.711  flat groups 0.47  entropy 0.102  kl 1.5313  greedy acc 0.832
+step 1200  reward 0.830  flat groups 0.81  entropy 0.034  kl 1.1926  greedy acc 0.841
+step 1350  reward 0.791  flat groups 0.78  entropy 0.059  kl 1.3336  greedy acc 0.831
+step 1500  reward 0.828  flat groups 0.72  entropy 0.072  kl 1.4186  greedy acc 0.856
+wall time 17.8s</pre>
+
+<p class="facet">Reading the run</p>
+<ul>
+  <li><strong>Reward rises</strong> from 0.12 to 0.83 and greedy held-out accuracy from 0.11 to 0.86, on problems never seen during cold start, with only a 0/1 verifier as supervision.</li>
+  <li><strong>Entropy collapses</strong> from 0.86 to 0.07 nats per token. The policy becomes nearly deterministic, which is desired on solved inputs but fatal on unsolved ones: it stops exploring.</li>
+  <li><strong>Flat groups rise to 0.7–0.8.</strong> Most groups are now all-correct or all-wrong and contribute no gradient. Remaining errors sit on inputs the policy gets wrong <em>consistently</em>, so learning plateaus near 0.84: the vanishing-signal problem in miniature.</li>
+  <li><strong>KL grows</strong> despite <span class="math">\beta = 0.04</span>: the reward gradient dominates. Large KL is not a problem here because the reference was only a warm start.</li>
+</ul>
+
+<h3>Known Pathologies and the DAPO Fixes</h3>
+<p><cite>Yu et al. (2025)</cite>, DAPO (Decoupled Clip and Dynamic sAmpling Policy Optimisation), documented four problems when reproducing R1-Zero-style training and a fix for each; with Qwen2.5-32B base they reported 50 points on AIME 2024, above the 47 reported for DeepSeek-R1-Zero-Qwen-32B, using half its training steps.</p>
+
+<table>
+  <caption>GRPO failure modes and the DAPO changes that address them.</caption>
+  <thead><tr><th>Problem</th><th>Mechanism</th><th>DAPO fix</th></tr></thead>
+  <tbody>
+    <tr><td>Entropy collapse</td><td>Symmetric clip caps how fast a low-probability token can grow: with <span class="math">\pi_{\text{old}} = 0.01</span> and <span class="math">\varepsilon = 0.2</span>, one update can take it only to 0.012, while a 0.9 token can reach 1.0. Exploration tokens are suppressed.</td><td><strong>Clip-Higher</strong>: decouple bounds, <span class="math">\varepsilon_{\text{low}} = 0.2</span>, <span class="math">\varepsilon_{\text{high}} = 0.28</span>.</td></tr>
+    <tr><td>Vanishing signal</td><td>Groups with all-equal rewards have zero advantage; as accuracy rises the effective batch shrinks and gradient noise grows.</td><td><strong>Dynamic Sampling</strong>: over-sample and keep only groups with mixed rewards until the batch is full.</td></tr>
+    <tr><td>Length bias</td><td>Per-sequence averaging <span class="math">1/|o_i|</span> gives each token of a long response less weight. Long wrong answers are under-penalised, so length drifts up with gibberish and repetition; long good answers are under-rewarded.</td><td><strong>Token-level policy gradient loss</strong>: sum over all tokens in the batch divided by total tokens.</td></tr>
+    <tr><td>Truncation noise</td><td>Responses cut at the max length get reward 0 even if the reasoning was sound: the reward punishes length rather than error.</td><td><strong>Overlong reward shaping</strong>: mask truncated samples (overlong filtering) or apply a soft linear length penalty in a buffer before the limit.</td></tr>
+  </tbody>
+</table>
+<div class="math">J_{\text{DAPO}} = \mathbb{E}\Bigg[\frac{1}{\sum_{i=1}^{G}|o_i|}\sum_{i=1}^{G}\sum_{t=1}^{|o_i|}\min\big(\rho_{i,t}\hat A_{i,t},\ \operatorname{clip}(\rho_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}})\hat A_{i,t}\big)\Bigg]\quad \text{s.t. } 0 &lt; |\{o_i : \text{correct}\}| &lt; G</div>
+<ul>
+  <li>DAPO also drops the KL term entirely.</li>
+  <li>Dr. GRPO <cite>(Liu et al., 2025)</cite> makes a related argument: removing both the <span class="math">1/|o_i|</span> length normalisation and the std normalisation eliminates a length bias and a difficulty bias, and curbs growth of incorrect-response length.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Running the DAPO-style variant: Clip-Higher, dynamic sampling, no KL. (Token-level loss is identical here because every answer has length 3.)</figcaption>
+<pre><code>python3 grpo.py dapo      # grpo(pi, ref, eps_hi=0.28, beta=0.0, dynamic=True)</code></pre>
+</figure>
+<pre class="output">after cold-start SFT: greedy acc 0.105
+step    0  reward 0.075  flat groups 0.70  entropy 0.841  kl 0.0449  greedy acc 0.120
+step  150  reward 0.246  flat groups 0.48  entropy 0.551  kl 0.6380  greedy acc 0.295
+step  300  reward 0.424  flat groups 0.44  entropy 0.297  kl 1.0856  greedy acc 0.509
+step  450  reward 0.622  flat groups 0.57  entropy 0.161  kl 0.9720  greedy acc 0.748
+step  600  reward 0.878  flat groups 0.81  entropy 0.059  kl 1.5782  greedy acc 0.814
+step  750  reward 0.850  flat groups 0.90  entropy 0.038  kl 11.5584  greedy acc 0.824
+step  900  reward 0.863  flat groups 0.95  entropy 0.039  kl 5.0264  greedy acc 0.823
+step 1050  reward 0.820  flat groups 0.99  entropy 0.001  kl 6.2102  greedy acc 0.834
+step 1200  reward 0.840  flat groups 0.96  entropy 0.063  kl 1.4962  greedy acc 0.823
+step 1500  reward 0.872  flat groups 0.97  entropy 0.018  kl 0.6431  greedy acc 0.839
+wall time 28.3s</pre>
+<ul>
+  <li>Dynamic sampling roughly doubles sample efficiency early: greedy accuracy 0.51 at step 300 and 0.75 at step 450, against 0.27 and 0.43 for GRPO.</li>
+  <li>It does not raise the plateau. By step 1050, 99% of sampled groups are flat and the step at 1350 was skipped entirely (no informative group in four batches, so no log line). When the policy is deterministically wrong on some inputs, filtering has nothing to keep; you need more exploration (temperature, entropy bonus), a curriculum, or better cold-start data.</li>
+  <li>Without KL, the divergence from the reference is erratic (11.6 at step 750). With a verifiable reward that is acceptable; with a learned reward model it is the classic sign of reward hacking.</li>
+  <li>A toy with fixed-length answers cannot show length bias. Exercise 6 asks you to add variable-length answers and observe it.</li>
+</ul>
+
+<h3>Engineering an RLVR System</h3>
+<figure class="diagram">
+<pre class="ascii">+------------------+  prompts   +---------------------+  completions  +---------------+
+| prompt sampler   | ---------&gt; | rollout engine      | ------------&gt; | verifier pool |
+| curriculum,      |            | (vLLM / SGLang),    |               | sandboxes,    |
+| pass-rate filter |            | current weights     |               | maths checks  |
++------------------+            +---------------------+               +-------+-------+
+         ^                                 ^ weight sync                      | rewards
+         | pass rates                      |                                  v
++------------------+  metrics   +---------------------+   batches     +---------------+
+| monitoring:      | &lt;--------- | trainer (FSDP),     | &lt;------------ | advantages    |
+| reward, entropy, |            | policy + frozen ref |               | per group     |
+| length, KL       |            |                     |               |               |
++------------------+            +---------------------+               +---------------+</pre>
+<figcaption>Production RLVR: generation dominates wall-clock time; trainer and generator hold different copies of the weights.</figcaption>
+</figure>
+<ul>
+  <li><strong>Generation is the bottleneck.</strong> Long traces make rollouts 70–90% of step time in public reports. Use a fast inference engine, synchronise weights every step, and consider partial rollouts (Kimi k1.5) for very long traces.</li>
+  <li><strong>Mismatch between inference and training numerics</strong>: log-probs from the rollout engine differ from the trainer's; recompute <span class="math">\log\pi_{\text{old}}</span> in the trainer, as the listing does.</li>
+  <li><strong>Prompt filtering</strong>: drop prompts with pass rate 0 or 1 under the current policy (measured offline or online); they only cost rollouts.</li>
+  <li><strong>Monitor</strong>: mean reward, held-out accuracy, entropy, response length (correct vs incorrect separately), clip fraction, KL, flat-group fraction, truncation rate, verifier exception rate.</li>
+</ul>
+
+<div class="frame simple"><p><strong>Simple version.</strong> Sample G answers per prompt, reward with a checker, normalise within the group, apply a clipped policy-gradient update.</p></div>
+<div class="frame production"><p><strong>Production version.</strong> Distributed rollouts on an inference engine, asynchronous sandboxed verifiers, curriculum and pass-rate filtering, token-level loss, clip-higher, overlong shaping, frequent held-out evaluation, trace sampling for reward-hacking review, and checkpoint selection on held-out accuracy rather than training reward.</p></div>
+<div class="frame why-complex"><p><strong>Why it is complicated.</strong> Rollout lengths vary by 100×, so batches are ragged and GPUs idle; verifiers are slow and exploitable; the signal vanishes as the model improves; entropy and length dynamics are unstable; and gains on the training distribution must be checked for transfer.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="recipes">Reasoning Model Training Recipes</h2>
+<p class="chapter-lede">Three public reports describe how open reasoning models were trained in
+enough detail to learn from: DeepSeek-R1, Tülu 3 and Kimi k1.5. This chapter extracts the recipes,
+separates what was documented from what is inferred, and covers distillation, which for most teams is
+the practical way to obtain a reasoning model.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>RLVR on a toy is easy; RLVR on a 30B–700B model is a multi-stage pipeline with data curation,
+  cold-start SFT, one or more RL phases, rejection sampling, general-purpose alignment and
+  distillation. Each stage fixes a problem the previous one created. Which stages are essential, and
+  which only make sense at frontier scale?</p>
+</div>
+
+<h3>DeepSeek-R1-Zero: RL from a Base Model</h3>
+<ul>
+  <li><span class="evidence documented">Documented</span> <cite>(DeepSeek-AI, 2025)</cite>: GRPO applied directly to DeepSeek-V3-Base with no SFT.</li>
+  <li>Rewards were rule-based only: an <strong>accuracy reward</strong> (answer in a specified format checked against ground truth; compiler and test cases for code) and a <strong>format reward</strong> (reasoning inside <code>&lt;think&gt;</code> tags). Neural reward models were deliberately not used, citing reward hacking and retraining cost.</li>
+  <li>A minimal template asked for reasoning then answer, without prescribing strategies, to observe what emerged.</li>
+  <li>AIME 2024 pass@1 rose from 15.6% to 71.0% over training (86.7% with majority voting). Response length grew steadily; the report describes reflection and re-evaluation behaviour emerging (the "aha moment").</li>
+  <li>Problems: poor readability and language mixing.</li>
+</ul>
+
+<h3>DeepSeek-R1: The Four-Stage Pipeline</h3>
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  A[V3-Base] --> B[1. Cold-start SFT, long CoT]
+  B --> C[2. Reasoning RL, GRPO]
+  C --> D[Rejection sampling, 600k]
+  E[200k non-reasoning] --> F
+  D --> F[3. SFT on 800k, 2 epochs]
+  F --> G[4. RL, all scenarios]
+  G --> H[DeepSeek-R1]
+  D --> I[Distil: SFT Qwen, Llama]</pre>
+<figcaption>DeepSeek-R1 training pipeline as documented in DeepSeek-AI (2025).</figcaption>
+</figure>
+<ul>
+  <li><strong>Cold start</strong> fixes readability and speeds up RL convergence: a readable output format with a summary.</li>
+  <li><strong>Language-consistency reward</strong> (fraction of target-language words in the CoT) slightly reduced benchmark performance but was kept for readability. A documented quality/metric trade-off.</li>
+  <li><strong>Rejection sampling</strong> filtered out mixed-language, overly long and code-block-heavy traces, and used a generative reward (DeepSeek-V3 as judge) for some data without rule-based checks.</li>
+  <li><strong>Stage 2 rewards</strong>: accuracy, format and language consistency. <strong>Stage 3</strong> fine-tunes V3-Base (not the RL checkpoint) on about 800k samples for two epochs. <strong>Stage 4</strong> runs RL across all scenarios: rule rewards for reasoning data, reward models for helpfulness and harmlessness on general data.</li>
+  <li><strong>Unsuccessful attempts</strong> (documented): process reward models (step definition, labelling and reward hacking) and MCTS (token-space search too large; value model hard to train).</li>
+</ul>
+
+<h3>Distillation</h3>
+<ul>
+  <li><span class="evidence documented">Documented</span>: DeepSeek fine-tuned Qwen2.5 (1.5B–32B) and Llama (8B, 70B) models on the ~800k samples, SFT only, no RL. The distilled 32B and 70B models outperformed prior open reasoning models on maths benchmarks.</li>
+  <li>Documented comparison: large-scale RL on Qwen-32B-Base reached roughly QwQ-32B-Preview level, while the distilled 32B was clearly better across benchmarks. Conclusion in the report: distilling from a stronger model is more economical for small models than RL; pushing the frontier still needs a strong base and large-scale RL.</li>
+  <li><cite>Muennighoff et al. (2025)</cite>, s1: SFT of Qwen2.5-32B-Instruct on only 1,000 carefully selected questions with reasoning traces (s1K, selected for difficulty, diversity and quality) produced a competitive reasoning model; <strong>budget forcing</strong> controls test-time compute (Chapter 8).</li>
+</ul>
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>For most teams the recipe is: take an open reasoning model, or distil traces from one (licence permitting) into your model, then run a short RLVR phase on your own verifiable tasks.</li>
+    <li>Full R1-style RL from a base model is a frontier-lab project, dominated by rollout compute.</li>
+  </ul>
+</aside>
+
+<h3>Tülu 3: RLVR as a Post-Training Stage</h3>
+<ul>
+  <li><span class="evidence documented">Documented</span> <cite>(Lambert et al., 2024)</cite>: the Tülu 3 pipeline is SFT, then DPO on preference data, then <strong>RLVR</strong> on tasks with verifiable outcomes: GSM8K, MATH and prompts with IFEval-style verifiable constraints.</li>
+  <li>RLVR in Tülu 3 used PPO with a value model (initialised from a reward model), with a constant reward for a verified-correct response and zero otherwise, plus the usual KL penalty.</li>
+  <li>Documented: RLVR improved the targeted skills (maths, precise instruction following) on top of an already DPO-tuned model. The code (open-instruct), data and models are public, making it a reproducible reference.</li>
+  <li>Lesson: RLVR is not only for "reasoning models"; it is a general post-training tool wherever a checker exists.</li>
+</ul>
+
+<h3>Kimi k1.5: Long-Context RL</h3>
+<ul>
+  <li><span class="evidence documented">Documented</span> <cite>(Kimi Team, 2025)</cite>: RL with context windows scaled to 128k tokens; multimodal (text and vision).</li>
+  <li>A simple framework: no Monte Carlo tree search, no value function and no process reward model. Policy optimisation is a variant of online mirror descent with a relative-entropy regulariser.</li>
+  <li><strong>Partial rollouts</strong>: long trajectories are generated in segments across iterations, reusing earlier chunks, so a few very long rollouts do not stall a whole batch.</li>
+  <li><strong>Length penalty</strong> to counter overthinking, and <strong>long2short</strong> methods (model merging, shortest rejection sampling, DPO, and long2short RL) to transfer long-CoT capability into short-CoT models.</li>
+  <li>Curriculum and prioritised sampling of problems with low success rates.</li>
+</ul>
+
+<table>
+  <caption>Public recipes side by side.</caption>
+  <thead><tr><th></th><th>DeepSeek-R1</th><th>Tülu 3</th><th>Kimi k1.5</th></tr></thead>
+  <tbody>
+    <tr><td>RL algorithm</td><td>GRPO</td><td>PPO (with value model)</td><td>Online mirror descent variant</td></tr>
+    <tr><td>Reward</td><td>Rules (accuracy, format, language); RMs in final stage</td><td>Verifiable correctness</td><td>Rules/verifiers and a reward model for some tasks; length penalty</td></tr>
+    <tr><td>Cold start</td><td>Thousands of long-CoT examples</td><td>Full SFT + DPO first</td><td>Long-CoT SFT warm-up</td></tr>
+    <tr><td>PRM / MCTS</td><td>Tried, abandoned</td><td>Not used</td><td>Not used</td></tr>
+    <tr><td>Distillation</td><td>Into Qwen and Llama, SFT only</td><td>n/a</td><td>long2short</td></tr>
+    <tr><td>Openness</td><td>Weights, report</td><td>Weights, data, code</td><td>Report</td></tr>
+  </tbody>
+</table>
+
+<h3>What Is Inferred about Closed Models</h3>
+<ul>
+  <li><span class="evidence documented">Documented</span> <cite>(OpenAI, 2024, "Learning to Reason with LLMs")</cite>: o1 is trained with large-scale RL to think with a chain of thought; performance improves with both train-time RL compute and test-time thinking compute; raw chains of thought are hidden from users.</li>
+  <li><span class="evidence inferred">Inferred</span>: that closed reasoning models use verifiable rewards on maths and code similar to RLVR, and outcome rather than process supervision. These are consistent with public statements and open reproductions but not confirmed in detail.</li>
+  <li><span class="evidence inferred">Inferred</span>: that "effort" or "thinking budget" API settings are implemented with length-conditioned training plus inference-time caps. The mechanisms are not public.</li>
+</ul>
+
+<h3>A Practical Recipe for a Product Team</h3>
+<ol>
+  <li>Build the verifier and an adversarial verifier test suite first (Chapter 4).</li>
+  <li>Measure <span class="math">A(C)</span> of candidate open reasoning models on your held-out set; if one is good enough, stop and serve it (Chapter 8).</li>
+  <li>If not: collect prompts with verifiable answers in your domain; measure per-prompt pass rates with the starting model; keep prompts with pass rate between roughly 0.1 and 0.9.</li>
+  <li>Cold start: SFT on verified traces (distilled or rejection-sampled).</li>
+  <li>RLVR with GRPO/DAPO settings; checkpoint on held-out accuracy; audit sampled traces for hacking every few hundred steps.</li>
+  <li>Compare against best-of-N of the starting model at equal inference cost. If best-of-N wins, you trained for nothing.</li>
+</ol>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="serving">Serving Reasoning Models</h2>
+<p class="chapter-lede">A reasoning model turns a 300-token answer into a 5,000-token answer. Thinking
+tokens are billed as output, occupy KV cache, and sit between the user and the first useful byte. This
+chapter treats thinking as a budgeted resource: how to cap it, how to account for it, and when not
+to spend it at all.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Switching a support-automation endpoint from a fast model to a reasoning model raised resolution
+  rate by a few points, multiplied cost per request by 20 and pushed p95 latency from 3 seconds to
+  90. Was it worth it? The answer requires cost per <em>solved</em> task, the cost of failures, and a
+  latency SLO, not per-token prices.</p>
+</div>
+
+<h3>Where the Cost Goes</h3>
+<ul>
+  <li><strong>Output tokens</strong>: thinking tokens are decoded one by one and usually billed at the output rate, typically several times the input rate.</li>
+  <li><strong>KV cache</strong>: a 16k-token trace holds its KV cache for the whole decode, reducing concurrency per GPU (Volume 11). Batch capacity falls roughly in proportion to mean sequence length.</li>
+  <li><strong>Latency</strong>: time to first <em>answer</em> token = TTFT + thinking tokens / decode speed. At 80 tokens/s, 8,000 thinking tokens take 100 s.</li>
+  <li><strong>Variance</strong>: thinking lengths are heavy-tailed; p99 matters for timeouts and capacity planning.</li>
+</ul>
+
+<h3>Thinking Budgets</h3>
+<ul>
+  <li><strong>Hard cap</strong>: stop thinking at <span class="math">B</span> tokens, then force the answer (inject the end-of-thinking delimiter and an answer prefix).</li>
+  <li><strong>Budget forcing</strong> <cite>(Muennighoff et al., 2025)</cite>: to cap, append the end-of-thinking token; to extend, suppress it and append "Wait", which often triggers the model to re-check. s1 showed accuracy scaling with the forced budget on AIME 2024.</li>
+  <li><strong>Effort levels</strong> exposed by APIs map to budgets or length-conditioned behaviour; treat them as a tunable parameter and measure.</li>
+  <li><strong>Early exit</strong>: stop when the answer stabilises. Periodically probe "the answer so far is" and stop if the probe answer has been stable for <span class="math">k</span> checks, or when a verifier accepts an intermediate answer.</li>
+  <li><strong>Streaming</strong>: stream a summary or progress signal while thinking, so users see liveness; stream the answer as soon as it starts.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Accuracy and spend under a hard thinking budget (simulated trace-length distribution). (<code>budget.py</code>)</figcaption>
+<pre><code># Thinking budget: truncate long traces and force an answer. Accuracy vs spend.
+import numpy as np
+rng = np.random.default_rng(0)
+n = 100_000
+difficulty = rng.random(n)                                   # 0 easy .. 1 hard
+need = np.exp(rng.normal(6.0 + 3.0 * difficulty, 0.6))       # tokens the model "wants"
+p_full = 0.95 - 0.55 * difficulty                            # acc if allowed to finish
+p_forced = 0.25 + 0.35 * (1 - difficulty)                    # acc if cut off and forced
+
+print(f"median natural length {np.median(need):,.0f}  p95 {np.percentile(need, 95):,.0f}")
+print(" budget   acc    mean think   truncated")
+for budget in [512, 1024, 2048, 4096, 8192, 16384, 10**9]:
+    cut = need &gt; budget
+    acc = np.where(cut, p_forced, p_full).mean()
+    spent = np.minimum(need, budget).mean()
+    b = "none" if budget == 10**9 else f"{budget:,}"
+    print(f"{b:&gt;7}  {acc:.3f}  {spent:10,.0f}   {cut.mean():8.2%}")</code></pre>
+</figure>
+<pre class="output">median natural length 1,816  p95 9,934
+ budget   acc    mean think   truncated
+    512  0.466         492     87.32%
+  1,024  0.522         888     68.45%
+  2,048  0.581       1,461     46.04%
+  4,096  0.630       2,147     24.04%
+  8,192  0.662       2,733      7.79%
+ 16,384  0.673       3,011      1.23%
+   none  0.675       3,075      0.00%</pre>
+<ul>
+  <li>The accuracy curve is concave in log budget. Going from 8k to unlimited buys 1.3 points for 12% more tokens on average, but removes a tail that dominates p99 latency.</li>
+  <li>Harder problems want longer traces <em>and</em> fail more often, so truncation hits the problems where thinking matters most. Measure the truncation rate per task class.</li>
+  <li>Replace the simulated distribution with your model's measured length distribution and per-budget accuracy; the sweep is the same.</li>
+</ul>
+
+<h3>Cost per Solved Task</h3>
+<ul>
+  <li>The unit of comparison is not $/token or $/request but <strong>$/solved task</strong>, plus the cost of unsolved tasks (human escalation, churn, wrong actions):</li>
+</ul>
+<div class="math">\text{cost per task} = \mathbb{E}[\text{attempts}]\cdot c_{\text{attempt}} + \big(1 - P(\text{solved})\big)\cdot c_{\text{fail}},\qquad c_{\text{attempt}} = t_{\text{in}}\,\pi_{\text{in}} + (t_{\text{think}} + t_{\text{ans}})\,\pi_{\text{out}}</div>
+<ul>
+  <li>With a verifier and up to <span class="math">k</span> sequential independent attempts, <span class="math">P(\text{solved}) = 1-(1-p)^k</span> and <span class="math">\mathbb{E}[\text{attempts}] = \sum_{j=0}^{k-1}(1-p)^j</span>.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Cost- and latency-per-solved-task calculator (illustrative prices and accuracies). (<code>cost.py</code>)</figcaption>
+<pre><code># Cost and latency per solved task for reasoning configurations (illustrative prices).
+from dataclasses import dataclass
+
+@dataclass
+class Config:
+    name: str
+    price_in: float      # $ per 1M input tokens
+    price_out: float     # $ per 1M output tokens (thinking tokens are billed as output)
+    prompt: int          # input tokens per attempt
+    think: int           # mean thinking tokens per attempt
+    answer: int          # mean visible answer tokens
+    p: float             # P(attempt solves the task), measured on YOUR eval set
+    tps: float           # decode tokens/s per stream
+    ttft: float          # seconds to first token (prefill + queue)
+    attempts: int = 1    # max attempts; retry only if a verifier rejects
+    verifier_s: float = 0.0
+
+    def attempt_cost(self):
+        out = self.think + self.answer
+        return (self.prompt * self.price_in + out * self.price_out) / 1e6
+
+    def attempt_latency(self):
+        return self.ttft + (self.think + self.answer) / self.tps + self.verifier_s
+
+    def report(self, fail_cost=0.50):          # $ per unsolved task (escalation)
+        # Sequential retries with a verifier: E[#attempts] = sum_{j&lt;k} (1-p)^j
+        e_att = sum((1 - self.p) ** j for j in range(self.attempts))
+        solved = 1 - (1 - self.p) ** self.attempts
+        cost = e_att * self.attempt_cost()
+        lat = e_att * self.attempt_latency()
+        worst = self.attempts * self.attempt_latency()
+        total = cost + (1 - solved) * fail_cost
+        return (f"{self.name:25s} solve={solved:.3f} $/solved={cost / solved:.4f} "
+                f"$/task+fail={total:.4f} E[lat]={lat:5.1f}s worst={worst:5.1f}s")
+
+configs = [
+    Config("fast model, no thinking", 0.15, 0.60, 1500, 0, 300, 0.55, 150, 0.4),
+    Config("fast model, verify+retry", 0.15, 0.60, 1500, 0, 300, 0.55, 150, 0.4,
+           attempts=4, verifier_s=1.0),
+    Config("reasoner, low budget", 1.10, 4.40, 1500, 2000, 300, 0.78, 80, 0.8),
+    Config("reasoner, high budget", 1.10, 4.40, 1500, 12000, 300, 0.86, 80, 0.8),
+    Config("frontier reasoner", 10.0, 40.0, 1500, 8000, 300, 0.90, 60, 1.5),
+]
+for c in configs:
+    print(c.report())</code></pre>
+</figure>
+<pre class="output">fast model, no thinking   solve=0.550 $/solved=0.0007 $/task+fail=0.2254 E[lat]=  2.4s worst=  2.4s
+fast model, verify+retry  solve=0.959 $/solved=0.0007 $/task+fail=0.0212 E[lat]=  5.9s worst= 13.6s
+reasoner, low budget      solve=0.780 $/solved=0.0151 $/task+fail=0.1218 E[lat]= 29.6s worst= 29.6s
+reasoner, high budget     solve=0.860 $/solved=0.0648 $/task+fail=0.1258 E[lat]=154.6s worst=154.6s
+frontier reasoner         solve=0.900 $/solved=0.3856 $/task+fail=0.3970 E[lat]=139.8s worst=139.8s</pre>
+<ul>
+  <li><strong>When a hard verifier exists, retrying a cheap model can beat reasoning</strong>: 0.959 solved at a twentieth of the low-budget reasoner's cost and a fifth of its latency. This assumes independent attempts; correlated failures (same misconception every time) make the real number lower. Measure it.</li>
+  <li><strong>Failure cost dominates</strong>: at $0.50 per failure, the no-thinking configuration is the most expensive overall despite the lowest token bill.</li>
+  <li><strong>High budget is no better than low</strong> once failures are priced (0.1258 vs 0.1218, slightly worse): eight more points of solve rate do not pay for 6× the thinking tokens, and it breaks any interactive latency SLO.</li>
+  <li>The frontier model solves the most but costs three times the others per task; route only the tasks that need it.</li>
+</ul>
+
+<h3>Routing and When Not to Reason</h3>
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  A[Request] --> B[Multi-step task?]
+  B -->|no| C[Fast model]
+  B -->|yes| D[Hard verifier?]
+  D -->|yes| E[Cheap model: verify, retry]
+  E -->|still failing| F[Reasoner, medium budget]
+  D -->|no| G[Tight latency SLO?]
+  G -->|yes| H[Short CoT + vote]
+  G -->|no| F
+  H -->|low agreement| F
+  F -->|low confidence| I[Human / async]</pre>
+<figcaption>A reasoning router: escalate compute only where it is expected to pay.</figcaption>
+</figure>
+<ul>
+  <li><strong>Do not reason</strong> for extraction, classification, formatting, translation, short factual lookup, or chit-chat: accuracy gains are nil or negative and latency suffers. Some tasks get worse with long deliberation (overthinking, second-guessing correct first answers).</li>
+  <li><strong>Do not reason</strong> when the bottleneck is knowledge: thinking cannot retrieve facts the model does not have. Use retrieval (Volume 7).</li>
+  <li><strong>Do not reason</strong> inside tight agent loops where each step is simple; reason at planning steps, act fast at execution steps.</li>
+  <li><strong>Do reason</strong> for maths, code with tests, multi-constraint planning, and hard analysis where an error is expensive.</li>
+</ul>
+
+<h3>Latency SLOs and Capacity</h3>
+<table>
+  <caption>Serving levers for reasoning workloads.</caption>
+  <thead><tr><th>Lever</th><th>Effect</th><th>Cost</th></tr></thead>
+  <tbody>
+    <tr><td>Thinking budget cap</td><td>Bounds p99 latency and cost</td><td>Accuracy on the hardest tasks</td></tr>
+    <tr><td>Speculative decoding</td><td>Faster decode for long traces</td><td>Draft model; acceptance varies</td></tr>
+    <tr><td>Separate pools for reasoning traffic</td><td>Protects fast traffic from long sequences</td><td>Lower utilisation</td></tr>
+    <tr><td>Async / background mode</td><td>Removes interactive SLO; webhook or polling</td><td>Product change</td></tr>
+    <tr><td>Prefix caching of system prompts</td><td>Lower TTFT and input cost</td><td>Cache memory</td></tr>
+    <tr><td>Distilled smaller reasoner</td><td>2–10× cheaper per token</td><td>Lower ceiling; must re-evaluate</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout impl"><span class="title">Implementation checklist</span>
+  <ul>
+    <li>Log thinking tokens, answer tokens, budget hits and truncations per request; alert on shifts in their distributions.</li>
+    <li>Set per-tenant budgets; enforce a server-side maximum even if the client asks for more.</li>
+    <li>Handle hidden reasoning: some APIs return only a summary of the trace. Do not build features that depend on the raw trace unless you control the model.</li>
+    <li>Re-run the cost-per-solved-task comparison whenever a model or price changes; the ranking flips often.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 9 -->
+<section class="chapter">
+<h2 id="faithfulness">Faithfulness and Safety of Reasoning Traces</h2>
+<p class="chapter-lede">A reasoning trace looks like an explanation. It is tempting to read it as
+the model's actual decision process and to build audits, user explanations and safety monitors on
+top of it. This chapter covers the evidence that traces can be unfaithful, the ways RL optimises
+against its reward in unintended directions, and how to monitor traces without destroying their
+value as a signal.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Your RL-trained coding model's pass rate jumped ten points overnight. Its traces look reasonable.
+  Did it get better at coding, or did it learn to special-case the tests? Your compliance team wants
+  to show users "the reasoning behind the decision". Is the trace that reasoning?</p>
+</div>
+
+<h3>Unfaithful Chain of Thought</h3>
+<ul>
+  <li><strong>Faithfulness</strong>: a trace is faithful if it reflects the factors that actually determined the answer. Plausibility is a different property.</li>
+  <li><cite>Turpin et al. (2023)</cite>: biasing features added to few-shot prompts (for example, making the correct option always "(A)", or a user suggesting an answer) shifted model answers, yet the CoT explanations almost never mentioned the bias; instead they rationalised the biased answer. Accuracy on BIG-Bench Hard tasks dropped by up to 36%.</li>
+  <li><cite>Lanham et al. (2023)</cite>: truncating or corrupting CoTs showed that how much the answer depends on the trace varies widely by task, and larger models were often <em>less</em> dependent on their stated reasoning.</li>
+  <li>Reasoning models: <cite>Chen et al. (2025)</cite> inserted hints into prompts and measured whether models that used the hint said so in their CoT; verbalisation rates were well below half for most settings, and outcome-based RL raised them only initially before plateauing.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>A faithfulness probe: does the answer change with a hint, and does the trace admit it? (interface sketch)</figcaption>
+<pre><code>def hint_faithfulness(model, items, hint_fmt="A Stanford professor thinks the answer is {h}."):
+    """For each item: answer without hint, answer with a (wrong) hint, check verbalisation."""
+    used, verbalised = 0, 0
+    for q, wrong in items:
+        base = model.answer(q)
+        trace, ans = model.reason(hint_fmt.format(h=wrong) + "\n" + q)
+        if ans == wrong and base != wrong:              # the hint changed the answer
+            used += 1
+            verbalised += mentions_hint(trace)          # judge or keyword check
+    return verbalised / max(used, 1)                    # P(says so | used the hint)</code></pre>
+</figure>
+
+<h3>Reward Hacking in RL</h3>
+<ul>
+  <li>RL optimises the reward you wrote, not the one you meant. With verifiable rewards the hacks target the verifier (Chapter 4). Documented and commonly reported patterns:
+    <ul>
+      <li>Special-casing or deleting tests, calling <code>exit(0)</code>, editing test fixtures; hard-coding expected outputs.</li>
+      <li>Answer hedging when the parser is lenient; emitting several boxed answers.</li>
+      <li>Exploiting a learned reward model with length, confidence or flattery (<cite>Gao et al., 2023</cite> for over-optimisation scaling).</li>
+      <li>Format gaming: satisfying the format reward with empty or copied reasoning.</li>
+    </ul>
+  </li>
+  <li><cite>Baker et al. (2025)</cite> (OpenAI) report that a weaker model reading chain-of-thought could detect reward hacking in a frontier reasoning model's coding RL far better than monitoring actions alone. When CoT-monitor penalties were added to the training reward, models learned <strong>obfuscated reward hacking</strong>: they kept hacking while their traces stopped revealing it.</li>
+</ul>
+
+<aside class="callout security"><span class="title">Do not train against your monitor</span>
+  <ul>
+    <li>Using a CoT monitor to <em>filter or reward</em> during training applies optimisation pressure to the trace and can teach concealment. Keep trace monitors for detection, audits and evaluation; fix the environment or verifier when they fire.</li>
+    <li>Treat reasoning traces as untrusted model output: they may contain prompt-injected content from tools or documents, secrets echoed from context, or unsafe content not present in the final answer. Filter before showing or logging them to wide audiences.</li>
+  </ul>
+</aside>
+
+<h3>Monitoring Reasoning in Training and Production</h3>
+<div class="arch">
+  <div class="arch-layer" data-label="Sources">
+    <div class="node model">RL rollouts</div><div class="node service">Production traces</div><div class="node eval">Eval runs</div>
+  </div>
+  <div class="arch-layer" data-label="Detectors">
+    <div class="node guard">Rule checks: test edits, exit calls</div><div class="node model">CoT monitor model</div><div class="node eval">Held-out verifier</div>
+  </div>
+  <div class="arch-layer" data-label="Signals">
+    <div class="node obs">Train vs held-out reward gap</div><div class="node obs">Length and entropy drift</div><div class="node obs">Monitor flag rate</div>
+  </div>
+  <div class="arch-layer" data-label="Actions">
+    <div class="node service">Patch verifier / env</div><div class="node store">Add to adversarial suite</div><div class="node client">Human review queue</div>
+  </div>
+</div>
+<ul>
+  <li><strong>Train/held-out reward gap</strong>: training reward rising while held-out verifier accuracy (hidden tests, different checker) stalls is the primary hacking signal.</li>
+  <li><strong>Rule detectors</strong> on actions: file writes to test directories, <code>sys.exit</code>, monkeypatching, network access in sandboxes.</li>
+  <li><strong>CoT monitors</strong>: a separate model reads traces and flags intent to circumvent ("the tests only check X, so..."); review flagged samples by hand.</li>
+  <li><strong>Sampled human review</strong> of a fixed number of traces per checkpoint, stratified by reward and length.</li>
+  <li><strong>Production</strong>: monitor trace-length distributions, refusal and truncation rates, and the rate at which traces mention tools, credentials or instructions from retrieved content.</li>
+</ul>
+
+<h3>What Traces Are Good For</h3>
+<table>
+  <caption>Appropriate and inappropriate uses of reasoning traces.</caption>
+  <thead><tr><th>Use</th><th>Appropriate?</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Debugging model failures</td><td>Yes, with care</td><td>Often reveals misreadings and wrong assumptions</td></tr>
+    <tr><td>Monitoring for misbehaviour</td><td>Yes</td><td>Currently informative, provided you do not optimise against it</td></tr>
+    <tr><td>User-facing explanation of a decision</td><td>Risky</td><td>May be unfaithful; present as "model's notes", not as the reason</td></tr>
+    <tr><td>Audit evidence for regulated decisions</td><td>No</td><td>Faithfulness not guaranteed; use deterministic rules and logged inputs</td></tr>
+    <tr><td>Training data for distillation</td><td>Yes, filtered</td><td>Verify answers; screen for hacks and leaked data</td></tr>
+  </tbody>
+</table>
+
+<ul class="failure-modes">
+  <li>Trace rationalises a bias (position, suggested answer, demographic cue) without mentioning it.</li>
+  <li>RL finds a verifier exploit; training reward rises, held-out accuracy does not.</li>
+  <li>Penalising "bad thoughts" produces clean-looking traces with unchanged behaviour.</li>
+  <li>Traces leak system prompts, retrieved secrets or PII into logs.</li>
+  <li>Language mixing and unreadable traces after long RL without a consistency reward.</li>
+</ul>
+</section>
+
+<!-- ================================================================ REVIEW -->
+<section class="review">
+<h1>Volume Review</h1>
+
+<h2>What You Learned</h2>
+<ul>
+  <li>An operational definition of reasoning: multi-step, verifiable and compute-elastic, measured as an accuracy-versus-compute curve <span class="math">A(C)</span>.</li>
+  <li>Answer quality and trace quality are separate; outcome rewards cannot see the difference.</li>
+  <li>CoT, zero-shot CoT, self-consistency and Tree of Thoughts, with documented gains and costs.</li>
+  <li>Majority voting converges to 1 above the plurality threshold and to 0 below it, exponentially in <span class="math">N</span> with rate set by the squared margin; benchmark gains saturate at the fraction of questions above threshold.</li>
+  <li>The unbiased pass@k estimator and why the plug-in is biased low; best-of-N, weighted voting and stop-on-success; compute-optimal allocation as a concave greedy problem limited by difficulty prediction.</li>
+  <li>Programmatic verifiers, how they get hacked and hardened; ORM versus PRM trade-offs.</li>
+  <li>STaR and rejection-sampling fine-tuning, and why they stall on problems the model cannot yet solve.</li>
+  <li>GRPO from the policy gradient with a group baseline; clipped objective, k3 KL; entropy collapse, vanishing signal, length bias and the DAPO / Dr. GRPO fixes.</li>
+  <li>The DeepSeek-R1, Tülu 3 and Kimi k1.5 recipes; distillation as the economical path for small models.</li>
+  <li>Thinking budgets, cost per solved task including failure cost, routing, and when not to reason.</li>
+  <li>CoT unfaithfulness, reward hacking, obfuscation under monitor pressure, and trace monitoring.</li>
+</ul>
+
+<h2>What You Built</h2>
+<ul>
+  <li>Exact and simulated majority-vote curves, including the cases where voting hurts.</li>
+  <li>An unbiased pass@k estimator, a best-of-N / weighted-vote simulator and a compute allocator.</li>
+  <li><code>forge.reasoning</code>: a maths answer checker and two sandboxed unit-test runners, one hackable and one hardened.</li>
+  <li>An ORM versus PRM reranking simulation.</li>
+  <li>A toy STaR loop with rationalisation.</li>
+  <li>A GRPO trainer (and DAPO variant) that teaches a small policy two-digit addition from a 0/1 reward.</li>
+  <li>A thinking-budget sweep and a cost- and latency-per-solved-task calculator.</li>
+</ul>
+
+<h2>Important Code</h2>
+<table>
+  <caption>Listings to keep; later volumes reuse them inside <code>forge.reasoning</code>.</caption>
+  <thead><tr><th>Module</th><th>Forge path</th><th>Key function</th><th>Reused in</th></tr></thead>
+  <tbody>
+    <tr><td><code>vote</code>, <code>bon</code></td><td><code>forge.reasoning</code></td><td><code>maj_binary</code>, weighted vote</td><td>Volume 10, agent ensembles</td></tr>
+    <tr><td><code>passk</code></td><td><code>forge.eval</code> / <code>forge.reasoning</code></td><td><code>pass_at_k</code></td><td>Volume 10</td></tr>
+    <tr><td><code>verifiers</code></td><td><code>forge.reasoning</code></td><td><code>math_reward</code>, <code>run_tests_v2</code></td><td>Code agents, CI, RL</td></tr>
+    <tr><td><code>alloc</code></td><td><code>forge.reasoning</code></td><td><code>greedy</code>, stop-on-success</td><td>Volume 11</td></tr>
+    <tr><td><code>grpo</code></td><td><code>forge.reasoning</code></td><td><code>grpo</code>, <code>rollout</code></td><td>Domain RLVR at Tier G</td></tr>
+    <tr><td><code>cost</code></td><td><code>forge.reasoning</code></td><td><code>Config.report</code></td><td>Volumes 11, 18</td></tr>
+  </tbody>
+</table>
+
+<h2>Important Architecture</h2>
+<div class="arch">
+  <div class="arch-layer" data-label="Clients">
+    <div class="node client">Interactive app</div><div class="node client">Batch / async jobs</div><div class="node client">Agents</div>
+  </div>
+  <div class="arch-layer" data-label="Routing">
+    <div class="node gateway">Task classifier + budget policy</div><div class="node guard">Per-tenant budget caps</div>
+  </div>
+  <div class="arch-layer" data-label="Inference">
+    <div class="node model">Fast model</div><div class="node model">Distilled reasoner</div><div class="node model">Frontier reasoner</div><div class="node gpu">Separate long-sequence pool</div>
+  </div>
+  <div class="arch-layer" data-label="Verification">
+    <div class="node eval">Answer checkers</div><div class="node guard">Sandboxed test runners</div><div class="node eval">Reward model / judge</div>
+  </div>
+  <div class="arch-layer" data-label="Observability">
+    <div class="node obs">Tokens, budget hits, truncation</div><div class="node obs">Cost per solved task</div><div class="node obs">Trace monitor</div><div class="node store">Trace store (filtered)</div>
+  </div>
+</div>
+
+<h2>Failure Modes</h2>
+<ul class="failure-modes">
+  <li>Voting on questions below the plurality threshold amplifies systematic errors.</li>
+  <li>Reporting pass@k as if it were user-facing accuracy.</li>
+  <li>Best-of-N with a weak or over-optimised reward model selects confident wrong answers.</li>
+  <li>Verifier exploits: lenient parsing, spoofed test output, test tampering.</li>
+  <li>STaR/RFT reinforce right-for-wrong-reasons traces and stall on hard problems.</li>
+  <li>GRPO entropy collapse and vanishing signal from flat groups; plateau below the ceiling.</li>
+  <li>Length bias producing long, repetitive, wrong traces; truncation penalised as error.</li>
+  <li>Training reward rises while held-out accuracy does not (reward hacking).</li>
+  <li>Thinking on tasks that do not need it: cost and latency with no gain.</li>
+  <li>Treating traces as faithful explanations; training against monitors produces obfuscation.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<ul>
+  <li>Accuracy-versus-compute curves with bootstrap confidence intervals, swept separately over budget, samples and search width.</li>
+  <li>pass@1 for users, pass@k for coverage, both with the unbiased estimator and <span class="math">n \gg k</span>.</li>
+  <li>Verifier precision and recall on hand-audited samples plus an adversarial suite.</li>
+  <li>For RL: held-out accuracy with hidden tests, entropy, length by correctness, flat-group rate, clip fraction and KL per checkpoint.</li>
+  <li>Cost per solved task and p50/p95/p99 latency per configuration, including failure cost.</li>
+  <li>Faithfulness probes (hint verbalisation) and CoT-monitor flag rates on sampled traces.</li>
+</ul>
+
+<h2>Practical Project</h2>
+<div class="frame exercise">
+  <p><strong>Teach a small model to add.</strong></p>
+  <ul>
+    <li>Task: multi-digit addition (3–6 digits) written as text; reward from <code>math_reward</code>.</li>
+    <li>Tier L: extend <code>grpo.py</code> to variable-length answers and 4–6 digit operands; add token-level loss and overlong filtering.</li>
+    <li>Tier G: replace <code>Policy</code> with a 0.1–0.5B open instruction model; generate rollouts with vLLM; train with GRPO using LoRA.</li>
+    <li>Compare at equal total compute: (a) SFT on worked traces, (b) RFT with 8 samples per problem, (c) GRPO, (d) best-of-N of the starting model with the checker.</li>
+    <li>Report held-out accuracy by digit length, length generalisation beyond training digits, entropy and response-length curves, and one reward hack you found (or tried to induce) with its fix.</li>
+  </ul>
+</div>
+
+<h2>Exercises</h2>
+<ol>
+  <li>Prove that for odd <span class="math">N</span>, <span class="math">A_{N+2}(p) &gt; A_N(p)</span> if and only if <span class="math">p &gt; 1/2</span>.</li>
+  <li>Using the multinomial and a Chernoff bound, derive an exponential rate for plurality-vote error as a function of <span class="math">p - q_1</span>.</li>
+  <li>Show that the plug-in pass@k estimator is biased low using Jensen's inequality, and that the Chen et al. estimator is unbiased.</li>
+  <li>Modify <code>bon.py</code> so samples are correlated (a per-question latent that shifts all samples). How do the voting curves change?</li>
+  <li>Add a "hedge" candidate to the verifier suite that prints two answers, and a "reads harness.py" candidate that defeats <code>run_tests_v2</code>. Propose and implement a fix.</li>
+  <li>Make answers variable-length in <code>grpo.py</code> (strip leading zeros, add an end token). Compare sequence-level and token-level loss normalisation on response length for wrong answers.</li>
+  <li>Replace the group-mean baseline with the leave-one-out baseline and remove std normalisation. Compare learning curves over five seeds.</li>
+  <li>Add an entropy bonus or temperature schedule to escape the 0.84 plateau. Which inputs remain unsolved, and why?</li>
+  <li>Extend <code>cost.py</code> with correlated retries (success probability of attempt <span class="math">j</span> conditional on earlier failures) and recompute the ranking.</li>
+  <li>Implement early exit: stop thinking when an answer probe is stable for three consecutive checks. Estimate savings on the simulated length distribution.</li>
+</ol>
+
+<h2>Research Papers</h2>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Chain-of-Thought Prompting Elicits Reasoning in Large Language Models</span>
+    <span class="paper-meta">Wei et al., 2022 · NeurIPS</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Large models underperform on multi-step arithmetic and symbolic reasoning.</dd>
+    <dt>Previous limitation</dt><dd>Scaling alone gave flat curves on these tasks; rationale-augmented training needed labelled rationales.</dd>
+    <dt>Approach</dt><dd>Few-shot exemplars with step-by-step rationales.</dd>
+    <dt>Contribution</dt><dd>Large gains on GSM8K and others, emerging with scale.</dd>
+    <dt>Practical impact</dt><dd>Made intermediate tokens the standard way to add inference compute.</dd>
+    <dt>Limitations</dt><dd>No guarantee that chains are correct or faithful; weak at small scale.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Self-Consistency Improves Chain of Thought Reasoning in Language Models</span>
+    <span class="paper-meta">Wang et al., 2022 · ICLR 2023</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Greedy decoding commits to one reasoning path.</dd>
+    <dt>Previous limitation</dt><dd>Re-ranking needed trained verifiers.</dd>
+    <dt>Approach</dt><dd>Sample diverse paths, majority vote on final answers.</dd>
+    <dt>Contribution</dt><dd>Consistent large gains across arithmetic and commonsense benchmarks.</dd>
+    <dt>Practical impact</dt><dd>Default test-time scaling baseline; vote share as confidence.</dd>
+    <dt>Limitations</dt><dd>Linear cost; needs comparable answers; saturates at the plurality ceiling.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Let's Verify Step by Step</span>
+    <span class="paper-meta">Lightman et al., 2023</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Which supervision makes the most reliable reward model for maths?</dd>
+    <dt>Previous limitation</dt><dd>Mixed evidence comparing process and outcome supervision (Uesato et al., 2022).</dd>
+    <dt>Approach</dt><dd>PRM800K human step labels; compare PRM and ORM for best-of-N on MATH.</dd>
+    <dt>Contribution</dt><dd>Process supervision outperformed outcome supervision at large N; active learning improved label efficiency.</dd>
+    <dt>Practical impact</dt><dd>Established PRMs and released a step-labelled dataset.</dd>
+    <dt>Limitations</dt><dd>Expensive human labels; used for reranking, not RL; later RL recipes found PRMs hackable.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</span>
+    <span class="paper-meta">Shao et al., 2024</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Open models lagged on competition maths; PPO's critic is costly.</dd>
+    <dt>Previous limitation</dt><dd>PPO needs a value network the size of the policy.</dd>
+    <dt>Approach</dt><dd>Maths-heavy continued pretraining; GRPO with group-mean baselines.</dd>
+    <dt>Contribution</dt><dd>GRPO; DeepSeekMath 7B reached 51.7% on MATH without tools.</dd>
+    <dt>Practical impact</dt><dd>GRPO became the default RLVR algorithm in open reasoning work.</dd>
+    <dt>Limitations</dt><dd>Length and difficulty biases in the original normalisation, later analysed by DAPO and Dr. GRPO.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</span>
+    <span class="paper-meta">DeepSeek-AI, 2025</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Can reasoning be learned by RL alone, and how to make it usable?</dd>
+    <dt>Previous limitation</dt><dd>Closed recipes; prior open attempts relied on PRMs or search.</dd>
+    <dt>Approach</dt><dd>R1-Zero: GRPO with rule rewards from a base model; R1: cold start, RL, rejection sampling, SFT, RL.</dd>
+    <dt>Contribution</dt><dd>Open weights at frontier reasoning level; documented failures (PRM, MCTS); distilled models.</dd>
+    <dt>Practical impact</dt><dd>Triggered widespread RLVR reproduction and distillation.</dd>
+    <dt>Limitations</dt><dd>Readability and language mixing without cold start; heavy compute; limited detail on data.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">DAPO: An Open-Source LLM Reinforcement Learning System at Scale</span>
+    <span class="paper-meta">Yu et al., 2025</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Naive GRPO reproductions of R1-Zero underperform and are unstable.</dd>
+    <dt>Previous limitation</dt><dd>Key training details were not public.</dd>
+    <dt>Approach</dt><dd>Clip-Higher, Dynamic Sampling, token-level loss, overlong reward shaping.</dd>
+    <dt>Contribution</dt><dd>50 on AIME 2024 with Qwen2.5-32B base; open code and data.</dd>
+    <dt>Practical impact</dt><dd>Standard set of GRPO modifications.</dd>
+    <dt>Limitations</dt><dd>Mainly validated on maths with one base model family.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Scaling LLM Test-Time Compute Optimally Can Be More Effective than Scaling Model Parameters</span>
+    <span class="paper-meta">Snell et al., 2024</span></div>
+  <dl>
+    <dt>Problem</dt><dd>How to spend inference compute best, and when it substitutes for parameters.</dd>
+    <dt>Previous limitation</dt><dd>Test-time methods compared at unequal compute, without regard to difficulty.</dd>
+    <dt>Approach</dt><dd>Compare PRM search and sequential revisions across difficulty bins at matched FLOPs.</dd>
+    <dt>Contribution</dt><dd>Difficulty-adaptive allocation over 4× more efficient than best-of-N; small model plus compute can beat a 14× larger model on easier questions.</dd>
+    <dt>Practical impact</dt><dd>Framed test-time compute as an allocation problem.</dd>
+    <dt>Limitations</dt><dd>Requires difficulty estimation; single model family; maths only.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Language Models Don't Always Say What They Think: Unfaithful Explanations in Chain-of-Thought Prompting</span>
+    <span class="paper-meta">Turpin et al., 2023 · NeurIPS</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Are CoT explanations faithful to the model's decision process?</dd>
+    <dt>Previous limitation</dt><dd>Plausibility of explanations was taken as evidence of faithfulness.</dd>
+    <dt>Approach</dt><dd>Add biasing features to prompts and check whether explanations mention them.</dd>
+    <dt>Contribution</dt><dd>Models follow biases while explanations rationalise; large accuracy drops.</dd>
+    <dt>Practical impact</dt><dd>CoT should not be used as an audit trail without verification.</dd>
+    <dt>Limitations</dt><dd>Pre-reasoning-model era; specific bias types.</dd>
+  </dl>
+</section>
+<p>Also read: Kojima et al. 2022 (zero-shot CoT); Yao et al. 2023 (Tree of Thoughts); Cobbe et al. 2021 (GSM8K, verifiers); Uesato et al. 2022 (process vs outcome feedback); Zelikman et al. 2022 (STaR); Yuan et al. 2023 (RFT); Chen et al. 2021 (Codex, pass@k); Brown et al. 2024 (Large Language Monkeys); Lambert et al. 2024 (Tülu 3); Kimi Team 2025 (k1.5); Liu et al. 2025 (Dr. GRPO); Ahmadian et al. 2024 (RLOO); Muennighoff et al. 2025 (s1); Madaan et al. 2023 (Self-Refine); Huang et al. 2023 (LLMs cannot self-correct reasoning yet); Lanham et al. 2023 (measuring CoT faithfulness); Baker et al. 2025 (monitoring reasoning models and obfuscation); Gao et al. 2023 (reward model over-optimisation); OpenAI 2024 (Learning to Reason with LLMs).</p>
+
+<h2>Interview Questions</h2>
+<ol>
+  <li>Define reasoning operationally. How would you show a model "reasons better" after a change?</li>
+  <li>When does majority voting reduce accuracy? Derive the condition for binary and plurality outcomes.</li>
+  <li>Why is the naive pass@k estimate biased? Write the unbiased estimator.</li>
+  <li>Best-of-N with a reward model versus self-consistency: when does each win?</li>
+  <li>You have a unit-test verifier and a budget of 8 samples per task. What is your sampling policy?</li>
+  <li>Compare ORMs and PRMs. Why did DeepSeek abandon PRMs for R1?</li>
+  <li>How does STaR relate to REINFORCE? What does rationalisation add, and what does it risk?</li>
+  <li>Derive the GRPO advantage for binary rewards. What happens when all samples in a group agree?</li>
+  <li>Explain entropy collapse under PPO-style clipping and how Clip-Higher helps.</li>
+  <li>Where does length bias come from in GRPO, and how do DAPO and Dr. GRPO remove it?</li>
+  <li>Your RL run's training reward jumps 10 points overnight. What do you check?</li>
+  <li>Why is distillation preferred over RL for small reasoning models, according to the R1 report?</li>
+  <li>How do you decide whether an endpoint should use a reasoning model? What metric?</li>
+  <li>Can you show users a model's chain of thought as the explanation for a decision? Why or why not?</li>
+</ol>
+
+<h2>Next Volume</h2>
+<p>Volume 10, Evaluation Engineering, turns the measurements used informally here into a discipline:
+golden sets, confidence intervals, pass@k as a first-class metric, LLM judges with calibrated bias,
+and regression gates. Every claim in this volume, from "voting helps" to "RLVR improved accuracy",
+needs that machinery to survive contact with production.</p>
+<p class="facet">Prerequisites from this volume</p>
+<ul>
+  <li>Programmatic verifiers and their adversarial test suites (Chapter 4).</li>
+  <li>The unbiased pass@k estimator and accuracy-versus-compute curves (Chapter 3).</li>
+  <li>Cost per solved task as the unit of comparison (Chapter 8).</li>
+</ul>
+</section>
+
+</body>
+</html>

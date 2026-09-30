@@ -1,0 +1,1464 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 2 · Transformers from First Principles</title>
+<meta name="volume" content="Volume 2 · Transformers from First Principles">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 2</p>
+  <h1 class="no-toc">Transformers from First Principles</h1>
+  <p class="tp-subtitle">Attention, Blocks and Causal Language Modelling</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Implement every component of a modern decoder-only Transformer from scratch in NumPy: softmax, attention, masks, multi-head attention, positional encodings (sinusoidal and RoPE), LayerNorm, RMSNorm, GELU and SwiGLU feed-forward networks, and the pre-norm block.</li>
+  <li>Prove each component correct: a finite-difference gradient check, a future-leakage test, and parity with PyTorch to about <span class="math">10^{-15}</span> in float64.</li>
+  <li>Rebuild the block as <code>forge.nn</code> in PyTorch on top of <code>F.scaled_dot_product_attention</code> and train a tiny causal language model on CPU in under 20 seconds.</li>
+  <li>Understand the design choices (scaling, pre-norm, RoPE, SwiGLU, decoder-only) as answers to specific engineering problems, not as folklore.</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>Fluent NumPy and PyTorch, backpropagation, cross-entropy and Adam. None of this is re-taught.</li>
+  <li>Volume 1: the next-token objective, perplexity, parameter and FLOP counting, and the Forge layout (<code>src/forge/</code>).</li>
+</ul>
+
+<p class="facet">How to read the code</p>
+<ul>
+  <li>Listings build on each other like a notebook: <code>softmax</code> from Chapter 2 is used by <code>sdpa</code> in Chapter 3, and so on. All were executed in one Python 3.12 session with NumPy 2.3 and PyTorch 2.10 on an Apple laptop CPU. Printed output is real.</li>
+  <li>NumPy listings are the reference; the matching PyTorch modules seed <code>forge.nn</code>.</li>
+  <li>NumPy code uses float64 so that parity tests measure bugs, not rounding.</li>
+  <li>Shape comments use <code>B</code> batch, <code>T</code> query length, <code>S</code> key length, <code>C</code> model width, <code>H</code> heads, <code>D = C/H</code> head width.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1   The problem         why RNNs bottleneck; attention as soft lookup
+Chapter 2   Tensor mechanics    views, strides, einsum, stable softmax
+Chapter 3   Attention           Q, K, V; the sqrt(d_k) argument; gradients; parity
+Chapter 4   Masking             causal, padding, combined; the leakage test
+Chapter 5   Multi-head          split/merge; parameter and FLOP accounting
+Chapter 6   Position            permutation equivariance; sinusoidal, ALiBi, RoPE
+Chapter 7   Feed-forward        GELU MLP, SwiGLU, parameter matching
+Chapter 8   Residuals and norm  residual stream; pre-LN vs post-LN; RMSNorm
+Chapter 9   Architectures       the block; encoder, decoder, encoder-decoder
+Chapter 10  Causal LM           shifted targets; nats, bits, perplexity; training
+Chapter 11  Production PyTorch  SDPA backends, torch.compile, Llama-style code</pre>
+<figcaption>Map of Volume 2.</figcaption>
+</figure>
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="sequence-problem">The Sequence Modelling Problem</h2>
+<p class="chapter-lede">Every Transformer design decision is an answer to a failure of what came
+before. This chapter states those failures precisely, so that attention arrives as the obvious fix
+rather than as a recipe.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>We need a function that maps a sequence of <span class="math">T</span> vectors to <span class="math">T</span> vectors, where each output may depend on any input. It must train in parallel on accelerators, pass gradients across hundreds of thousands of positions, and not compress the whole history into a fixed-size bottleneck.</p>
+</div>
+
+<h3>Why Recurrent Networks Bottleneck</h3>
+<p>An RNN computes <span class="math">h_t = \tanh(W h_{t-1} + U x_t)</span>. Three problems follow directly from that equation.</p>
+<ul>
+  <li><strong>Sequential compute.</strong> <span class="math">h_t</span> needs <span class="math">h_{t-1}</span>. Training on a sequence of length <span class="math">T</span> takes <span class="math">T</span> dependent steps, so a GPU with 10,000 cores does one small matmul at a time. Critical path length is <span class="math">O(T)</span>.</li>
+  <li><strong>Vanishing and exploding gradients.</strong> <span class="math">\partial h_T / \partial h_0 = \prod_t \operatorname{diag}(1 - h_t^2) W</span>. A product of <span class="math">T</span> Jacobians shrinks or grows geometrically. LSTMs and GRUs add gated additive paths that slow the decay; they do not remove it.</li>
+  <li><strong>Fixed-size state.</strong> Everything the model knows about the prefix must fit in one vector <span class="math">h_t \in \mathbb{R}^d</span>. For seq2seq translation, the entire source sentence was squeezed into a single vector before decoding began.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Measuring gradient decay through a tanh RNN: the spectral norm of the Jacobian from step 0 to step T.</figcaption>
+<pre><code>import numpy as np
+rng = np.random.default_rng(0)
+# Gradient through T steps of a tanh RNN: product of Jacobians W^T diag(1-h^2)
+d = 64
+W = rng.normal(0, 1 / np.sqrt(d), (d, d)) * 0.9      # spectral radius ~0.9
+h = np.zeros(d); J = np.eye(d)
+for t in range(1, 101):
+    h = np.tanh(W @ h + rng.normal(0, 1, d))
+    J = (W.T * (1 - h**2)) @ J                         # d h_t / d h_0 (transposed)
+    if t in (1, 10, 25, 50, 100):
+        print(f"T={t:3d}  ||dh_T/dh_0|| = {np.linalg.norm(J, 2):.2e}")</code></pre>
+</figure>
+<pre class="output">T=  1  ||dh_T/dh_0|| = 1.49e+00
+T= 10  ||dh_T/dh_0|| = 1.93e-02
+T= 25  ||dh_T/dh_0|| = 4.62e-06
+T= 50  ||dh_T/dh_0|| = 6.12e-12
+T=100  ||dh_T/dh_0|| = 5.14e-24</pre>
+
+<ul>
+  <li>After 25 steps the signal from the first token is attenuated by a factor of about <span class="math">10^{-6}</span>; after 100 steps it is below float32 resolution. The model cannot learn a dependency it receives no gradient for.</li>
+  <li>Scaling <span class="math">W</span> up to spectral radius above 1 flips the problem to explosion. There is no stable middle ground for a plain RNN over long spans.</li>
+</ul>
+
+<h3>Possible Solutions</h3>
+<table>
+  <caption>Approaches to long-range sequence modelling, and what each does not solve.</caption>
+  <thead><tr><th>Approach</th><th>Fixes</th><th>Does not fix</th></tr></thead>
+  <tbody>
+    <tr><td>LSTM / GRU</td><td>Gradient decay over tens to hundreds of steps</td><td>Sequential compute; fixed-size state</td></tr>
+    <tr><td>Truncated BPTT</td><td>Memory cost of long sequences</td><td>Cannot learn dependencies longer than the truncation</td></tr>
+    <tr><td>1D convolutions (WaveNet, ByteNet)</td><td>Parallel training</td><td>Receptive field grows only linearly or logarithmically with depth</td></tr>
+    <tr><td>Seq2seq + Bahdanau attention</td><td>Fixed-size bottleneck between encoder and decoder</td><td>Still recurrent inside encoder and decoder</td></tr>
+    <tr><td>Self-attention (Transformer)</td><td>All three: <span class="math">O(1)</span> path length, fully parallel, state grows with sequence</td><td>Cost is <span class="math">O(T^2)</span> in time and (naively) memory; no inherent notion of order</td></tr>
+  </tbody>
+</table>
+
+<h3>Attention as Differentiable Lookup</h3>
+<p>A hash map returns the value whose key <em>equals</em> the query. Attention returns a <em>weighted average</em> of all values, weighted by how similar each key is to the query. Because the weights come from a softmax, the lookup is differentiable end to end.</p>
+<div class="math">\operatorname{lookup}(q) = \sum_{j} \operatorname{softmax}_j\big(\operatorname{sim}(q, k_j)\big)\, v_j</div>
+<ul>
+  <li><strong>Bahdanau (2014)</strong>: decoder state is the query, encoder states are keys and values, similarity is a small MLP (additive attention). This removed the seq2seq bottleneck: the decoder can look back at every source position.</li>
+  <li><strong>Luong (2015)</strong>: similarity becomes a dot product, which is a single matmul on hardware.</li>
+  <li><strong>Self-attention (Vaswani et al. 2017)</strong>: queries, keys and values all come from the <em>same</em> sequence, via learned linear projections. Remove the recurrence entirely; stack attention with per-token MLPs.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Self-attention gives every pair of positions a direct, one-step connection. Gradient path length between any two tokens is constant, not <span class="math">O(T)</span>.</li>
+    <li>All <span class="math">T</span> outputs are computed with a few large matmuls, so training is parallel across the sequence.</li>
+    <li>The price is <span class="math">O(T^2)</span> pairwise scores. Volumes 7 and 11 are largely about paying that price more cheaply.</li>
+  </ul>
+</aside>
+
+<table>
+  <caption>Per-layer complexity (Vaswani et al. 2017, Table 1). n = sequence length, d = width, k = kernel size.</caption>
+  <thead><tr><th>Layer</th><th>Compute per layer</th><th>Sequential operations</th><th>Max path length</th></tr></thead>
+  <tbody>
+    <tr><td>Self-attention</td><td><span class="math">O(n^2 d)</span></td><td><span class="math">O(1)</span></td><td><span class="math">O(1)</span></td></tr>
+    <tr><td>Recurrent</td><td><span class="math">O(n d^2)</span></td><td><span class="math">O(n)</span></td><td><span class="math">O(n)</span></td></tr>
+    <tr><td>Convolutional</td><td><span class="math">O(k n d^2)</span></td><td><span class="math">O(1)</span></td><td><span class="math">O(\log_k n)</span></td></tr>
+  </tbody>
+</table>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="tensor-mechanics">Tensor Mechanics for Attention</h2>
+<p class="chapter-lede">Attention bugs are almost never conceptual. They are a transpose on the wrong
+axes, a reshape of a non-contiguous tensor, or an overflow in exp. This chapter fixes the tensor
+vocabulary and builds the one numerical primitive attention depends on: a stable softmax.</p>
+
+<h3>Views, Strides and Copies</h3>
+<ul>
+  <li>An array is a pointer, a shape and <strong>strides</strong> (bytes to step along each axis). <code>reshape</code> of a contiguous array and <code>transpose</code> only rewrite shape and strides; no data moves.</li>
+  <li>After a transpose, the memory is no longer laid out in row-major order. A subsequent <code>reshape</code> that merges the transposed axes <em>must copy</em>. In PyTorch, <code>view</code> refuses and raises; <code>reshape</code> silently copies; <code>.contiguous()</code> makes the copy explicit.</li>
+  <li>Multi-head attention does exactly this twice per layer: split heads (reshape then transpose) and merge heads (transpose then reshape). The merge is a real memory copy on the hot path, which is why fused kernels avoid it.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Views versus copies, and three equivalent ways to compute batched attention scores.</figcaption>
+<pre><code>B, T, H, D = 2, 5, 4, 8
+x = np.arange(B * T * H * D, dtype=np.float32).reshape(B, T, H * D)   # (B, T, C)
+v = x.reshape(B, T, H, D)                  # view: no copy
+print("reshape is view :", np.shares_memory(x, v))
+t = v.transpose(0, 2, 1, 3)                # (B, H, T, D) view, non-contiguous strides
+print("strides (bytes) :", v.strides, "-&gt;", t.strides)
+print("contiguous?     :", t.flags["C_CONTIGUOUS"])
+m = t.reshape(B * H, T, D)                 # forces a copy
+print("reshape after T :", "view" if np.shares_memory(x, m) else "copy")
+# Batched matmul three ways
+q = np.random.default_rng(1).normal(size=(B, H, T, D))
+k = np.random.default_rng(2).normal(size=(B, H, T, D))
+s1 = q @ k.swapaxes(-1, -2)                               # (B, H, T, T)
+s2 = np.einsum("bhtd,bhsd-&gt;bhts", q, k)
+s3 = np.stack([[q[b, h] @ k[b, h].T for h in range(H)] for b in range(B)])
+print("einsum == @     :", np.allclose(s1, s2), np.allclose(s1, s3), s1.shape)</code></pre>
+</figure>
+<pre class="output">reshape is view : True
+strides (bytes) : (640, 128, 32, 4) -&gt; (640, 32, 128, 4)
+contiguous?     : False
+reshape after T : copy
+einsum == @     : True True (2, 4, 5, 5)</pre>
+
+<p class="facet">Batched matmul and einsum</p>
+<ul>
+  <li><code>@</code> broadcasts over all leading axes and contracts the last axis of the left operand with the second-to-last of the right. <code>q @ k.swapaxes(-1, -2)</code> is the attention score for every batch and head at once.</li>
+  <li><code>einsum("bhtd,bhsd-&gt;bhts", q, k)</code> states the contraction explicitly. Prefer it in reference code: the index string is the documentation. Production code often uses <code>@</code> because some backends dispatch it more predictably.</li>
+</ul>
+
+<h3>Numerically Stable Softmax</h3>
+<div class="math">\operatorname{softmax}(x)_i = \frac{e^{x_i}}{\sum_j e^{x_j}} = \frac{e^{x_i - m}}{\sum_j e^{x_j - m}}, \quad m = \max_j x_j</div>
+<ul>
+  <li><strong>Shift invariance</strong>: multiplying numerator and denominator by <span class="math">e^{-m}</span> changes nothing mathematically.</li>
+  <li><strong>Overflow</strong>: with <span class="math">m</span> subtracted, the largest exponent is <span class="math">e^0 = 1</span>, so nothing overflows. float32 overflows at <span class="math">e^{88.7}</span>; float16 at <span class="math">e^{11.1}</span>. Attention logits routinely exceed 11.</li>
+  <li><strong>Underflow</strong>: small probabilities underflow to 0, and <code>log(0) = -inf</code>. Compute <span class="math">\log\operatorname{softmax}(x)_i = x_i - m - \log\sum_j e^{x_j - m}</span> directly (log-sum-exp). Cross-entropy must always use this form.</li>
+  <li><strong>Fully masked rows</strong>: if every entry is <code>-inf</code>, then <span class="math">m = -\infty</span> and <span class="math">x - m</span> is <code>nan</code>. The implementation below guards against it; Chapter 4 explains when it happens.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Naive versus stable softmax and log-softmax.</figcaption>
+<pre><code>import numpy as np
+
+def softmax_naive(x, axis=-1):
+    e = np.exp(x)
+    return e / e.sum(axis=axis, keepdims=True)
+
+def softmax(x, axis=-1):
+    m = np.max(x, axis=axis, keepdims=True)
+    m = np.where(np.isfinite(m), m, 0.0)              # all -inf row: avoid inf - inf
+    e = np.exp(x - m)
+    return e / e.sum(axis=axis, keepdims=True)
+
+def log_softmax(x, axis=-1):
+    m = np.max(x, axis=axis, keepdims=True)
+    return x - m - np.log(np.exp(x - m).sum(axis=axis, keepdims=True))
+
+x = np.array([1000.0, 1001.0, 1002.0])
+with np.errstate(over="ignore", invalid="ignore"):
+    print("naive     :", softmax_naive(x))
+print("stable    :", softmax(x))
+print("shift-inv :", np.allclose(softmax(x), softmax(x - 1000)))
+y = np.array([-1000.0, 0.0, 5.0])
+with np.errstate(divide="ignore"):
+    print("log(softmax):", np.log(softmax(y)))
+print("log_softmax :", log_softmax(y))
+x32 = np.array([80.0, 90.0], dtype=np.float32)
+with np.errstate(over="ignore"):
+    print("float32 exp(90):", np.exp(x32))</code></pre>
+</figure>
+<pre class="output">naive     : [nan nan nan]
+stable    : [0.09003057 0.24472847 0.66524096]
+shift-inv : True
+log(softmax): [       -inf -5.00671535 -0.00671535]
+log_softmax : [-1.00500672e+03 -5.00671535e+00 -6.71534849e-03]
+float32 exp(90): [5.5406225e+34           inf]</pre>
+
+<aside class="callout warning"><span class="title">Failure Mode</span>
+  <ul>
+    <li><code>np.log(softmax(x))</code> returned <code>-inf</code> for a logit of −1000; <code>log_softmax</code> returned the correct −1005. A single <code>-inf</code> in a loss becomes <code>nan</code> gradients and a dead training run.</li>
+    <li>Framework functions (<code>F.cross_entropy</code>, <code>F.log_softmax</code>) are stable. Hand-written losses in custom training code are the usual culprit.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="sdpa">Scaled Dot-Product Attention from Scratch</h2>
+<p class="chapter-lede">Scaled dot-product attention (SDPA) is five lines of code. This chapter
+derives each line, proves the scale factor is necessary, checks the gradients numerically, and
+matches PyTorch to machine precision.</p>
+
+<h3>Q, K and V as Learned Projections</h3>
+<p>Given token representations <span class="math">X \in \mathbb{R}^{T \times C}</span>:</p>
+<div class="math">Q = X W_Q,\quad K = X W_K,\quad V = X W_V,\qquad W_Q, W_K \in \mathbb{R}^{C \times d_k},\ W_V \in \mathbb{R}^{C \times d_v}</div>
+<div class="math">\operatorname{Attention}(Q, K, V) = \operatorname{softmax}\!\left(\frac{Q K^\top}{\sqrt{d_k}}\right) V</div>
+<ul>
+  <li><strong>Query</strong>: what this position is looking for. <strong>Key</strong>: what this position offers to be matched on. <strong>Value</strong>: what this position hands over if matched.</li>
+  <li>Separate projections matter. With <span class="math">Q = K</span>, the score matrix is symmetric and every token attends most strongly to itself; separate projections let "looking for a subject" differ from "being a subject".</li>
+  <li><span class="math">QK^\top \in \mathbb{R}^{T \times S}</span>: row <span class="math">i</span> holds token <span class="math">i</span>'s scores against every key. Softmax is taken <em>over keys</em> (the last axis), so each row is a probability distribution.</li>
+</ul>
+
+<h3>Why Scale by the Square Root of d_k</h3>
+<div class="frame problem"><p>Without scaling, attention collapses to near one-hot as the head dimension grows, and softmax gradients vanish. Training stalls, and the effect gets worse precisely in wider models.</p></div>
+<p>Assume the components of <span class="math">q</span> and <span class="math">k</span> are independent with mean 0 and variance 1 (roughly what normalisation and initialisation give you). Then</p>
+<div class="math">\operatorname{Var}(q \cdot k) = \sum_{i=1}^{d_k} \operatorname{Var}(q_i k_i) = \sum_{i=1}^{d_k} \mathbb{E}[q_i^2]\,\mathbb{E}[k_i^2] = d_k</div>
+<ul>
+  <li>The standard deviation of a raw score is <span class="math">\sqrt{d_k}</span>: 8 for <span class="math">d_k = 64</span>, 32 for <span class="math">d_k = 1024</span>. Softmax of logits spread that widely is nearly one-hot.</li>
+  <li>The softmax Jacobian is <span class="math">\operatorname{diag}(p) - pp^\top</span>. When <span class="math">p</span> is one-hot, every entry is 0: no gradient flows to the scores, so <span class="math">W_Q</span> and <span class="math">W_K</span> stop learning.</li>
+  <li>Dividing by <span class="math">\sqrt{d_k}</span> restores unit variance regardless of width. It is a fixed temperature chosen so the initial distribution is soft.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Empirical check of the variance argument and its effect on attention sharpness.</figcaption>
+<pre><code>rng = np.random.default_rng(0)
+print(" d_k   var(q.k)  var(q.k/sqrt(d_k))  max softmax weight (T=64)")
+for d_k in (16, 64, 256, 1024):
+    q = rng.normal(size=(2000, d_k)); k = rng.normal(size=(2000, d_k))
+    dots = (q * k).sum(-1)
+    s = rng.normal(size=(64, d_k)) @ rng.normal(size=(d_k, 64))   # (T, T) scores
+    pmax_raw = softmax(s).max(-1).mean()
+    pmax_scl = softmax(s / np.sqrt(d_k)).max(-1).mean()
+    print(f"{d_k:5d} {dots.var():9.1f} {(dots / np.sqrt(d_k)).var():12.3f}"
+          f"      raw={pmax_raw:.3f} scaled={pmax_scl:.3f}")</code></pre>
+</figure>
+<pre class="output"> d_k   var(q.k)  var(q.k/sqrt(d_k))  max softmax weight (T=64)
+   16      15.5        0.969      raw=0.550 scaled=0.100
+   64      67.1        1.048      raw=0.793 scaled=0.115
+  256     251.8        0.984      raw=0.902 scaled=0.110
+ 1024     967.1        0.944      raw=0.934 scaled=0.105</pre>
+
+<ul>
+  <li>Measured variance tracks <span class="math">d_k</span> closely; after scaling it stays at about 1 for every width.</li>
+  <li>Unscaled, the average maximum attention weight over 64 keys rises from 0.55 to 0.93 as <span class="math">d_k</span> grows: attention is already nearly hard at initialisation. Scaled, it stays near 0.1 regardless of width.</li>
+</ul>
+
+<aside class="callout advanced"><span class="title">Beyond the Fixed Scale</span>
+  <ul>
+    <li>The argument holds only at initialisation. During training, query and key norms can grow, producing <em>attention logit growth</em> and loss spikes in large models.</li>
+    <li>Fixes used in practice: QK-norm (normalise <span class="math">q</span> and <span class="math">k</span> per head before the dot product), logit soft-capping (<span class="math">c \tanh(s/c)</span>, used in Gemma 2), and a learned temperature. Volume 6 covers training stability.</li>
+  </ul>
+</aside>
+
+<h3>The Implementation</h3>
+<figure class="listing">
+<figcaption>Scaled dot-product attention in NumPy, with an optional boolean mask (True means attend).</figcaption>
+<pre><code>def sdpa(q, k, v, mask=None):
+    """q: (..., T, d_k), k: (..., S, d_k), v: (..., S, d_v). mask: True = keep."""
+    d_k = q.shape[-1]
+    scores = q @ k.swapaxes(-1, -2) / np.sqrt(d_k)       # (..., T, S)
+    if mask is not None:
+        scores = np.where(mask, scores, -np.inf)
+    w = softmax(scores, axis=-1)                           # rows sum to 1 over keys
+    w = np.nan_to_num(w)                                   # fully-masked rows -&gt; 0
+    return w @ v, w                                        # (..., T, d_v), (..., T, S)
+
+rng = np.random.default_rng(0)
+T, C, d_k = 4, 8, 8
+x = rng.normal(size=(T, C))
+Wq, Wk, Wv = (rng.normal(0, C**-0.5, (C, d_k)) for _ in range(3))
+out, w = sdpa(x @ Wq, x @ Wk, x @ Wv)
+print("out shape:", out.shape, " row sums:", w.sum(-1).round(6))
+print(np.array2string(w, precision=3, suppress_small=True))</code></pre>
+</figure>
+<pre class="output">out shape: (4, 8)  row sums: [1. 1. 1. 1.]
+[[0.344 0.127 0.332 0.198]
+ [0.775 0.004 0.053 0.168]
+ [0.252 0.278 0.286 0.184]
+ [0.216 0.278 0.211 0.295]]</pre>
+
+<p class="facet">How it works</p>
+<ul>
+  <li>Scores: one batched matmul, <span class="math">O(T S d_k)</span> FLOPs.</li>
+  <li>Mask: replace forbidden scores with <span class="math">-\infty</span> so that <span class="math">e^{-\infty} = 0</span> exactly.</li>
+  <li>Softmax over keys, then a second matmul <span class="math">O(T S d_v)</span> to mix values.</li>
+  <li>Memory: the <span class="math">T \times S</span> weight matrix is materialised. At <span class="math">T = S = 32{,}768</span>, 32 heads and fp16 that is 64 GiB per layer per sequence. FlashAttention (Chapter 11, Volume 11) never materialises it.</li>
+</ul>
+
+<h3>Gradients and a Numerical Check</h3>
+<p>With <span class="math">S = QK^\top/\sqrt{d_k}</span>, <span class="math">P = \operatorname{softmax}(S)</span>, <span class="math">O = PV</span> and upstream gradient <span class="math">G = \partial L/\partial O</span>:</p>
+<div class="math">dV = P^\top G,\quad dP = G V^\top,\quad dS = P \odot \big(dP - \operatorname{rowsum}(dP \odot P)\big),\quad dQ = \frac{dS\,K}{\sqrt{d_k}},\quad dK = \frac{dS^\top Q}{\sqrt{d_k}}</div>
+<ul>
+  <li>The <span class="math">dS</span> line is the softmax Jacobian-vector product applied row by row, without ever forming the <span class="math">T \times T \times T</span> Jacobian.</li>
+  <li>This is exactly the backward pass FlashAttention recomputes tile by tile; the <code>rowsum(dP ⊙ P)</code> term is its <code>D</code> vector.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Analytic attention gradients versus central finite differences.</figcaption>
+<pre><code>def sdpa_backward(q, k, v, g):
+    """Gradients of sum(g * sdpa(q,k,v)) w.r.t. q, k, v (no mask)."""
+    d_k = q.shape[-1]
+    s = q @ k.swapaxes(-1, -2) / np.sqrt(d_k)
+    p = softmax(s)
+    dv = p.swapaxes(-1, -2) @ g
+    dp = g @ v.swapaxes(-1, -2)
+    ds = p * (dp - (dp * p).sum(-1, keepdims=True))        # softmax Jacobian-vector
+    dq = ds @ k / np.sqrt(d_k)
+    dk = ds.swapaxes(-1, -2) @ q / np.sqrt(d_k)
+    return dq, dk, dv
+
+rng = np.random.default_rng(0)
+q, k, v = (rng.normal(size=(3, 5, 4)) for _ in range(3))
+g = rng.normal(size=(3, 5, 4))
+f = lambda q, k, v: (sdpa(q, k, v)[0] * g).sum()
+analytic = sdpa_backward(q, k, v, g)
+eps = 1e-6
+for name, i in (("dq", 0), ("dk", 1), ("dv", 2)):
+    args = [q.copy(), k.copy(), v.copy()]
+    num = np.zeros_like(args[i])
+    for idx in np.ndindex(num.shape):
+        a = [x.copy() for x in args]; a[i][idx] += eps; fp = f(*a)
+        a[i][idx] -= 2 * eps; fm = f(*a)
+        num[idx] = (fp - fm) / (2 * eps)
+    rel = np.abs(num - analytic[i]).max() / np.abs(num).max()
+    print(f"{name}: max relative error {rel:.1e}")</code></pre>
+</figure>
+<pre class="output">dq: max relative error 3.4e-10
+dk: max relative error 1.2e-09
+dv: max relative error 4.6e-10</pre>
+
+<p>Relative errors around <span class="math">10^{-9}</span> to <span class="math">10^{-10}</span> are what central differences with <span class="math">\epsilon = 10^{-6}</span> achieve in float64. A wrong transpose or a missing scale would give errors of order 1.</p>
+
+<h3>Parity with PyTorch</h3>
+<figure class="listing">
+<figcaption>Forward and backward parity against <code>F.scaled_dot_product_attention</code>.</figcaption>
+<pre><code>import torch, torch.nn.functional as F
+rng = np.random.default_rng(0)
+q, k, v = (rng.normal(size=(2, 4, 16, 32)) for _ in range(3))   # (B, H, T, D)
+ours, _ = sdpa(q, k, v)
+ref = F.scaled_dot_product_attention(*(torch.from_numpy(a) for a in (q, k, v)))
+print("max |numpy - torch| :", np.abs(ours - ref.numpy()).max())
+qt, kt, vt = (torch.from_numpy(a).requires_grad_() for a in (q, k, v))
+g = rng.normal(size=q.shape)
+(F.scaled_dot_product_attention(qt, kt, vt) * torch.from_numpy(g)).sum().backward()
+dq, dk, dv = sdpa_backward(q, k, v, g)
+print("grad parity (q,k,v) :", [float(np.abs(a - b.grad.numpy()).max())
+                               for a, b in ((dq, qt), (dk, kt), (dv, vt))])</code></pre>
+</figure>
+<pre class="output">max |numpy - torch| : 8.881784197001252e-16
+grad parity (q,k,v) : [6.661338147750939e-16, 6.661338147750939e-16, 6.661338147750939e-16]</pre>
+
+<aside class="callout impl"><span class="title">Testing Pattern</span>
+  <ul>
+    <li>Keep one slow, obviously correct reference (NumPy, float64) and test every fast implementation against it with a tolerance chosen for the dtype: about <span class="math">10^{-12}</span> in float64, <span class="math">10^{-5}</span> in float32, <span class="math">10^{-2}</span> in bf16.</li>
+    <li>Test gradients as well as outputs. A forward pass can be right while a custom backward is wrong.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="masking">Masking</h2>
+<p class="chapter-lede">Masks encode two different facts: "this position is in the future" and "this
+position is not real". Getting either wrong produces a model that trains beautifully and fails in
+production.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <ul>
+    <li><strong>Causality</strong>: a language model trained with teacher forcing sees the whole sequence at once. Without a mask, position <span class="math">t</span> can read token <span class="math">t+1</span> (the answer), training loss goes to near zero, and generation is garbage.</li>
+    <li><strong>Padding</strong>: batches contain sequences of different lengths padded to a common <span class="math">S</span>. Real tokens must not attend to padding, or outputs depend on how much padding the batch happened to have.</li>
+  </ul>
+</div>
+
+<h3>Causal, Padding and Combined Masks</h3>
+<ul>
+  <li><strong>Causal</strong>: lower-triangular <span class="math">T \times S</span>, allowing key <span class="math">j</span> for query <span class="math">i</span> iff <span class="math">j \le i + (S - T)</span>. The offset matters when queries are a suffix of keys, as in KV-cached decoding.</li>
+  <li><strong>Padding</strong>: per-sequence <span class="math">(B, S)</span> key mask, broadcast over queries.</li>
+  <li><strong>Combined</strong>: logical AND, broadcast to <span class="math">(B, 1, T, S)</span> or <span class="math">(B, H, T, S)</span>.</li>
+  <li><strong>Additive form</strong>: many kernels take a float mask added to scores (0 to keep, <span class="math">-\infty</span> to block). Boolean conventions also differ: our <code>sdpa</code> and <code>F.scaled_dot_product_attention</code> use True = attend; <code>nn.MultiheadAttention</code> uses True = <em>block</em>. the <code>nn.MultiheadAttention</code> parity check in Chapter 5 inverts accordingly.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Building and combining causal and padding masks.</figcaption>
+<pre><code>def causal_mask(T, S=None):
+    S = S or T
+    return np.tril(np.ones((T, S), dtype=bool), k=S - T)     # (T, S), True = may attend
+
+def padding_mask(lengths, S):
+    return np.arange(S)[None, :] &lt; np.asarray(lengths)[:, None]   # (B, S)
+
+B, T = 2, 5
+lengths = [5, 3]
+m = causal_mask(T)[None] &amp; padding_mask(lengths, T)[:, None, :]  # (B, T, S)
+print(m[1].astype(int))
+rng = np.random.default_rng(0)
+q = k = v = rng.normal(size=(B, T, 8))
+_, w = sdpa(q, k, v, mask=m)
+print("weights for sequence 1 (length 3):")
+print(np.array2string(w[1], precision=2, suppress_small=True))</code></pre>
+</figure>
+<pre class="output">[[1 0 0 0 0]
+ [1 1 0 0 0]
+ [1 1 1 0 0]
+ [1 1 1 0 0]
+ [1 1 1 0 0]]
+weights for sequence 1 (length 3):
+[[1.   0.   0.   0.   0.  ]
+ [0.02 0.98 0.   0.   0.  ]
+ [0.07 0.04 0.88 0.   0.  ]
+ [0.8  0.08 0.12 0.   0.  ]
+ [0.33 0.63 0.04 0.   0.  ]]</pre>
+
+<ul>
+  <li>Rows 3 and 4 of the second sequence are padding <em>queries</em>. They still produce outputs (attending to real tokens), which is harmless provided the loss ignores them (<code>ignore_index</code> in cross-entropy).</li>
+  <li>With left padding and a causal mask, the first real query can see only padding keys, giving an all-<code>-inf</code> row. That is why <code>softmax</code> guards the max and <code>sdpa</code> calls <code>nan_to_num</code>.</li>
+</ul>
+
+<h3>−inf Versus a Large Negative Number</h3>
+<div class="tradeoffs">
+  <div class="pros"><p class="facet"><code>-inf</code></p>
+    <ul>
+      <li>Masked weights are exactly 0; no leakage at any logit scale.</li>
+      <li>Fully masked rows produce <code>nan</code> unless handled explicitly.</li>
+    </ul></div>
+  <div class="cons"><p class="facet">Large negative (−1e9, or dtype minimum)</p>
+    <ul>
+      <li>Fully masked rows become uniform instead of <code>nan</code>; no special case.</li>
+      <li>−1e9 overflows in fp16 (max 65,504) to <code>-inf</code> anyway; use <code>torch.finfo(dtype).min</code>.</li>
+      <li>Adding a mask of dtype minimum to a large negative score can overflow to <code>-inf</code>; subtle, dtype-dependent bugs.</li>
+    </ul></div>
+</div>
+
+<h3>Failure Mode: Leakage from the Future, and a Test That Catches It</h3>
+<p>The property to test is behavioural, not structural: <em>perturbing token <span class="math">t</span> must not change any output at positions before <span class="math">t</span></em>. It catches transposed masks, off-by-one masks, a mask applied after softmax, and future information leaking through non-attention paths (for example a normalisation over the time axis).</p>
+
+<figure class="listing">
+<figcaption>A black-box causal leakage test applied to a correct mask, a transposed mask and no mask.</figcaption>
+<pre><code>def leak_test(attn_fn, T=8, C=16, seed=0):
+    """Perturb token t; outputs at positions &lt; t must not change."""
+    rng = np.random.default_rng(seed)
+    x = rng.normal(size=(T, C))
+    base = attn_fn(x)
+    for t in range(1, T):
+        x2 = x.copy(); x2[t] += rng.normal(size=C)
+        diff = np.abs(attn_fn(x2)[:t] - base[:t]).max()
+        if diff &gt; 1e-12:
+            return f"LEAK: position {t} changed earlier outputs by {diff:.2e}"
+    return "ok: no future information reaches the past"
+
+good = lambda x: sdpa(x, x, x, mask=causal_mask(len(x)))[0]
+bad = lambda x: sdpa(x, x, x, mask=np.triu(np.ones((len(x),) * 2, bool)))[0]  # bug
+print("correct mask :", leak_test(good))
+print("transposed   :", leak_test(bad))
+big_neg = lambda x: sdpa(x, x, x)[0]   # forgot mask entirely
+print("no mask      :", leak_test(big_neg))</code></pre>
+</figure>
+<pre class="output">correct mask : ok: no future information reaches the past
+transposed   : LEAK: position 1 changed earlier outputs by 6.63e-02
+no mask      : LEAK: position 1 changed earlier outputs by 6.63e-02</pre>
+
+<ul class="failure-modes">
+  <li><strong>Transposed mask</strong> (<code>triu</code> instead of <code>tril</code>): each token sees only the future. Training loss collapses; the leakage test fails at position 1.</li>
+  <li><strong>Off by one</strong> (<code>k=1</code> in <code>tril</code>): each token sees exactly one future token. Loss looks excellent; generation is incoherent.</li>
+  <li><strong>Mask after softmax</strong>: weights no longer sum to 1, and gradients still flow through the softmax denominator from future keys.</li>
+  <li><strong>Padding side mismatch</strong>: training with right padding and serving with left padding changes positions and masks; outputs drift.</li>
+</ul>
+<aside class="callout impl"><span class="title">Put It in CI</span>
+  <p>Run <code>leak_test</code> on every model class, not just the attention function. It runs in milliseconds and is the cheapest insurance in this volume. Chapter 9 applies it to a full block.</p>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="mha">Multi-Head Attention</h2>
+<p class="chapter-lede">One attention distribution per token can express only one "kind" of
+relationship at a time. Multi-head attention runs several smaller attentions in parallel on
+different learned subspaces, for the same parameter and FLOP budget.</p>
+
+<h3>Splitting and Merging Heads</h3>
+<div class="math">\operatorname{MHA}(X) = \operatorname{Concat}(\text{head}_1, \ldots, \text{head}_H)\, W_O,\qquad \text{head}_h = \operatorname{Attention}(X W_Q^{(h)}, X W_K^{(h)}, X W_V^{(h)})</div>
+<ul>
+  <li>Each head has width <span class="math">D = C/H</span>. Instead of <span class="math">H</span> separate matmuls, project once to <span class="math">C</span> and reshape <span class="math">(B, T, C) \to (B, T, H, D) \to (B, H, T, D)</span>.</li>
+  <li>Q, K and V projections are fused into one <span class="math">C \times 3C</span> matmul: one large GEMM is faster than three small ones.</li>
+  <li><span class="math">W_O</span> mixes information across heads. Without it, head outputs would stay in disjoint channel slices of the residual stream.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">x (B,T,C) --[W_qkv]--> (B,T,3C) --split--> q,k,v (B,T,C)
+   --reshape--> (B,T,H,D) --transpose--> (B,H,T,D)       # view, then strided view
+   --sdpa per (b,h)--> (B,H,T,D)
+   --transpose--> (B,T,H,D) --reshape--> (B,T,C)         # copy (non-contiguous)
+   --[W_o]--> (B,T,C)</pre>
+<figcaption>Shape flow through multi-head attention.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption>Multi-head attention in NumPy with fused QKV projection and an optional RoPE hook.</figcaption>
+<pre><code>class MultiHeadAttention:
+    def __init__(self, C, H, rng):
+        assert C % H == 0
+        self.C, self.H, self.D = C, H, C // H
+        s = C**-0.5
+        self.W_qkv = rng.normal(0, s, (C, 3 * C))    # fused Q, K, V projection
+        self.W_o = rng.normal(0, s, (C, C))
+
+    def split(self, x):                               # (B, T, C) -&gt; (B, H, T, D)
+        B, T, _ = x.shape
+        return x.reshape(B, T, self.H, self.D).transpose(0, 2, 1, 3)
+
+    def merge(self, x):                               # (B, H, T, D) -&gt; (B, T, C)
+        B, H, T, D = x.shape
+        return x.transpose(0, 2, 1, 3).reshape(B, T, H * D)
+
+    def __call__(self, x, mask=None, rope=None):
+        q, k, v = np.split(x @ self.W_qkv, 3, axis=-1)          # 3 x (B, T, C)
+        q, k, v = self.split(q), self.split(k), self.split(v)    # (B, H, T, D)
+        if rope is not None:
+            q, k = rope(q), rope(k)
+        out, self.attn = sdpa(q, k, v, mask)                    # (B, H, T, D)
+        return self.merge(out) @ self.W_o                       # (B, T, C)
+
+rng = np.random.default_rng(0)
+mha = MultiHeadAttention(C=64, H=8, rng=rng)
+x = rng.normal(size=(2, 10, 64))
+y = mha(x, mask=causal_mask(10))
+print("out:", y.shape, " attn:", mha.attn.shape)
+print("params:", mha.W_qkv.size + mha.W_o.size, "= 4 C^2 =", 4 * 64**2)
+# Merge must be the exact inverse of split
+print("merge(split(x)) == x:", np.array_equal(mha.merge(mha.split(x)), x))</code></pre>
+</figure>
+<pre class="output">out: (2, 10, 64)  attn: (2, 8, 10, 10)
+params: 16384 = 4 C^2 = 16384
+merge(split(x)) == x: True</pre>
+
+<figure class="listing">
+<figcaption>Parity against <code>torch.nn.MultiheadAttention</code> with copied weights.</figcaption>
+<pre><code>mha_t = torch.nn.MultiheadAttention(64, 8, bias=False, batch_first=True).double()
+with torch.no_grad():
+    mha_t.in_proj_weight.copy_(torch.from_numpy(mha.W_qkv.T))   # torch stores (3C, C)
+    mha_t.out_proj.weight.copy_(torch.from_numpy(mha.W_o.T))
+xt = torch.from_numpy(x)
+ref, _ = mha_t(xt, xt, xt, attn_mask=~torch.from_numpy(causal_mask(10)),
+               need_weights=False)                           # torch: True = BLOCK
+print("max |numpy MHA - nn.MultiheadAttention|:",
+      np.abs(ref.detach().numpy() - y).max())</code></pre>
+</figure>
+<pre class="output">max |numpy MHA - nn.MultiheadAttention|: 6.661338147750939e-16</pre>
+
+<aside class="callout warning"><span class="title">The Classic Bug</span>
+  <p><code>x.reshape(B, H, T, D)</code> instead of <code>x.reshape(B, T, H, D).transpose(0, 2, 1, 3)</code> has the right shape and runs without error, but scrambles tokens across heads. Only a parity test or the <code>merge(split(x)) == x</code> check catches it.</p>
+</aside>
+
+<h3>Parameter and FLOP Accounting</h3>
+<table>
+  <caption>Multi-head attention cost per layer, bias-free, for one sequence of length T.</caption>
+  <thead><tr><th>Component</th><th>Parameters</th><th>Forward FLOPs</th></tr></thead>
+  <tbody>
+    <tr><td>QKV projection</td><td class="num"><span class="math">3C^2</span></td><td class="num"><span class="math">6TC^2</span></td></tr>
+    <tr><td>Scores <span class="math">QK^\top</span></td><td class="num">0</td><td class="num"><span class="math">2T^2C</span></td></tr>
+    <tr><td>Weighted sum <span class="math">PV</span></td><td class="num">0</td><td class="num"><span class="math">2T^2C</span></td></tr>
+    <tr><td>Output projection</td><td class="num"><span class="math">C^2</span></td><td class="num"><span class="math">2TC^2</span></td></tr>
+    <tr><td><strong>Total</strong></td><td class="num"><span class="math">4C^2</span></td><td class="num"><span class="math">8TC^2 + 4T^2C</span></td></tr>
+  </tbody>
+</table>
+<ul>
+  <li>Head count does not change parameters or FLOPs; it changes how the same budget is partitioned.</li>
+  <li>The quadratic term overtakes the projections when <span class="math">4T^2C &gt; 8TC^2</span>, that is when <span class="math">T &gt; 2C</span>. For <span class="math">C = 4096</span>, attention scores dominate beyond about 8k tokens.</li>
+</ul>
+
+<h3>What Heads Learn, and Redundancy</h3>
+<ul>
+  <li><span class="evidence documented">Documented</span> Heads specialise: previous-token heads, heads tracking syntactic dependencies, and induction heads that complete repeated patterns (Clark et al. 2019; Olsson et al. 2022).</li>
+  <li><span class="evidence documented">Documented</span> Many heads are redundant at inference: Michel et al. (2019) pruned a large fraction of heads with little loss, and Voita et al. (2019) found a few specialised heads do most of the work.</li>
+  <li>Redundancy is an inference-cost opportunity. Multi-query attention (MQA) and grouped-query attention (GQA) share K and V across heads to shrink the KV cache, with small quality loss (Volume 7).</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="position">Position Information</h2>
+<p class="chapter-lede">Attention is a function of a <em>set</em>. "Dog bites man" and "man bites dog"
+produce the same outputs, merely permuted. Order has to be injected, and how it is injected
+determines how a model behaves beyond its training length.</p>
+
+<h3>Permutation Equivariance, Demonstrated</h3>
+<p>For any permutation matrix <span class="math">P</span>, <span class="math">\operatorname{MHA}(PX) = P\,\operatorname{MHA}(X)</span> when there is no mask and no position signal.</p>
+<figure class="listing">
+<figcaption>Permuting the input permutes the output identically: attention alone has no notion of order.</figcaption>
+<pre><code>rng = np.random.default_rng(0)
+x = rng.normal(size=(1, 6, 64))
+perm = rng.permutation(6)
+y1 = mha(x)[:, perm]              # permute outputs
+y2 = mha(x[:, perm])              # permute inputs
+print("permutation perm:", perm)
+print("attention(P x) == P attention(x):", np.allclose(y1, y2))</code></pre>
+</figure>
+<pre class="output">permutation perm: [5 1 0 2 4 3]
+attention(P x) == P attention(x): True</pre>
+<p>The causal mask does break the symmetry partially (position <span class="math">t</span> sees <span class="math">t</span> tokens), and causal models without any positional encoding (NoPE) can learn some position information from that. It is weak and not relied upon in practice.</p>
+
+<h3>Possible Solutions</h3>
+<table>
+  <caption>Positional schemes. Extrapolation means quality at lengths beyond training, without fine-tuning.</caption>
+  <thead><tr><th>Scheme</th><th>Where applied</th><th>Relative?</th><th>Extrapolation</th><th>Used by</th></tr></thead>
+  <tbody>
+    <tr><td>Sinusoidal absolute</td><td>Added to embeddings</td><td>Partly (via linear maps)</td><td>Poor</td><td>Original Transformer</td></tr>
+    <tr><td>Learned absolute</td><td>Added to embeddings</td><td>No</td><td>None: no embedding exists past <span class="math">T_{\max}</span></td><td>BERT, GPT-2</td></tr>
+    <tr><td>Relative bias (T5)</td><td>Bucketed bias on scores</td><td>Yes</td><td>Moderate</td><td>T5</td></tr>
+    <tr><td>ALiBi</td><td>Linear distance penalty on scores</td><td>Yes</td><td>Good for loss; weak for long-range retrieval</td><td>BLOOM, MPT</td></tr>
+    <tr><td>RoPE</td><td>Rotation of q and k</td><td>Yes (exactly)</td><td>Poor raw; good with interpolation or YaRN</td><td>Llama, Qwen, Mistral, most current LLMs</td></tr>
+  </tbody>
+</table>
+
+<h3>Sinusoidal Encoding</h3>
+<div class="math">PE_{p,2i} = \sin\!\big(p\,\theta_i\big),\quad PE_{p,2i+1} = \cos\!\big(p\,\theta_i\big),\quad \theta_i = 10000^{-2i/C}</div>
+<ul>
+  <li>Each pair of channels is a clock at a different frequency, from period <span class="math">2\pi</span> to <span class="math">2\pi \cdot 10000</span>.</li>
+  <li><span class="math">PE_{p+k}</span> is a fixed rotation of <span class="math">PE_p</span>, so <span class="math">PE_p \cdot PE_{p+k}</span> depends only on <span class="math">k</span>. But the encoding is <em>added</em> to content, so content–position cross-terms pollute the score and relative structure is not guaranteed after projection.</li>
+</ul>
+<figure class="listing">
+<figcaption>Sinusoidal positional encoding; the dot product depends only on the offset.</figcaption>
+<pre><code>def sinusoidal_pe(T, C, base=10000.0):
+    pos = np.arange(T)[:, None]                                # (T, 1)
+    inv = base ** (-np.arange(0, C, 2) / C)                    # (C/2,)
+    pe = np.zeros((T, C))
+    pe[:, 0::2] = np.sin(pos * inv)
+    pe[:, 1::2] = np.cos(pos * inv)
+    return pe
+
+pe = sinusoidal_pe(128, 64)
+sim = pe @ pe.T
+print("dot(pe[p], pe[p+k]) for p = 10 and p = 90 (depends only on k):")
+for kk in (0, 1, 4, 16):
+    print(f"  k={kk:2d}: {sim[10, 10 + kk]:7.3f} {sim[90, 90 + kk]:7.3f}")</code></pre>
+</figure>
+<pre class="output">dot(pe[p], pe[p+k]) for p = 10 and p = 90 (depends only on k):
+  k= 0:  32.000  32.000
+  k= 1:  30.917  30.917
+  k= 4:  23.934  23.934
+  k=16:  19.373  19.373</pre>
+
+<h3>ALiBi</h3>
+<div class="math">s_{ij} = \frac{q_i \cdot k_j}{\sqrt{d_k}} - m_h \,(i - j),\qquad m_h = 2^{-8h/H}</div>
+<ul>
+  <li>No embedding at all: a per-head linear penalty on distance, with geometric slopes so some heads are local and some near-global.</li>
+  <li>Extrapolates in perplexity because the bias for unseen distances is just a larger penalty. It does so partly by ignoring distant tokens, which hurts long-range retrieval tasks.</li>
+</ul>
+
+<h3>Relative Bias (T5)</h3>
+<ul>
+  <li>Instead of adding a position vector to embeddings, T5 adds a learned scalar bias to each attention score that depends on the clipped relative offset <span class="math">i - j</span> (Raffel et al. 2019).</li>
+  <li>Offsets beyond a few buckets share one bias, so the table stays small and can generalise past the training length better than learned absolute embeddings.</li>
+  <li>Unlike RoPE, the bias is not content-dependent: it cannot express "attend relatively when the tokens match". That is why most modern LLMs prefer RoPE (or ALiBi) over T5-style relative bias for decoder-only models.</li>
+</ul>
+
+<h3>RoPE: Rotary Position Embedding</h3>
+<p class="facet">Derivation</p>
+<p>We want a transform <span class="math">f(x, m)</span> applied to queries and keys such that the score depends on content and <em>relative</em> position only: <span class="math">\langle f(q, m), f(k, n)\rangle = g(q, k, m - n)</span>. Treat each channel pair as a complex number <span class="math">z = x_{2i} + i\,x_{2i+1}</span> and rotate it by an angle proportional to position:</p>
+<div class="math">f(z, m) = z\, e^{i m \theta_i} \quad\Rightarrow\quad \operatorname{Re}\!\big[f(q, m)\,\overline{f(k, n)}\big] = \operatorname{Re}\!\big[q\,\bar{k}\, e^{i (m-n)\theta_i}\big]</div>
+<ul>
+  <li>The absolute positions cancel; only <span class="math">m - n</span> survives. Summing over pairs gives the real dot product.</li>
+  <li>In real arithmetic each pair is multiplied by a <span class="math">2 \times 2</span> rotation matrix <span class="math">\begin{pmatrix}\cos m\theta_i &amp; -\sin m\theta_i \\ \sin m\theta_i &amp; \cos m\theta_i\end{pmatrix}</span>. Rotations preserve norms, so RoPE does not change the variance argument of Chapter 3.</li>
+  <li>RoPE is applied to <span class="math">q</span> and <span class="math">k</span> only, never to <span class="math">v</span>: position shapes <em>where</em> to look, not <em>what</em> is retrieved.</li>
+  <li>Low-index pairs rotate fast (local position); high-index pairs rotate slowly (coarse position). Long-context methods (position interpolation, NTK scaling, YaRN) rescale these frequencies.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>RoPE in real and complex form; checking norm preservation and the relative-position property.</figcaption>
+<pre><code>def rope_cache(T, D, base=10000.0):
+    inv = base ** (-np.arange(0, D, 2) / D)                    # (D/2,)
+    ang = np.arange(T)[:, None] * inv[None, :]                 # (T, D/2)
+    return np.cos(ang), np.sin(ang)
+
+def apply_rope(x, cos, sin):
+    """x: (..., T, D). Rotate pairs (x[2i], x[2i+1]) by angle pos * theta_i."""
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    out = np.empty_like(x)
+    out[..., 0::2] = x1 * cos - x2 * sin
+    out[..., 1::2] = x1 * sin + x2 * cos
+    return out
+
+def apply_rope_complex(x, T, base=10000.0):
+    D = x.shape[-1]
+    z = x[..., 0::2] + 1j * x[..., 1::2]                       # (..., T, D/2) complex
+    theta = base ** (-np.arange(0, D, 2) / D)
+    z = z * np.exp(1j * np.arange(T)[:, None] * theta)         # z * e^{i m theta}
+    return np.stack([z.real, z.imag], -1).reshape(x.shape)
+
+rng = np.random.default_rng(0)
+T, D = 32, 16
+cos, sin = rope_cache(T, D)
+q, k = rng.normal(size=(T, D)), rng.normal(size=(T, D))
+print("real == complex form:", np.allclose(apply_rope(q, cos, sin),
+                                           apply_rope_complex(q, T)))
+rq = apply_rope(q, cos, sin)
+print("norm preserved      :", np.allclose(np.linalg.norm(rq, axis=-1),
+                                           np.linalg.norm(q, axis=-1)))
+# Relative property: &lt;R_m q, R_n k&gt; depends only on m - n
+qv, kv = q[0], k[0]
+def score(m, n):
+    Q = np.tile(qv, (T, 1)); K = np.tile(kv, (T, 1))
+    return apply_rope(Q, cos, sin)[m] @ apply_rope(K, cos, sin)[n]
+print("score(5,2), score(20,17), score(29,26):",
+      [round(float(score(m, n)), 6) for m, n in ((5, 2), (20, 17), (29, 26))])</code></pre>
+</figure>
+<pre class="output">real == complex form: True
+norm preserved      : True
+score(5,2), score(20,17), score(29,26): [-6.098267, -6.098267, -6.098267]</pre>
+
+<aside class="callout warning"><span class="title">Interleaved Versus Half-Split Layout</span>
+  <p>We rotate adjacent pairs <span class="math">(x_0, x_1), (x_2, x_3), \ldots</span> as in the RoFormer paper and Meta's original Llama code. Hugging Face Llama uses <code>rotate_half</code>, pairing <span class="math">x_i</span> with <span class="math">x_{i + D/2}</span>. Both are valid; they are <em>not</em> interchangeable. Loading weights trained with one layout into code using the other silently degrades the model; conversion scripts permute the Q and K projection rows to compensate.</p>
+</aside>
+
+<h3>Length Extrapolation Behaviour</h3>
+<ul>
+  <li><strong>Learned absolute</strong>: hard wall at <span class="math">T_{\max}</span>.</li>
+  <li><strong>Sinusoidal</strong>: defined everywhere, but the model has never seen those phase combinations; perplexity rises quickly.</li>
+  <li><strong>RoPE, unmodified</strong>: low-frequency pairs reach angles never seen in training; attention scores go out of distribution and perplexity explodes a little past the training length.</li>
+  <li><strong>RoPE plus interpolation or YaRN</strong>: rescale positions or frequencies so that angles stay in the trained range, then fine-tune briefly. This is how most models extend from 4k–8k to 128k context (Volume 7).</li>
+  <li><strong>ALiBi</strong>: stable perplexity well past training length, but effective use of distant context is limited.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="ffn">Feed-Forward Networks and Gating</h2>
+<p class="chapter-lede">Attention moves information between positions. The feed-forward network (FFN)
+transforms information within a position. It holds about two-thirds of the parameters of a typical
+LLM, and is where much factual association is stored.</p>
+
+<h3>The Per-Token MLP</h3>
+<div class="math">\operatorname{FFN}(x) = \phi(x W_1)\, W_2,\qquad W_1 \in \mathbb{R}^{C \times 4C},\ W_2 \in \mathbb{R}^{4C \times C}</div>
+<ul>
+  <li>Applied independently to every token: it is a <span class="math">1 \times 1</span> convolution over the sequence. No information crosses positions.</li>
+  <li>Expansion ratio 4 is convention from the original paper, not a law. It sets FFN parameters at <span class="math">8C^2</span> versus <span class="math">4C^2</span> for attention.</li>
+  <li><strong>GELU</strong>, <span class="math">x\,\Phi(x)</span>, is a smooth ReLU: non-zero gradient for small negative inputs, which avoids dead units. GPT-2 uses a tanh approximation; PyTorch supports both via <code>approximate=</code>.</li>
+</ul>
+
+<h3>GLU Variants and SwiGLU</h3>
+<div class="math">\operatorname{SwiGLU}(x) = \big(\operatorname{SiLU}(x W_{\text{gate}}) \odot x W_{\text{up}}\big)\, W_{\text{down}},\qquad \operatorname{SiLU}(z) = z\,\sigma(z)</div>
+<ul>
+  <li>One branch computes features, the other computes a data-dependent gate. Multiplicative interactions let a single layer express functions a plain MLP needs more width for.</li>
+  <li>Three matrices instead of two. To compare fairly at equal parameters, shrink the hidden width to <span class="math">\tfrac{2}{3} \cdot 4C = \tfrac{8}{3}C</span>, usually rounded up to a hardware-friendly multiple.</li>
+  <li><span class="evidence documented">Documented</span> Shazeer (2020) found GEGLU and SwiGLU gave the best perplexity among variants at matched parameters and compute. The paper famously offers no explanation, attributing success to "divine benevolence".</li>
+</ul>
+
+<figure class="listing">
+<figcaption>GELU and SwiGLU feed-forward networks, parameter matching, and activation parity.</figcaption>
+<pre><code>def gelu(x):  # tanh approximation (GPT-2); exact uses erf
+    return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x**3)))
+
+def silu(x):
+    return x / (1 + np.exp(-x))
+
+def ffn_gelu(x, W1, W2):            # C -&gt; 4C -&gt; C
+    return gelu(x @ W1) @ W2
+
+def ffn_swiglu(x, W_gate, W_up, W_down):   # C -&gt; H -&gt; C, gated
+    return (silu(x @ W_gate) * (x @ W_up)) @ W_down
+
+C = 768
+H_gelu = 4 * C
+H_swi = int(2 / 3 * 4 * C)                  # parameter-matched hidden size
+H_swi = 256 * ((H_swi + 255) // 256)        # round up to a multiple of 256
+print(f"GELU FFN   : hidden {H_gelu}, params {2 * C * H_gelu:,}")
+print(f"SwiGLU FFN : hidden {H_swi}, params {3 * C * H_swi:,}")
+xt = torch.linspace(-4, 4, 9, dtype=torch.float64)
+print("gelu parity (tanh approx):",
+      np.abs(gelu(xt.numpy()) - F.gelu(xt, approximate="tanh").numpy()).max())
+print("silu parity             :", np.abs(silu(xt.numpy()) - F.silu(xt).numpy()).max())</code></pre>
+</figure>
+<pre class="output">GELU FFN   : hidden 3072, params 4,718,592
+SwiGLU FFN : hidden 2048, params 4,718,592
+gelu parity (tanh approx): 2.220446049250313e-16
+silu parity             : 0.0</pre>
+
+<p>At <span class="math">C = 768</span> the <span class="math">\tfrac{8}{3}C</span> rule gives 2048 exactly, so both FFNs have identical parameter counts. Llama 2 7B uses <span class="math">C = 4096</span> and hidden 11008, which is <span class="math">\tfrac{8}{3} \cdot 4096 = 10923</span> rounded up to a multiple of 256.</p>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">SwiGLU</p>
+    <ul>
+      <li>Better quality per parameter; the default in Llama, Mistral, Qwen, Gemma (GeGLU).</li>
+      <li>Hidden size sits at awkward values; three GEMMs instead of two, though gate and up can be fused.</li>
+    </ul></div>
+  <div class="cons"><p class="facet">GELU MLP</p>
+    <ul>
+      <li>Simpler, two GEMMs, slightly faster per parameter.</li>
+      <li>Measurably worse perplexity at the same budget.</li>
+    </ul></div>
+</div>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="residual-norm">Residuals and Normalisation</h2>
+<p class="chapter-lede">A deep Transformer is trainable because of two components that do no
+"modelling" at all: residual connections and normalisation. Where the normalisation sits decides
+whether a 100-layer model trains out of the box or needs careful warm-up.</p>
+
+<h3>The Residual Stream View</h3>
+<ul>
+  <li>Write the block as <span class="math">x_{l+1} = x_l + \operatorname{Attn}(x_l) + \operatorname{FFN}(\ldots)</span>. The running sum <span class="math">x</span> is the <strong>residual stream</strong>: a shared communication channel of width <span class="math">C</span>.</li>
+  <li>Every layer reads from the stream (via a projection) and writes an additive update to it. The final logits are a linear readout of the sum of all updates plus the embedding.</li>
+  <li>Gradient of the loss with respect to <span class="math">x_l</span> contains an identity term through every residual, so gradients reach early layers undiminished (He et al. 2015). This is the Transformer's answer to Chapter 1's vanishing gradient.</li>
+  <li>The stream view underpins mechanistic interpretability (Elhage et al. 2021): heads and MLPs are independent readers and writers that can be analysed separately.</li>
+</ul>
+
+<h3>Post-LN Versus Pre-LN</h3>
+<figure class="diagram">
+<pre class="ascii">Post-LN (2017 original)               Pre-LN (GPT-2 onwards, all modern LLMs)
+x -&gt; Attn -&gt; (+x) -&gt; LN -&gt;              x -&gt; LN -&gt; Attn -&gt; (+x) -&gt;
+  -&gt; FFN  -&gt; (+ ) -&gt; LN -&gt; out           -&gt; LN -&gt; FFN  -&gt; (+ ) -&gt; ... -&gt; final LN -&gt; head
+LN sits ON the residual path          residual path is a pure identity</pre>
+<figcaption>Where the normalisation sits.</figcaption>
+</figure>
+<ul>
+  <li><strong>Post-LN</strong>: normalisation on the residual path rescales gradients at every layer. Xiong et al. (2020) show gradient norms near the output are large at initialisation, so post-LN needs learning-rate warm-up and still diverges in deep stacks.</li>
+  <li><strong>Pre-LN</strong>: the identity path is clean; training is stable without careful warm-up. Cost: the stream's norm grows with depth, so later layers' updates are relatively smaller, and a final norm before the head is mandatory.</li>
+  <li><span class="evidence documented">Documented</span> Post-LN often reaches slightly better final quality when it trains at all; variants such as DeepNorm and sandwich norm try to have both.</li>
+</ul>
+
+<h3>LayerNorm Versus RMSNorm</h3>
+<div class="math">\operatorname{LN}(x) = \gamma \odot \frac{x - \mu}{\sqrt{\sigma^2 + \epsilon}} + \beta,\qquad \operatorname{RMSNorm}(x) = \gamma \odot \frac{x}{\sqrt{\tfrac{1}{C}\sum_i x_i^2 + \epsilon}}</div>
+<ul>
+  <li>RMSNorm drops mean-centring and the bias. Zhang and Sennrich (2019) found re-centring contributes little; removing it saves one reduction per token, which matters because normalisation is memory-bound.</li>
+  <li>Both normalise over the channel axis per token, never over the batch or time axis. Normalising over time would leak future information through the statistics.</li>
+</ul>
+<figure class="listing">
+<figcaption>LayerNorm and RMSNorm in NumPy, with parity against <code>F.layer_norm</code> and <code>F.rms_norm</code>.</figcaption>
+<pre><code>def layer_norm(x, g, b, eps=1e-5):
+    mu = x.mean(-1, keepdims=True)
+    var = x.var(-1, keepdims=True)                             # biased, like PyTorch
+    return g * (x - mu) / np.sqrt(var + eps) + b
+
+def rms_norm(x, g, eps=1e-6):
+    return g * x / np.sqrt((x**2).mean(-1, keepdims=True) + eps)
+
+rng = np.random.default_rng(0)
+C = 64
+x = rng.normal(3.0, 5.0, size=(2, 7, C))
+g, b = rng.normal(size=C), rng.normal(size=C)
+xt = torch.from_numpy(x)
+ln_ref = F.layer_norm(xt, (C,), torch.from_numpy(g), torch.from_numpy(b), eps=1e-5)
+rms_ref = F.rms_norm(xt, (C,), torch.from_numpy(g), eps=1e-6)
+print("LayerNorm parity:", np.abs(layer_norm(x, g, b) - ln_ref.numpy()).max())
+print("RMSNorm   parity:", np.abs(rms_norm(x, g) - rms_ref.numpy()).max())
+y = rms_norm(x, np.ones(C))
+print("RMSNorm output mean (not centred):", y.mean().round(3), " rms:",
+      np.sqrt((y**2).mean(-1)).mean().round(3))</code></pre>
+</figure>
+<pre class="output">LayerNorm parity: 8.881784197001252e-16
+RMSNorm   parity: 8.881784197001252e-16
+RMSNorm output mean (not centred): 0.509  rms: 1.0</pre>
+
+<h3>Initialisation and Stability</h3>
+<ul>
+  <li>Each block adds two updates to the stream. With <span class="math">L</span> layers the stream variance grows roughly as <span class="math">1 + 2L\sigma^2_{\text{update}}</span>.</li>
+  <li>GPT-2 scales the init of the output projections (<span class="math">W_O</span>, <span class="math">W_{\text{down}}</span>) by <span class="math">1/\sqrt{2L}</span> so the stream stays <span class="math">O(1)</span> at initialisation; our block in Chapter 9 does the same.</li>
+  <li>Norm gains initialised to 1; embeddings with small standard deviation (0.02 is the GPT-2 convention).</li>
+  <li>Symptoms of bad initialisation: loss spikes in the first few hundred steps, activations growing layer by layer, a few channels with huge magnitudes (outlier features), which later break int8 quantisation (Volume 11).</li>
+</ul>
+<aside class="callout advanced"><span class="title">Why the Final Norm Matters</span>
+  <p>In pre-LN models the last block's output is unnormalised and its scale grows with depth. Without the final norm before the unembedding, logit scale depends on depth and the softmax temperature is effectively uncontrolled.</p>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 9 -->
+<section class="chapter">
+<h2 id="block">The Transformer Block and Architectures</h2>
+<p class="chapter-lede">Everything so far composes into one block, repeated <span class="math">L</span>
+times. The same block, with different masks and wiring, yields BERT, GPT and T5.</p>
+
+<h3>Assembling the Decoder Block</h3>
+<div class="math">\begin{aligned} h &amp;= x + \operatorname{MHA}\big(\operatorname{RMSNorm}(x);\ \text{causal},\ \text{RoPE}\big)\\ y &amp;= h + \operatorname{SwiGLU}\big(\operatorname{RMSNorm}(h)\big)\end{aligned}</div>
+
+<div class="frame simple"><p><strong>Simple version.</strong> Attention, then MLP, each wrapped in pre-norm and a residual. This is the Llama block.</p></div>
+
+<figure class="listing">
+<figcaption>A complete Llama-style decoder block in NumPy: RMSNorm, RoPE, causal MHA, SwiGLU, residual scaling. The leakage test runs on the full block.</figcaption>
+<pre><code>class DecoderBlock:
+    """Pre-norm, Llama-style: x += Attn(RMSNorm(x)); x += SwiGLU(RMSNorm(x))."""
+    def __init__(self, C, H, hidden, rng, n_layers=1):
+        self.attn = MultiHeadAttention(C, H, rng)
+        self.attn.W_o *= 1 / np.sqrt(2 * n_layers)             # GPT-2 residual scaling
+        self.g1, self.g2 = np.ones(C), np.ones(C)
+        s = C**-0.5
+        self.W_gate = rng.normal(0, s, (C, hidden))
+        self.W_up = rng.normal(0, s, (C, hidden))
+        self.W_down = rng.normal(0, hidden**-0.5 / np.sqrt(2 * n_layers), (hidden, C))
+
+    def __call__(self, x):
+        B, T, C = x.shape
+        cos, sin = rope_cache(T, C // self.attn.H)
+        rope = lambda t: apply_rope(t, cos, sin)
+        x = x + self.attn(rms_norm(x, self.g1), mask=causal_mask(T), rope=rope)
+        x = x + ffn_swiglu(rms_norm(x, self.g2), self.W_gate, self.W_up, self.W_down)
+        return x
+
+rng = np.random.default_rng(0)
+blk = DecoderBlock(C=64, H=4, hidden=192, rng=rng)
+x = rng.normal(size=(2, 12, 64))
+y = blk(x)
+print("block out:", y.shape, " residual rms in/out:",
+      np.sqrt((x**2).mean()).round(3), np.sqrt((y**2).mean()).round(3))
+print("causal leak test:", leak_test(lambda z: blk(z[None])[0], T=12, C=64))</code></pre>
+</figure>
+<pre class="output">block out: (2, 12, 64)  residual rms in/out: 0.976 1.168
+causal leak test: ok: no future information reaches the past</pre>
+
+<p>Now the same block in PyTorch as the start of <code>forge.nn</code>, with weights copied from the NumPy block. Note the reliance on <code>F.scaled_dot_product_attention(..., is_causal=True)</code> instead of a hand-built mask.</p>
+<figure class="listing">
+<figcaption><code>forge.nn</code>: the PyTorch block, and parity with the NumPy block to machine precision.</figcaption>
+<pre><code># forge/nn.py — DecoderBlock and helpers used by Volume 4import torch.nn as nn
+
+def rope_t(x, cos, sin):                                  # x: (B, H, T, D) interleaved
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1).flatten(-2)
+
+class Block(nn.Module):
+    def __init__(self, C, H, hidden):
+        super().__init__()
+        self.H = H
+        self.n1, self.n2 = nn.RMSNorm(C, eps=1e-6), nn.RMSNorm(C, eps=1e-6)
+        self.qkv = nn.Linear(C, 3 * C, bias=False)
+        self.o = nn.Linear(C, C, bias=False)
+        self.gate = nn.Linear(C, hidden, bias=False)
+        self.up = nn.Linear(C, hidden, bias=False)
+        self.down = nn.Linear(hidden, C, bias=False)
+
+    def forward(self, x, cos, sin):
+        B, T, C = x.shape
+        q, k, v = self.qkv(self.n1(x)).view(B, T, 3, self.H, C // self.H).unbind(2)
+        q, k, v = (t.transpose(1, 2) for t in (q, k, v))       # (B, H, T, D)
+        q, k = rope_t(q, cos, sin), rope_t(k, cos, sin)
+        a = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        x = x + self.o(a.transpose(1, 2).reshape(B, T, C))
+        h = self.n2(x)
+        return x + self.down(F.silu(self.gate(h)) * self.up(h))
+
+tb = Block(64, 4, 192).double()
+with torch.no_grad():                                      # copy NumPy weights
+    tb.qkv.weight.copy_(torch.from_numpy(blk.attn.W_qkv.T))
+    tb.o.weight.copy_(torch.from_numpy(blk.attn.W_o.T))
+    tb.gate.weight.copy_(torch.from_numpy(blk.W_gate.T))
+    tb.up.weight.copy_(torch.from_numpy(blk.W_up.T))
+    tb.down.weight.copy_(torch.from_numpy(blk.W_down.T))
+cos, sin = (torch.from_numpy(a) for a in rope_cache(12, 16))
+yt = tb(torch.from_numpy(x), cos, sin)
+print("max |NumPy block - PyTorch block|:", np.abs(yt.detach().numpy() - y).max())</code></pre>
+</figure>
+<pre class="output">max |NumPy block - PyTorch block|: 1.3322676295501878e-15</pre>
+
+<div class="frame production"><p><strong>Production version.</strong> The same block adds grouped-query attention (fewer K/V heads), a KV cache for decoding, fused QKV and gate/up kernels, bf16 weights with fp32 norms and softmax, tensor-parallel sharding of projections, and FlashAttention. The mathematics is unchanged; everything else is about memory traffic.</p></div>
+<div class="frame why-complex"><p><strong>Why it is complicated.</strong> Each optimisation moves the implementation further from the reference: GQA changes head bookkeeping, KV caching changes mask offsets, fusion hides intermediates, and low precision changes numerics. The parity suite from this volume is how you keep those changes honest.</p></div>
+
+<h3>Encoder-Only, Decoder-Only and Encoder-Decoder</h3>
+<pre class="mermaid">flowchart TD
+  A[Input tokens] --> E1["Encoder stack: bidirectional self-attention"]
+  E1 --> BERT["Encoder-only (BERT): per-token or pooled outputs"]
+  E1 --> X["Cross-attention: decoder queries, encoder keys and values"]
+  B[Target tokens so far] --> D1["Decoder stack: causal self-attention"]
+  D1 --> X
+  X --> T5["Encoder-decoder (T5, original Transformer)"]
+  C[All tokens] --> D2["Decoder-only (GPT, Llama): causal self-attention"]
+  D2 --> LM["Next-token logits"]</pre>
+
+<table>
+  <caption>The three architecture families.</caption>
+  <thead><tr><th></th><th>Encoder-only</th><th>Decoder-only</th><th>Encoder-decoder</th></tr></thead>
+  <tbody>
+    <tr><td>Examples</td><td>BERT, RoBERTa, modern embedding models</td><td>GPT, Llama, Claude-class and most frontier LLMs</td><td>T5, BART, Whisper, original Transformer</td></tr>
+    <tr><td>Self-attention mask</td><td>Bidirectional</td><td>Causal</td><td>Bidirectional (encoder), causal (decoder)</td></tr>
+    <tr><td>Extra component</td><td>None</td><td>None</td><td>Cross-attention in each decoder block</td></tr>
+    <tr><td>Objective</td><td>Masked-token prediction</td><td>Next-token prediction</td><td>Span corruption or seq2seq</td></tr>
+    <tr><td>Best at</td><td>Classification, retrieval embeddings, tagging</td><td>Generation, in-context learning, general assistants</td><td>Translation, summarisation, speech-to-text, fixed input-to-output mappings</td></tr>
+    <tr><td>Generates text?</td><td>Not naturally</td><td>Yes</td><td>Yes</td></tr>
+  </tbody>
+</table>
+
+<h4>Cross-Attention</h4>
+<ul>
+  <li>Queries from the decoder stream; keys and values from the final encoder output: <span class="math">\operatorname{Attention}(X_{\text{dec}} W_Q,\ X_{\text{enc}} W_K,\ X_{\text{enc}} W_V)</span>. Our <code>sdpa</code> already supports it because <span class="math">T \ne S</span> is allowed.</li>
+  <li>No causal mask (the whole source is known), but a padding mask on the source.</li>
+  <li>Encoder K and V are computed once per input and reused at every decoding step, a natural cache.</li>
+  <li>The same mechanism conditions image generators on text (Volume 20) and connects vision encoders to LMs in some multimodal designs (Volume 19).</li>
+</ul>
+
+<h4>Why Decoder-Only Won for LLMs</h4>
+<ul>
+  <li><strong>One objective, every token supervised.</strong> Next-token prediction on raw text gives a loss at every position; BERT's masked LM supervises about 15%.</li>
+  <li><strong>Tasks become text.</strong> Instructions, examples and answers all fit into one stream, enabling in-context learning and a single model for everything.</li>
+  <li><strong>Simple scaling and serving.</strong> One stack, one mask, one KV cache. Encoder-decoder needs two stacks and a policy for splitting inputs and outputs.</li>
+  <li><span class="evidence documented">Documented</span> Wang et al. (2022) found encoder-decoder with MLM-style objectives is stronger after multitask fine-tuning, but causal decoder-only is best at zero-shot generalisation after pretraining alone, which is the property that matters for general assistants.</li>
+  <li><span class="evidence inferred">Inferred</span> Ecosystem lock-in (tooling, kernels, serving engines optimised for decoder-only) now reinforces the choice independently of modelling merits.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 10 -->
+<section class="chapter">
+<h2 id="causal-lm">Causal Language Modelling</h2>
+<p class="chapter-lede">A stack of blocks becomes a language model with an embedding, a final norm, an
+unembedding and one loss. This chapter trains one end to end to prove the whole stack works.</p>
+
+<h3>The Objective</h3>
+<div class="math">\mathcal{L} = -\frac{1}{T}\sum_{t=1}^{T} \log p_\theta(x_t \mid x_{&lt;t}),\qquad \text{PPL} = e^{\mathcal{L}}</div>
+<ul>
+  <li><strong>Teacher forcing</strong>: during training the model conditions on the <em>true</em> prefix, not its own samples. With a causal mask, one forward pass yields all <span class="math">T</span> predictions in parallel.</li>
+  <li><strong>Shifted targets</strong>: inputs are <code>seq[:, :-1]</code>, targets are <code>seq[:, 1:]</code>. Position <span class="math">t</span> predicts token <span class="math">t+1</span>. Forgetting the shift trains an identity function: loss goes to 0 and nothing is learned.</li>
+  <li><strong>Units</strong>: with natural log the loss is in nats; divide by <span class="math">\ln 2</span> for bits. Bits per byte (loss in bits × tokens / bytes) compares models across tokenisers; perplexity does not.</li>
+  <li><strong>Exposure bias</strong>: at inference the model conditions on its own outputs, a distribution it never trained on. Errors can compound; in practice scale and data make this manageable.</li>
+</ul>
+
+<h3>Training a Tiny Transformer on a Toy Language</h3>
+<div class="frame problem"><p>A unit test cannot tell you that 11 components compose into a model that <em>learns</em>. The cheapest end-to-end test is a synthetic task with a known solution: reverse a sequence of 8 digits. Chance loss is <span class="math">\ln 10 \approx 2.30</span> nats; a correct model reaches about 0.</p></div>
+<ul>
+  <li>Sequence: 8 digits, a separator, then the digits reversed; 17 tokens, 16 input positions.</li>
+  <li>Loss is taken only on the reversed half: the first half is random and unpredictable, so including it would add a floor of 2.30 nats and obscure the signal.</li>
+  <li>Model: 2 of the PyTorch blocks from Chapter 9, <span class="math">C = 64</span>, 4 heads, RoPE, tied embedding and unembedding, 132k parameters.</li>
+</ul>
+<figure class="listing">
+<figcaption>A tiny causal Transformer trained on sequence reversal on CPU.</figcaption>
+<pre><code>import time
+torch.manual_seed(0)
+V, N = 16, 8      # vocab: digits 0..9, 10 = SEP; seq = x (8) SEP reverse(x) (8)
+SEP = 10
+
+def batch(bs):
+    x = torch.randint(0, 10, (bs, N))
+    seq = torch.cat([x, torch.full((bs, 1), SEP), x.flip(1)], 1)       # (B, 17)
+    return seq[:, :-1], seq[:, 1:]                                     # shifted targets
+
+class TinyLM(nn.Module):
+    def __init__(self, V, C=64, H=4, L=2, T=16):
+        super().__init__()
+        self.emb = nn.Embedding(V, C)
+        self.blocks = nn.ModuleList(Block(C, H, 4 * C) for _ in range(L))
+        self.norm = nn.RMSNorm(C, eps=1e-6)
+        self.head = nn.Linear(C, V, bias=False)
+        self.head.weight = self.emb.weight                             # weight tying
+        inv = 10000.0 ** (-torch.arange(0, C // H, 2) / (C // H))
+        ang = torch.arange(T)[:, None] * inv
+        self.register_buffer("cos", ang.cos()); self.register_buffer("sin", ang.sin())
+
+    def forward(self, idx):
+        T = idx.shape[1]
+        x = self.emb(idx)
+        for b in self.blocks:
+            x = b(x, self.cos[:T], self.sin[:T])
+        return self.head(self.norm(x))                                 # (B, T, V)
+
+model = TinyLM(V)
+opt = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=0.0)
+print("params:", sum(p.numel() for p in model.parameters()))
+t0 = time.time()
+for step in range(1, 1001):
+    xb, yb = batch(128)
+    logits = model(xb)
+    # score only the reversed half: positions whose target is after SEP
+    loss = F.cross_entropy(logits[:, N:].reshape(-1, V), yb[:, N:].reshape(-1))
+    opt.zero_grad(); loss.backward(); opt.step()
+    if step % 200 == 0:
+        print(f"step {step:4d}  loss {loss.item():.4f} nats"
+              f"  ppl {loss.exp().item():6.3f}  ({time.time() - t0:4.1f}s)")</code></pre>
+</figure>
+<pre class="output">params: 132416
+step  200  loss 1.6282 nats  ppl  5.095  ( 3.0s)
+step  400  loss 0.9057 nats  ppl  2.474  ( 6.1s)
+step  600  loss 0.0419 nats  ppl  1.043  ( 9.5s)
+step  800  loss 0.0092 nats  ppl  1.009  (12.9s)
+step 1000  loss 0.0007 nats  ppl  1.001  (16.3s)</pre>
+
+<figure class="listing">
+<figcaption>Greedy decoding on 1,000 fresh sequences: exact-match accuracy.</figcaption>
+<pre><code>@torch.no_grad()
+def generate(model, prefix, n):
+    idx = prefix
+    for _ in range(n):
+        nxt = model(idx)[:, -1].argmax(-1, keepdim=True)               # greedy
+        idx = torch.cat([idx, nxt], 1)
+    return idx
+
+model.eval()
+x = torch.randint(0, 10, (1000, N))
+prompt = torch.cat([x, torch.full((1000, 1), SEP)], 1)
+out = generate(model, prompt, N)[:, N + 1:]
+print("exact-sequence accuracy:", (out == x.flip(1)).all(1).float().mean().item())
+print("example  in:", x[0].tolist(), "\n        out:", out[0].tolist())
+print("chance loss ln(10) =", round(float(np.log(10)), 4), "nats")</code></pre>
+</figure>
+<pre class="output">exact-sequence accuracy: 0.9950000047683716
+example  in: [5, 5, 8, 9, 0, 4, 9, 6] 
+        out: [6, 9, 4, 0, 9, 8, 5, 5]
+chance loss ln(10) = 2.3026 nats</pre>
+
+<ul>
+  <li>Loss fell from chance to about <span class="math">7 \times 10^{-4}</span> nats in 1,000 steps (16 seconds on a laptop CPU; wall time varies with load), and 99.5% of fresh sequences are reversed exactly.</li>
+  <li>Loss plateaus near 1.6 nats before dropping sharply around step 400–600: the model first learns digit statistics, then the positional copy rule. Such plateaus followed by sudden drops recur at every scale (Olsson et al. 2022).</li>
+</ul>
+
+<h3>What the Model Learned: Attention Patterns</h3>
+<p>Reversal has a known algorithm: output position <span class="math">t</span> must copy the token at source position <span class="math">2N - 1 - t</span>. We can check whether some head attends there.</p>
+<figure class="listing">
+<figcaption>For each output position, the strongest attention weight any head places on the token that must be copied.</figcaption>
+<pre><code># For each output position, which head attends to the token it must copy?
+def attn_maps(model, idx):
+    maps, T = [], idx.shape[1]
+    x = model.emb(idx)
+    for b in model.blocks:
+        B, _, C = x.shape
+        q, k, _ = b.qkv(b.n1(x)).view(B, T, 3, b.H, C // b.H).unbind(2)
+        q, k = (rope_t(t.transpose(1, 2), model.cos[:T], model.sin[:T]) for t in (q, k))
+        s = (q @ k.transpose(-1, -2)) / (C // b.H) ** 0.5
+        s = s.masked_fill(~torch.ones(T, T, dtype=torch.bool).tril(), float("-inf"))
+        maps.append(s.softmax(-1))
+        x = b(x, model.cos[:T], model.sin[:T])
+    return maps
+
+with torch.no_grad():
+    full = generate(model, prompt[:1], N - 1)                           # (1, 16)
+    maps = attn_maps(model, full)                                       # L x (1,H,T,T)
+for t in range(N, 2 * N):
+    src = 2 * N - 1 - t                                     # where the answer sits
+    w = torch.stack([m[0, :, t, src] for m in maps])        # (L, H) weight on source
+    l, h = divmod(w.argmax().item(), w.shape[1])
+    print(f"query {t:2d} -&gt; source {src}: best layer {l} head {h} weight {w.max():.2f}")</code></pre>
+</figure>
+<pre class="output">query  8 -&gt; source 7: best layer 0 head 3 weight 0.99
+query  9 -&gt; source 6: best layer 1 head 1 weight 1.00
+query 10 -&gt; source 5: best layer 0 head 2 weight 0.00
+query 11 -&gt; source 4: best layer 0 head 0 weight 0.00
+query 12 -&gt; source 3: best layer 1 head 3 weight 0.99
+query 13 -&gt; source 2: best layer 1 head 1 weight 1.00
+query 14 -&gt; source 1: best layer 0 head 0 weight 0.01
+query 15 -&gt; source 0: best layer 1 head 2 weight 1.00</pre>
+<ul>
+  <li>For five of eight positions one head puts essentially all its weight on the correct source token: a learned, content-independent, position-addressed copy.</li>
+  <li>For the other three, no head attends directly to the source. The model routes in two hops: a layer-0 head moves the token into another position's residual stream, and a layer-1 head reads it from there. This is the composition of heads that Elhage et al. (2021) formalise, and a reminder that attention maps are evidence, not explanations.</li>
+</ul>
+
+<ul class="failure-modes">
+  <li>Loss drops to 0 in a few steps: targets not shifted, or causal mask missing.</li>
+  <li>Loss stuck at <span class="math">\ln V</span>: learning rate far too high or too low, or gradients not reaching parameters (weight tying broken, <code>no_grad</code> left on).</li>
+  <li>Training loss good, generation bad: train/inference mismatch in masks, positions or padding side.</li>
+  <li><code>nan</code> after some steps: hand-written log-softmax, fp16 overflow in scores, or a fully masked row.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 11 -->
+<section class="chapter">
+<h2 id="production">Production Transformers in PyTorch</h2>
+<p class="chapter-lede">Production code computes the same function as our NumPy block. The differences
+are all about memory traffic, fused kernels and compile-time specialisation. This chapter maps those
+abstractions back onto what you built.</p>
+
+<h3>F.scaled_dot_product_attention and Its Backends</h3>
+<ul>
+  <li>One call, <code>F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False)</code>, dispatches to one of several backends based on device, dtype, shapes and mask.</li>
+  <li><strong>FlashAttention-2</strong> (CUDA, fp16/bf16): tiles Q, K and V through on-chip SRAM with an online softmax; never materialises the <span class="math">T \times S</span> matrix. Memory <span class="math">O(T)</span>; typically several times faster.</li>
+  <li><strong>Memory-efficient</strong> (xFormers-style): similar tiling; supports more dtypes and arbitrary masks.</li>
+  <li><strong>cuDNN</strong> attention on recent NVIDIA GPUs.</li>
+  <li><strong>Math</strong>: the reference implementation, equivalent to our <code>sdpa</code>. Used on CPU or when no fused kernel supports the inputs.</li>
+  <li>Pass <code>is_causal=True</code> rather than a dense causal mask: a dense mask can disable the Flash backend and costs <span class="math">O(T^2)</span> memory to build.</li>
+  <li>Force or restrict a backend for debugging with <code>torch.nn.attention.sdpa_kernel([SDPBackend.MATH])</code>; compare outputs across backends at bf16 tolerances.</li>
+</ul>
+
+<h4>The Online Softmax in One Paragraph</h4>
+<p>Process keys in blocks. Keep, per query, a running maximum <span class="math">m</span>, running denominator <span class="math">\ell</span> and running output <span class="math">o</span>. For a new block with scores <span class="math">s</span>: <span class="math">m' = \max(m, \max s)</span>, <span class="math">\ell' = e^{m - m'}\ell + \sum e^{s - m'}</span>, <span class="math">o' = e^{m - m'} o + e^{s - m'} V_{\text{block}}</span>. Divide by <span class="math">\ell</span> at the end. This is the stable softmax of Chapter 2, made streaming. Volume 11 implements it.</p>
+
+<h3>torch.compile</h3>
+<ul>
+  <li>Traces the Python model into a graph (TorchDynamo) and generates fused kernels (TorchInductor, Triton on GPU). Norms, activations, RoPE and residual adds fuse into fewer memory-bound kernels.</li>
+  <li>Gains are largest for the memory-bound elementwise ops around attention; matmuls and SDPA are already library kernels.</li>
+  <li>Costs: compile time on first call, recompiles on new shapes (use <code>dynamic=True</code> or pad to buckets), and graph breaks on data-dependent Python control flow.</li>
+  <li>Always check parity between eager and compiled models; numerical differences at bf16 tolerance are expected, larger ones are bugs.</li>
+</ul>
+
+<h3>Reading a Llama-Style Implementation Against Ours</h3>
+<table>
+  <caption>Mapping from a Hugging Face–style Llama implementation to this volume's components.</caption>
+  <thead><tr><th>Production module</th><th>Our component</th><th>Differences to know</th></tr></thead>
+  <tbody>
+    <tr><td><code>LlamaRMSNorm</code></td><td><code>rms_norm</code></td><td>Computes in fp32 then casts back; <span class="math">\epsilon</span> from config (1e-5 or 1e-6).</td></tr>
+    <tr><td><code>LlamaRotaryEmbedding</code>, <code>apply_rotary_pos_emb</code></td><td><code>rope_cache</code>, <code>apply_rope</code></td><td>Half-split <code>rotate_half</code> layout; frequency scaling for long context (<code>rope_scaling</code>); <code>rope_theta</code> up to 500,000 in Llama 3.</td></tr>
+    <tr><td><code>LlamaAttention</code></td><td><code>MultiHeadAttention</code></td><td>Separate <code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code>; GQA with <code>num_key_value_heads</code> &lt; <code>num_attention_heads</code>; KV cache object; pluggable attention backend.</td></tr>
+    <tr><td><code>LlamaMLP</code></td><td><code>ffn_swiglu</code></td><td><code>gate_proj</code>, <code>up_proj</code>, <code>down_proj</code>; identical maths.</td></tr>
+    <tr><td><code>LlamaDecoderLayer</code></td><td><code>DecoderBlock</code></td><td>Same pre-norm residual structure.</td></tr>
+    <tr><td><code>LlamaModel</code> + <code>lm_head</code></td><td><code>TinyLM</code></td><td>Final norm, then unembedding; tying depends on model size.</td></tr>
+  </tbody>
+</table>
+<aside class="callout impl"><span class="title">Exercise the Mapping</span>
+  <p>Load a small open Llama-architecture model (SmolLM2-135M from Volume 1), copy one layer's weights into <code>DecoderBlock</code> (after permuting for the RoPE layout and repeating K/V heads for GQA), and check parity on random input. Doing this once removes all mystery from model code.</p>
+</aside>
+
+<h3>The Mechanistic View</h3>
+<ul>
+  <li><strong>Residual stream</strong>: a shared bus. Attention heads move information between positions; MLPs transform it in place (Chapter 8).</li>
+  <li><strong>Attention patterns</strong>: the <span class="math">P</span> matrix per head. Useful for diagnosis (Chapter 10), but misleading alone, because values and <span class="math">W_O</span> decide what is actually written.</li>
+  <li><strong>Induction heads</strong> (Olsson et al. 2022): a two-head circuit. A previous-token head in an earlier layer writes "the token before me was A" into each position; an induction head in a later layer looks for positions whose previous token matches the current token and copies what followed. Pattern <code>[A][B] … [A] → [B]</code>.</li>
+  <li><span class="evidence documented">Documented</span> Induction heads form abruptly during training, at the same time as a visible bump in the loss curve and the onset of in-context learning.</li>
+</ul>
+<figure class="diagram">
+<pre class="ascii">tokens:     ...  A    B   ...  ...   A    ?
+                 |    |              |
+L0 prev-token:   +---&gt;B knows "prev = A"
+L1 induction:                        A (query: "who had prev = A?")
+                      B &lt;------------+  attend, copy B  -&gt;  predict B</pre>
+<figcaption>An induction head composes with a previous-token head across layers.</figcaption>
+</figure>
+<p>The two-hop routing found in Chapter 10 is the same kind of composition on a simpler task. The practical project asks you to train on a repeated-random-sequence task and find a genuine induction head.</p>
+</section>
+
+<!-- ================================================================ REVIEW -->
+<section class="review">
+<h1>Volume Review</h1>
+
+<h2>What You Learned</h2>
+<ul>
+  <li>RNNs fail on long sequences because of sequential compute, geometric gradient decay and a fixed-size state; attention gives <span class="math">O(1)</span> path length and parallel training at <span class="math">O(T^2)</span> cost.</li>
+  <li>Softmax must subtract the max; losses must use log-sum-exp; fully masked rows need an explicit policy.</li>
+  <li>Dot products of unit-variance vectors have variance <span class="math">d_k</span>; dividing by <span class="math">\sqrt{d_k}</span> keeps attention soft and gradients alive.</li>
+  <li>Causal and padding masks encode different facts; the correct test for causality is behavioural (perturb the future).</li>
+  <li>Multi-head attention partitions the same <span class="math">4C^2</span> parameters into subspaces; split and merge are reshape plus transpose, and the merge copies.</li>
+  <li>Attention is permutation-equivariant; RoPE injects exact relative position by rotating q and k; extrapolation depends on the scheme.</li>
+  <li>SwiGLU beats a GELU MLP at matched parameters; hidden size <span class="math">\tfrac{8}{3}C</span>.</li>
+  <li>Pre-norm keeps the residual path an identity and trains stably; RMSNorm is LayerNorm without centring.</li>
+  <li>Decoder-only won for LLMs because of dense supervision, tasks-as-text and simple serving.</li>
+  <li>PyTorch modules live in <code>forge.nn</code> and must stay parity-checked against the NumPy reference.</li>
+</ul>
+
+<h2>What You Built</h2>
+<ul>
+  <li>NumPy reference: stable softmax and log-softmax, SDPA with forward and backward, masks, a leakage test, MHA, sinusoidal PE, RoPE (real and complex), LayerNorm, RMSNorm, GELU and SwiGLU FFNs, and a full Llama-style decoder block.</li>
+  <li><code>forge.nn</code>: PyTorch modules with a parity suite against NumPy and <code>torch.nn.functional</code> (SDPA, <code>nn.MultiheadAttention</code>, norms, activations, full block), all within <span class="math">2 \times 10^{-15}</span>.</li>
+  <li>A tiny causal LM on <code>forge.nn</code> that learns sequence reversal to 99.5% exact match in under 20 seconds on CPU.</li>
+  <li>An attention-pattern probe that exposes direct and two-hop copy circuits.</li>
+</ul>
+
+<h2>Important Code</h2>
+<table>
+  <caption>Listings to keep; later volumes extend them inside <code>src/forge/</code>.</caption>
+  <thead><tr><th>Listing</th><th>Forge module</th><th>Concept</th><th>Extended in</th></tr></thead>
+  <tbody>
+    <tr><td><code>softmax</code>, <code>log_softmax</code></td><td><code>forge.nn</code></td><td>Numerical stability</td><td>Volume 11 (online softmax)</td></tr>
+    <tr><td><code>sdpa</code>, <code>sdpa_backward</code></td><td><code>forge.nn</code></td><td>Attention and its gradient</td><td>Volume 11 (FlashAttention)</td></tr>
+    <tr><td><code>causal_mask</code>, <code>leak_test</code></td><td><code>forge.nn</code></td><td>Correctness</td><td>Volumes 4, 11 (KV cache offsets)</td></tr>
+    <tr><td><code>MultiHeadAttention</code></td><td><code>forge.nn</code></td><td>Heads</td><td>Volume 7 (GQA, MQA, MLA)</td></tr>
+    <tr><td><code>rope_cache</code>, <code>apply_rope</code></td><td><code>forge.nn</code></td><td>Position</td><td>Volume 7 (long context, YaRN)</td></tr>
+    <tr><td><code>DecoderBlock</code>, <code>Block</code>, <code>TinyLM</code></td><td><code>forge.nn</code> / <code>forge.model</code></td><td>The model</td><td>Volume 4</td></tr>
+  </tbody>
+</table>
+
+<h2>Important Architecture</h2>
+<figure class="diagram">
+<pre class="ascii">token ids (B,T)
+   |
+   v
+Embedding (V x C)  ---------------------------------------+ tied weights
+   |                                                       |
+   v   repeat L times                                      |
++--------------------------------------------------+       |
+| x = x + W_o . SDPA( RoPE(q), RoPE(k), v ; causal) |       |
+|         where q,k,v = split(W_qkv . RMSNorm(x))   |       |
+| x = x + W_down . (SiLU(W_gate h) * W_up h)        |       |
+|         where h = RMSNorm(x)                      |       |
++--------------------------------------------------+       |
+   |                                                       |
+   v                                                       |
+RMSNorm -&gt; Unembedding (C x V) &lt;-----------------------------+
+   |
+   v
+logits (B,T,V) -&gt; cross-entropy vs shifted targets</pre>
+<figcaption>The decoder-only Transformer built in this volume.</figcaption>
+</figure>
+
+<h2>Failure Modes</h2>
+<ul class="failure-modes">
+  <li>Naive softmax or <code>log(softmax)</code>: overflow, <code>-inf</code>, then <code>nan</code> gradients.</li>
+  <li>Missing <span class="math">\sqrt{d_k}</span> scale: near-hard attention at initialisation and stalled learning.</li>
+  <li>Transposed or off-by-one causal mask: excellent training loss, useless generation.</li>
+  <li>Opposite boolean mask conventions between libraries.</li>
+  <li>Reshape without transpose when splitting heads: runs, wrong.</li>
+  <li>RoPE layout mismatch (interleaved versus half-split) when loading weights.</li>
+  <li>Unshifted targets: the model learns the identity.</li>
+  <li>Post-LN in deep stacks without warm-up: divergence.</li>
+  <li>Padding side differing between training and serving.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<ul>
+  <li>Component level: parity with a float64 reference, gradient checks, the leakage test.</li>
+  <li>Model level: synthetic tasks with known solutions (copy, reverse, induction) and exact-match accuracy, compared against chance loss.</li>
+  <li>Report loss in nats and bits; use bits per byte to compare across tokenisers.</li>
+  <li>Backends: compare math, Flash and compiled paths at dtype-appropriate tolerances.</li>
+</ul>
+
+<h2>Practical Project</h2>
+<div class="frame exercise" data-title="Transformer parity suite">
+  <ol>
+    <li>Package the NumPy and PyTorch blocks as a module with pytest tests: every component, forward and backward, parity to <span class="math">10^{-5}</span> in float32.</li>
+    <li>Add the leakage test for every model class, including with padding and KV-cache offsets.</li>
+    <li>Benchmark your PyTorch attention against <code>F.scaled_dot_product_attention</code> for <span class="math">T \in \{256, 1024, 4096\}</span>; report time and peak memory.</li>
+    <li>Train the tiny model on a repeated-random-sequence task (a random 16-token sequence, then the same sequence again). Find the previous-token head and the induction head, and plot the loss curve around their formation.</li>
+    <li>Write a one-page memo: which components gave the most trouble and which tests caught the bugs.</li>
+  </ol>
+</div>
+
+<h2>Exercises</h2>
+<ol>
+  <li>Show that the gradient of softmax is <span class="math">\operatorname{diag}(p) - pp^\top</span> and that it vanishes as <span class="math">p</span> becomes one-hot.</li>
+  <li>Repeat the variance experiment of Chapter 3 with <span class="math">q, k</span> drawn with variance 2. What scale restores unit variance?</li>
+  <li>Implement ALiBi in <code>sdpa</code> and verify it passes the leakage test.</li>
+  <li>Convert <code>apply_rope</code> to the half-split layout and write the permutation that maps weights between the two layouts. Prove parity.</li>
+  <li>Implement grouped-query attention with 8 query heads and 2 KV heads and compare with <code>enable_gqa=True</code> in SDPA.</li>
+  <li>Switch the toy model to post-LN and 8 layers. At what learning rate does it diverge, and does warm-up fix it?</li>
+  <li>Train the reversal model with learned absolute positions instead of RoPE, then evaluate at length 12. Explain the result.</li>
+  <li>Implement the online softmax and show it matches <code>sdpa</code> when keys are processed in 4 blocks.</li>
+</ol>
+
+<h2>Research Papers</h2>
+<table>
+  <caption>Papers referenced in this volume.</caption>
+  <thead><tr><th>Paper</th><th>Why it matters here</th></tr></thead>
+  <tbody>
+    <tr><td>Bahdanau, Cho &amp; Bengio, 2014. <em>Neural Machine Translation by Jointly Learning to Align and Translate</em>. arXiv:1409.0473</td><td>Attention removes the seq2seq bottleneck.</td></tr>
+    <tr><td>Vaswani et al., 2017. <em>Attention Is All You Need</em>. arXiv:1706.03762</td><td>The Transformer; scaled dot-product attention; sinusoidal PE.</td></tr>
+    <tr><td>He et al., 2015. <em>Deep Residual Learning for Image Recognition</em>. arXiv:1512.03385</td><td>Residual connections.</td></tr>
+    <tr><td>Ba, Kiros &amp; Hinton, 2016. <em>Layer Normalization</em>. arXiv:1607.06450</td><td>LayerNorm.</td></tr>
+    <tr><td>Xiong et al., 2020. <em>On Layer Normalization in the Transformer Architecture</em>. arXiv:2002.04745</td><td>Why pre-LN trains without warm-up.</td></tr>
+    <tr><td>Zhang &amp; Sennrich, 2019. <em>Root Mean Square Layer Normalization</em>. arXiv:1910.07467</td><td>RMSNorm.</td></tr>
+    <tr><td>Shazeer, 2020. <em>GLU Variants Improve Transformer</em>. arXiv:2002.05202</td><td>SwiGLU.</td></tr>
+    <tr><td>Su et al., 2021. <em>RoFormer: Enhanced Transformer with Rotary Position Embedding</em>. arXiv:2104.09864</td><td>RoPE.</td></tr>
+    <tr><td>Press, Smith &amp; Lewis, 2021. <em>Train Short, Test Long</em>. arXiv:2108.12409</td><td>ALiBi.</td></tr>
+    <tr><td>Devlin et al., 2018. <em>BERT</em>. arXiv:1810.04805</td><td>Encoder-only.</td></tr>
+    <tr><td>Radford et al., 2018 and 2019. <em>GPT</em>; <em>Language Models are Unsupervised Multitask Learners</em></td><td>Decoder-only; pre-LN and residual init scaling (GPT-2).</td></tr>
+    <tr><td>Raffel et al., 2019. <em>Exploring the Limits of Transfer Learning (T5)</em>. arXiv:1910.10683</td><td>Encoder-decoder; relative position bias.</td></tr>
+    <tr><td>Wang et al., 2022. <em>What Language Model Architecture and Pretraining Objective Work Best for Zero-Shot Generalization?</em> arXiv:2204.05832</td><td>Decoder-only versus encoder-decoder evidence.</td></tr>
+    <tr><td>Elhage et al., 2021. <em>A Mathematical Framework for Transformer Circuits</em>. Anthropic</td><td>Residual stream; head composition.</td></tr>
+    <tr><td>Olsson et al., 2022. <em>In-context Learning and Induction Heads</em>. arXiv:2209.11895</td><td>Induction heads.</td></tr>
+    <tr><td>Michel, Levy &amp; Neubig, 2019. <em>Are Sixteen Heads Really Better than One?</em> arXiv:1905.10650</td><td>Head redundancy.</td></tr>
+    <tr><td>Dao et al., 2022. <em>FlashAttention</em>. arXiv:2205.14135</td><td>IO-aware exact attention behind SDPA's fast backend.</td></tr>
+  </tbody>
+</table>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Attention Is All You Need</span>
+    <span class="paper-meta">Vaswani et al., 2017 · NeurIPS</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Recurrent seq2seq models were slow to train and struggled with long-range dependencies.</dd>
+    <dt>Previous limitation</dt><dd>Attention was an add-on to RNNs; recurrence still serialised computation.</dd>
+    <dt>Approach</dt><dd>Remove recurrence entirely. Stack multi-head scaled dot-product self-attention and per-token FFNs with residuals, LayerNorm and sinusoidal positions; encoder-decoder with cross-attention.</dd>
+    <dt>Contribution</dt><dd>State-of-the-art translation at a fraction of the training cost; a fully parallel architecture.</dd>
+    <dt>Practical impact</dt><dd>The basis of every model in this book. Modern variants change the details (pre-norm, RMSNorm, RoPE, SwiGLU, decoder-only) but not the core.</dd>
+    <dt>Limitations</dt><dd>Quadratic cost in sequence length; post-LN instability at depth; weak length extrapolation.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Neural Machine Translation by Jointly Learning to Align and Translate</span>
+    <span class="paper-meta">Bahdanau, Cho &amp; Bengio, 2014 · ICLR · arXiv:1409.0473</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Seq2seq compresses a variable-length source into one fixed vector; long sentences lose information.</dd>
+    <dt>Previous limitation</dt><dd>Encoder–decoder RNNs had no soft alignment; hard attention was non-differentiable.</dd>
+    <dt>Approach</dt><dd>Learned additive attention: decoder state as query, encoder states as keys/values.</dd>
+    <dt>Contribution</dt><dd>Differentiable soft alignment; the conceptual parent of self-attention.</dd>
+    <dt>Practical impact</dt><dd>Made neural MT competitive; established attention as the default interface for sequence models.</dd>
+    <dt>Limitations</dt><dd>Still recurrent; training remains sequential; quadratic cost only appears once attention is applied everywhere (Vaswani).</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">In-context Learning and Induction Heads</span>
+    <span class="paper-meta">Olsson et al., 2022 · arXiv:2209.11895</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Models suddenly become better at in-context learning during training; the mechanism was unclear.</dd>
+    <dt>Previous limitation</dt><dd>Attention visualisations and loss curves alone did not identify a circuit.</dd>
+    <dt>Approach</dt><dd>Analyse small Transformers; isolate previous-token and induction-head composition.</dd>
+    <dt>Contribution</dt><dd>Induction heads as a concrete mechanism for pattern completion <code>[A][B]…[A]→[B]</code>.</dd>
+    <dt>Practical impact</dt><dd>A diagnostic target for attention probes and for training dynamics (loss bumps).</dd>
+    <dt>Limitations</dt><dd>Identified in controlled settings; large models contain many other circuits.</dd>
+  </dl>
+</section>
+
+<h2>Interview Questions</h2>
+<ol class="questions">
+  <li>Derive why attention scores are divided by <span class="math">\sqrt{d_k}</span>. What goes wrong without it, and does the argument hold throughout training?</li>
+  <li>Why is attention permutation-equivariant, and how does RoPE make scores depend only on relative position?</li>
+  <li>Write the shapes through multi-head attention. Where does a copy happen, and why?</li>
+  <li>How would you test that a model implementation has no causal leakage? What bugs would a structural test miss?</li>
+  <li>Count parameters and FLOPs of one Llama block. At what sequence length does attention dominate?</li>
+  <li>Pre-LN versus post-LN: which trains more stably, and why? Why is the final norm needed?</li>
+  <li>Why does SwiGLU use a hidden size of about <span class="math">\tfrac{8}{3}C</span>?</li>
+  <li>Why did decoder-only architectures win for general LLMs? When would you still choose an encoder or encoder-decoder?</li>
+  <li>Training loss is 0.001 after 50 steps on real text. What do you check first?</li>
+  <li>What does <code>F.scaled_dot_product_attention</code> do differently from a naive implementation, and when does it fall back to the math backend?</li>
+</ol>
+
+<h2>Next Volume</h2>
+<p>Volume 3 covers what goes in and comes out of the model you built: tokenisation (BPE, WordPiece, Unigram, byte-level), embeddings, the unembedding and weight tying, and how tokeniser choices affect cost, multilinguality and evaluation.</p>
+<p class="facet">Prerequisites from this volume</p>
+<ul>
+  <li>The embedding and unembedding in <code>TinyLM</code> (Chapter 10).</li>
+  <li>Loss in nats, bits and perplexity, and why perplexity does not transfer across tokenisers.</li>
+  <li>The parity-testing habit: every tokeniser you build will be tested against a reference implementation.</li>
+</ul>
+</section>
+
+</body>
+</html>

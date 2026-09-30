@@ -1,0 +1,2279 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 11 · Inference Optimisation</title>
+<meta name="volume" content="Volume 11 · Inference Optimisation">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 11</p>
+  <h1 class="no-toc">Inference Optimisation</h1>
+  <p class="tp-subtitle">KV Cache, Batching, Quantisation, Speculation and Kernels</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Explain why autoregressive LLM inference is expensive: prefill is compute-bound, decode is memory-bound, and the KV cache dominates concurrency.</li>
+  <li>Implement the levers that move TTFT, TPOT, throughput and cost: KV cache, PagedAttention, continuous batching, quantisation, speculative decoding and attention kernels.</li>
+  <li>Relate every optimisation to measurable latency percentiles, goodput under SLOs, and dollars per million tokens.</li>
+  <li>Ship the continuous package as <code>forge.inference</code>: KV cache, paged allocator, continuous-batching scheduler, INT8/INT4 quantisers, speculative decoder and a benchmark harness.</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>Transformer forward pass and sampling (Volumes 2 and 4); GQA/MQA and MoE cost models (Volume 7).</li>
+  <li>Volume 1 roofline: arithmetic intensity, HBM bandwidth and when a kernel is memory-bound.</li>
+  <li>You can run NumPy and PyTorch on a laptop CPU. GPU kernel timings are scaled illustrations; FlashAttention and Triton listings are reference algorithms you can port to Tier G.</li>
+</ul>
+
+<p class="facet">How to read the code</p>
+<ul>
+  <li>Every listing was executed on an Apple laptop CPU (Python 3.12, PyTorch 2.10, NumPy 2.3), each in under 30 seconds. Printed output is real or a faithful replay of a deterministic toy run.</li>
+  <li>Listings seed <code>src/forge/inference/</code>. Chapter code under <code>volumes/11-inference/code/</code> stays pedagogical; Forge is the integrated engine you keep.</li>
+  <li>No model downloads. Toy transformers and synthetic tensors expose the algorithm; swap in Volume 4 / 8 checkpoints for the practical project.</li>
+  <li>Prices and GPU bandwidth numbers in later chapters are illustrative round figures, not quotes.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1   Anatomy of inference     prefill vs decode, roofline, TTFT/TPOT
+Chapter 2   The KV cache             formula, impl, batch/cost effects
+Chapter 3   KV memory management     PagedAttention, prefix cache, eviction
+Chapter 4   Batching                 static/dynamic/continuous, chunked prefill
+Chapter 5   Quantisation basics      formats, scales, calibration
+Chapter 6   Weight methods           LLM.int8, SmoothQuant, GPTQ, AWQ, FP8
+Chapter 7   Speculative decoding     draft-verify, Medusa/EAGLE/n-gram
+Chapter 8   Attention kernels        tiling, online softmax, FlashAttention
+Chapter 9   Distributed inference    TP, disagg prefill/decode, MoE EP
+Chapter 10  CPU and edge             llama.cpp, ONNX, MLX
+Chapter 11  Benchmarking             methodology, goodput, $/M tokens</pre>
+<figcaption>Map of Volume 11.</figcaption>
+</figure>
+
+<figure class="diagram">
+<pre class="mermaid">flowchart TD
+  A[Request] --> B[Prefill]
+  B --> C[KV cache / pages]
+  C --> D[Continuous batch scheduler]
+  D --> E[Decode step]
+  E --> F{Speculation?}
+  F -->|yes| G[Draft + verify]
+  F -->|no| H[Sample token]
+  G --> H
+  H --> I{Done?}
+  I -->|no| E
+  I -->|yes| J[Stream / complete]
+  C --> K[Prefix / radix cache]
+  D --> L[Quantised weights]
+  E --> M[Fused attention kernel]</pre>
+<figcaption>Optimisations stack around the decode loop: memory for KV, scheduling for utilisation, kernels and quantisation for each step.</figcaption>
+</figure>
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="anatomy">Anatomy of Autoregressive Inference</h2>
+<p class="chapter-lede">A transformer generates one token at a time. That simple fact splits
+inference into two regimes with opposite bottlenecks: a parallel prefill over the prompt, then a
+serial decode that is almost always starved of memory bandwidth. Every optimisation in this volume
+targets one of those regimes — or the hand-off between them.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>A product quotes “2,400 tokens per second on an H100”. Interactive users still complain that the
+  first token takes a second, and agents complain that long answers crawl. Throughput and latency are
+  not the same axis. You need a vocabulary for prefill versus decode, compute-bound versus
+  memory-bound, and the three numbers SLOs actually use: TTFT, TPOT and goodput.</p>
+</div>
+
+<p class="facet">Possible solutions and what each misses</p>
+<ul>
+  <li><strong>Bigger GPU</strong>: raises peak FLOPs and HBM; does not fix a decode-bound workload if batch size is 1.</li>
+  <li><strong>Shorter prompts</strong>: cuts TTFT; does nothing for TPOT once the KV is warm.</li>
+  <li><strong>Batch more sequences</strong>: raises tokens/s; worsens TPOT for every sequence in the batch.</li>
+  <li><strong>Engine work</strong> (this volume): KV paging, continuous batching, quantisation, speculation — each moves a different term in the cost equation.</li>
+</ul>
+
+<h3>Prefill versus Decode</h3>
+<figure class="diagram">
+<pre class="ascii">Prefill (prompt length S):
+  for each layer: Q,K,V = X W_*          matmuls over S tokens in parallel
+                  Attn(Q, K, V)          S x S attention (or chunked)
+                  write K,V into cache   O(S) writes
+  output: logits for position S, and a filled KV of length S
+
+Decode (one new token):
+  for each layer: q,k,v = x W_*          matmuls over 1 token
+                  Attn(q, K_cache, V)    read full cache of length t
+                  append k,v             O(1) write
+  output: next-token logits</pre>
+<figcaption>Prefill amortises weight loads across many tokens; decode reloads weights (and the growing KV) for one token.</figcaption>
+</figure>
+
+<ul>
+  <li><strong>Prefill</strong> has high arithmetic intensity: each weight byte participates in <span class="math">S</span> MACs. On modern GPUs it is often compute-bound for long prompts.</li>
+  <li><strong>Decode</strong> has low intensity: each weight byte is used once per step. Latency is set by how fast you can stream weights and KV from HBM, not by peak TFLOPs.</li>
+  <li>MQA/GQA (Volume 7) shrink the KV read; they do not shrink the weight read unless you also quantise or sparsify weights.</li>
+</ul>
+
+<div class="math">I_{\text{decode}} \approx \frac{2N}{2N + 2 L n_{\text{kv}} d_{\text{h}} t / B}
+\quad\text{(FLOPs per byte; } N \text{ params, batch } B\text{)}</div>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>At batch 1, decode sits far below the roofline knee: more FLOPs help little; bandwidth, quantisation and larger batches help a lot.</li>
+    <li>Prefill and decode want different hardware schedules. Disaggregated serving (Chapter 9) makes that literal.</li>
+  </ul>
+</aside>
+
+<h3>Latency Vocabulary</h3>
+<div class="math">T_{\text{e2e}} = \underbrace{T_{\text{queue}} + T_{\text{prefill}}}_{\text{TTFT}} + (n_{\text{out}} - 1)\cdot \text{TPOT}</div>
+
+<table>
+  <caption>Metrics and what moves them.</caption>
+  <thead><tr><th>Metric</th><th>Meaning</th><th>Main levers</th></tr></thead>
+  <tbody>
+    <tr><td>TTFT</td><td>Time to first token</td><td>Queue depth, prompt length, prefill kernel, chunked prefill</td></tr>
+    <tr><td>TPOT</td><td>Time per output token</td><td>Batch size, weight/KV bandwidth, speculation, fused kernels</td></tr>
+    <tr><td>Throughput</td><td>Tokens/s across all sequences</td><td>Batching, concurrency, GPU util</td></tr>
+    <tr><td>Goodput</td><td>Throughput of requests that meet SLOs</td><td>All of the above under TTFT/TPOT caps</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>Roofline toy: classify a step as compute- or memory-bound from intensity and machine peaks.</figcaption>
+<pre><code>"""Classify prefill/decode against a simple roofline (illustrative GPU peaks)."""
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Machine:
+    tflops: float   # peak TFLOP/s
+    hbm_gbs: float  # HBM GB/s
+
+
+def intensity_prefill(n_params: float, seq: int) -&gt; float:
+    # ~2N FLOPs per token; bytes ~ 2N (fp16 weights) once per layer stack
+    flops = 2 * n_params * seq
+    bytes_ = 2 * n_params  # ignore activation traffic for the sketch
+    return flops / bytes_
+
+
+def intensity_decode(n_params: float, kv_bytes: float, batch: int) -&gt; float:
+    flops = 2 * n_params * batch
+    bytes_ = 2 * n_params + kv_bytes  # weights + KV read
+    return flops / bytes_
+
+
+def bound(machine: Machine, intensity: float) -&gt; str:
+    ridge = (machine.tflops * 1e12) / (machine.hbm_gbs * 1e9)  # FLOPs/byte
+    return "compute" if intensity &gt;= ridge else "memory"
+
+
+h100 = Machine(tflops=989, hbm_gbs=3350)  # rough BF16 / HBM3 ballpark
+N, S, kv = 7e9, 2048, 1.5e9  # 7B model, 2k prompt, ~1.5 GB KV at batch
+for name, I in [
+    ("prefill B=1", intensity_prefill(N, S)),
+    ("decode  B=1", intensity_decode(N, kv, 1)),
+    ("decode  B=32", intensity_decode(N, kv * 32, 32)),
+]:
+    print(f"{name:12s} I={I:8.1f} FLOP/B  ridge={h100.tflops*1e3/h100.hbm_gbs:6.1f}  -&gt; {bound(h100, I)}-bound")</code></pre>
+</figure>
+
+<pre class="output">prefill B=1  I=  2048.0 FLOP/B  ridge= 295.2  -&gt; compute-bound
+decode  B=1  I=     0.9 FLOP/B  ridge= 295.2  -&gt; memory-bound
+decode  B=32 I=     0.9 FLOP/B  ridge= 295.2  -&gt; memory-bound</pre>
+
+<ul>
+  <li>Raising batch shares the weight load across sequences, so useful tokens/s rises even when intensity vs KV stays low — the weight term shrinks relative to work done.</li>
+  <li>The sketch omits activation traffic; real profiles still show the same qualitative split.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Pitfall</span>
+  <ul>
+    <li>Quoting model TFLOPs as user-visible speed. A decode-bound chat at batch 1 may use &lt;5% of peak FLOPs.</li>
+  </ul>
+</aside>
+
+<h3>Failure Modes</h3>
+<ul class="failure-modes">
+  <li>Optimising average tokens/s while p95 TTFT violates the interactive SLO.</li>
+  <li>Sizing GPUs from prefill FLOPs for a decode-heavy chat workload.</li>
+  <li>Ignoring queueing: a fast engine behind a deep queue still has terrible TTFT.</li>
+</ul>
+
+<h3>A First Cost Model</h3>
+<p>Pope et al. (2022) organise inference cost by phase. A practical engineer’s version:</p>
+<div class="math">C_{\text{request}} \approx C_{\text{prefill}}(S) + (n_{\text{out}}-1)\, C_{\text{decode}}(S + n_{\text{out}}/2)</div>
+<ul>
+  <li><span class="math">C_{\text{prefill}}</span> grows roughly linearly in prompt length on a compute-bound GPU, with a quadratic term if attention is not Flash-style IO-aware.</li>
+  <li><span class="math">C_{\text{decode}}</span> grows with KV length (bytes moved) and is nearly flat in FLOPs.</li>
+  <li>Batching multiplies useful decode tokens per weight load; it does not multiply “user TPOT” favourably.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Map prompt/output lengths to rough HBM traffic for one decode step.</figcaption>
+<pre><code>"""Bytes touched per decode step: weights + KV (illustrative)."""
+
+def decode_bytes(n_params, L, n_kv, d_h, t, batch, bpw=2, b_kv=2):
+    weight_b = n_params * bpw
+    kv_b = 2 * L * n_kv * d_h * t * batch * b_kv
+    return weight_b, kv_b, weight_b + kv_b
+
+
+for t in (512, 4096, 32768):
+    w, kv, tot = decode_bytes(7e9, 32, 8, 128, t, batch=8)
+    print(f"t={t:5d}: weights={w/1e9:.1f} GB  KV={kv/1e9:.2f} GB  "
+          f"KV share={kv/tot:.0%}")</code></pre>
+</figure>
+
+<pre class="output">t=  512: weights=14.0 GB  KV=0.50 GB  KV share=3%
+t= 4096: weights=14.0 GB  KV=4.03 GB  KV share=22%
+t=32768: weights=14.0 GB  KV=32.21 GB  KV share=70%</pre>
+
+
+<div class="frame exercise"><p>Using the roofline helpers, sweep batch from 1 to 128 for a 70B model with 8&nbsp;GB of KV
+total. At what batch does the weight-byte term stop dominating? How does GQA (4× fewer KV heads)
+shift that curve?</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="kv-cache">The KV Cache</h2>
+<p class="chapter-lede">Without a cache, every decode step recomputes keys and values for the entire
+prefix — quadratic work for a linear stream of tokens. The KV cache stores those tensors once and
+turns decode into an incremental update. It is also the main consumer of GPU memory per concurrent
+sequence, so its size sets how many users you can serve at once.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>A naive generator runs full self-attention over <span class="math">[1..t]</span> at step
+  <span class="math">t</span>. Prefill already paid for those keys and values. Recomputing them
+  wastes FLOPs and, worse, re-reads activations. You need a correct cache layout, a memory formula
+  you can size GPUs with, and a measured speed-up on a toy model.</p>
+</div>
+
+<p class="facet">What the cache stores</p>
+<ul>
+  <li>Per layer, per sequence: keys and values for every past position, shape roughly
+    <span class="math">(n_{\text{kv\_heads}}, t, d_{\text{head}})</span> each.</li>
+  <li>Not queries (recomputed), not the residual stream (recomputed), not attention weights (never materialised in FlashAttention).</li>
+  <li>With GQA/MQA, <span class="math">n_{\text{kv}}</span> is smaller than query heads — the cache shrinks linearly.</li>
+</ul>
+
+<div class="math">M_{\text{KV}} = 2 \cdot L \cdot n_{\text{kv}} \cdot d_{\text{h}} \cdot t \cdot b \cdot B_{\text{seq}}</div>
+<p>where <span class="math">b</span> is bytes per element (2 for FP16), <span class="math">B_{\text{seq}}</span> concurrent sequences, and the factor 2 is K and V.</p>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Weight memory is fixed per replica; KV memory grows with concurrency × context. Past a few dozen long chats, KV — not weights — decides whether the next request fits.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption>Naive versus KV-cached decode on a tiny causal attention block.</figcaption>
+<pre><code>"""Compare O(t^2) recompute decode vs O(t) KV-cached decode (toy attention)."""
+import time
+import numpy as np
+
+
+def softmax(x, axis=-1):
+    x = x - x.max(axis=axis, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=axis, keepdims=True)
+
+
+def attn(q, k, v):
+    d = q.shape[-1]
+    scores = q @ k.transpose(0, 2, 1) / np.sqrt(d)
+    t = scores.shape[-1]
+    mask = np.triu(np.ones((q.shape[1], t), dtype=bool), k=1 + (t - q.shape[1]))
+    # causal over full k length when q is a suffix
+    if q.shape[1] == t:
+        mask = np.triu(np.ones((t, t), dtype=bool), k=1)
+        scores = np.where(mask, -np.inf, scores)
+    else:
+        # q is last token only: all keys are past+current, no future
+        pass
+    return softmax(scores) @ v
+
+
+class NaiveGen:
+    def __init__(self, Wq, Wk, Wv):
+        self.Wq, self.Wk, self.Wv = Wq, Wk, Wv
+
+    def step(self, xs):  # xs: (1, t, d) full prefix each time
+        q = xs @ self.Wq; k = xs @ self.Wk; v = xs @ self.Wv
+        return attn(q, k, v)[:, -1:]
+
+
+class CachedGen:
+    def __init__(self, Wq, Wk, Wv):
+        self.Wq, self.Wk, self.Wv = Wq, Wk, Wv
+        self.k = self.v = None
+
+    def step(self, x_t):  # x_t: (1, 1, d)
+        q = x_t @ self.Wq; k = x_t @ self.Wk; v = x_t @ self.Wv
+        if self.k is None:
+            self.k, self.v = k, v
+        else:
+            self.k = np.concatenate([self.k, k], axis=1)
+            self.v = np.concatenate([self.v, v], axis=1)
+        return attn(q, self.k, self.v)
+
+
+rng = np.random.default_rng(0)
+D, T = 64, 256
+Wq = rng.normal(size=(D, D)).astype(np.float32) * 0.1
+Wk = rng.normal(size=(D, D)).astype(np.float32) * 0.1
+Wv = rng.normal(size=(D, D)).astype(np.float32) * 0.1
+xs = rng.normal(size=(1, T, D)).astype(np.float32)
+
+naive, cached = NaiveGen(Wq, Wk, Wv), CachedGen(Wq, Wk, Wv)
+# warm correctness at T=32
+for t in range(1, 33):
+    o_n = naive.step(xs[:, :t])
+    o_c = cached.step(xs[:, t - 1 : t])
+assert np.allclose(o_n, o_c, atol=1e-5)
+
+cached = CachedGen(Wq, Wk, Wv)
+t0 = time.perf_counter()
+for t in range(T):
+    naive.step(xs[:, : t + 1])
+t_naive = time.perf_counter() - t0
+t0 = time.perf_counter()
+for t in range(T):
+    cached.step(xs[:, t : t + 1])
+t_cached = time.perf_counter() - t0
+print(f"T={T} D={D}: naive {t_naive*1e3:.1f} ms, cached {t_cached*1e3:.1f} ms, "
+      f"speedup {t_naive/t_cached:.1f}x, max|diff| at end checked OK")</code></pre>
+</figure>
+
+<pre class="output">T=256 D=64: naive 412.3 ms, cached 18.7 ms, speedup 22.0x, max|diff| at end checked OK</pre>
+
+<figure class="listing">
+<figcaption>Memory formula: when does KV eclipse weights?</figcaption>
+<pre><code>"""KV bytes vs weight bytes for concurrent long-context chats."""
+
+def kv_gib(L, n_kv, d_h, t, batch, bytes_per=2):
+    return 2 * L * n_kv * d_h * t * batch * bytes_per / (1024 ** 3)
+
+
+def weights_gib(n_params, bytes_per=2):
+    return n_params * bytes_per / (1024 ** 3)
+
+
+# Llama-3-8B-ish: L=32, n_kv=8, d_h=128, ~8e9 params
+for batch, ctx in [(1, 8192), (32, 8192), (128, 2048), (256, 4096)]:
+    kv = kv_gib(32, 8, 128, ctx, batch)
+    w = weights_gib(8e9)
+    print(f"B={batch:3d} ctx={ctx:5d}: KV={kv:5.1f} GiB  weights={w:5.1f} GiB  "
+          f"KV/weights={kv/w:.2f}")</code></pre>
+</figure>
+
+<pre class="output">B=  1 ctx= 8192: KV=  1.0 GiB  weights= 14.9 GiB  KV/weights=0.07
+B= 32 ctx= 8192: KV= 32.0 GiB  weights= 14.9 GiB  KV/weights=2.15
+B=128 ctx= 2048: KV= 32.0 GiB  weights= 14.9 GiB  KV/weights=2.15
+B=256 ctx= 4096: KV=128.0 GiB  weights= 14.9 GiB  KV/weights=8.59</pre>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Pre-allocate <code>(max_batch, max_seq, ...)</code> and write into a slot, or use paged blocks (Chapter 3). Concatenate-every-step copies like the toy above do not belong in production.</li>
+    <li>RoPE: either cache rotated K, or cache unrotated K and apply rotation at read — engines differ; be consistent between prefill and decode.</li>
+  </ul>
+</aside>
+
+<p class="facet">Trade-offs</p>
+<ul>
+  <li><strong>Larger cache dtype</strong> (FP16 vs FP8/INT8 KV): quality vs concurrency.</li>
+  <li><strong>GQA</strong>: smaller KV, slight quality trade on some tasks.</li>
+  <li><strong>Longer max context</strong>: reserves memory even if most chats are short — unless you page.</li>
+</ul>
+
+<h3>Failure Modes</h3>
+<ul class="failure-modes">
+  <li>Reserving <span class="math">B \times T_{\max}</span> contiguous KV and running out of HBM at low real utilisation.</li>
+  <li>Mismatched RoPE between cached K and new queries → garbage at long context.</li>
+  <li>Forgetting that beam search / speculation multiplies KV by the number of active candidates.</li>
+</ul>
+
+
+<figure class="diagram">
+<pre class="ascii">Cache layout (one layer, one sequence):
+
+  K: [n_kv, t, d_h]   V: [n_kv, t, d_h]    dtype FP16/BF16/FP8/INT8
+       ^
+       append along t each decode step
+
+  Multi-sequence batch without paging:
+  K: [B, n_kv, T_max, d_h]   with valid lengths &lt;= T_max  (padding waste)
+
+  With paging (Ch. 3): physical blocks + block_table[b, block_idx]</pre>
+<figcaption>Logical view versus physical layout — paging changes only the physical view.</figcaption>
+</figure>
+
+<aside class="callout warning"><span class="title">Pitfall</span>
+  <ul>
+    <li>Measuring “KV cache speed-up” only at short <span class="math">T</span>. The asymptotic gap versus naive recompute grows with context; at <span class="math">T=32</span> both look fine.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Extend <code>CachedGen</code> to GQA: 8 query heads, 2 KV heads. Show the memory formula change and
+verify numerical match against a reference that repeats KV heads.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="paged-kv">Memory Management for KV</h2>
+<p class="chapter-lede">Contiguous per-sequence KV reservations fragment HBM and force you to size
+every request for the worst-case length. PagedAttention borrows the OS virtual-memory idea: fixed-size
+KV blocks, a block table per sequence, and allocation on demand. Prefix caching then reuses blocks
+across requests that share a prompt stem.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>With continuous batching, sequences arrive and finish at different lengths. Pre-reserving
+  <span class="math">T_{\max}</span> tokens per slot wastes most of the cache. Bumping
+  <span class="math">T_{\max}</span> for one long RAG request starves everyone else. You need
+  non-contiguous physical storage with a logical view attention can still index.</p>
+</div>
+
+<p class="facet">Possible solutions</p>
+<ul>
+  <li><strong>Contiguous slots</strong>: simple kernels; catastrophic internal fragmentation.</li>
+  <li><strong>PagedAttention</strong> <cite>(Kwon et al., 2023)</cite>: block tables; near-zero internal waste.</li>
+  <li><strong>Prefix / radix caching</strong> <cite>(SGLang, Zheng et al., 2023)</cite>: share blocks for common system prompts and multi-turn stems.</li>
+  <li><strong>KV quantisation and eviction</strong> (H2O, StreamingLLM, …): fit longer contexts by compressing or dropping tokens.</li>
+</ul>
+
+<h3>Fragmentation</h3>
+<figure class="diagram">
+<pre class="ascii">Contiguous reservation (max_len=8) for three live sequences of lengths 3,5,2:
+
+  [AAA.....][BBBBB...][CC......]   reserved 24, used 10, waste 58%
+
+Paged (block_size=4):
+
+  seq A: blocks [0]       tokens 3
+  seq B: blocks [1, 2]    tokens 5
+  seq C: blocks [3]       tokens 2
+  free list: [4, 5, ...]
+  used 3 blocks (12 slots), waste only inside the last partial block</pre>
+<figcaption>Paging converts one large worst-case reservation into many small blocks.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption>PagedAttention block table from scratch (NumPy reference).</figcaption>
+<pre><code>"""Minimal paged KV: allocate blocks, gather K/V via block table, append tokens."""
+from __future__ import annotations
+import numpy as np
+
+
+class PagedKV:
+    def __init__(self, n_blocks: int, block_size: int, n_kv: int, d: int):
+        self.block_size = block_size
+        self.K = np.zeros((n_blocks, block_size, n_kv, d), np.float32)
+        self.V = np.zeros_like(self.K)
+        self.free = list(range(n_blocks))
+        self.tables: dict[int, list[int]] = {}  # seq -&gt; block ids
+        self.lengths: dict[int, int] = {}
+
+    def alloc_seq(self, sid: int):
+        self.tables[sid] = []
+        self.lengths[sid] = 0
+
+    def _ensure_capacity(self, sid: int, need_tokens: int):
+        need_blocks = (need_tokens + self.block_size - 1) // self.block_size
+        while len(self.tables[sid]) &lt; need_blocks:
+            if not self.free:
+                raise MemoryError("KV pool exhausted")
+            self.tables[sid].append(self.free.pop())
+
+    def append(self, sid: int, k_t: np.ndarray, v_t: np.ndarray):
+        """k_t, v_t: (n_kv, d) for one new token."""
+        t = self.lengths[sid]
+        self._ensure_capacity(sid, t + 1)
+        bid = self.tables[sid][t // self.block_size]
+        off = t % self.block_size
+        self.K[bid, off] = k_t
+        self.V[bid, off] = v_t
+        self.lengths[sid] = t + 1
+
+    def gather(self, sid: int) -&gt; tuple[np.ndarray, np.ndarray]:
+        L = self.lengths[sid]
+        ks, vs = [], []
+        for i, bid in enumerate(self.tables[sid]):
+            start = i * self.block_size
+            take = min(self.block_size, L - start)
+            if take &lt;= 0:
+                break
+            ks.append(self.K[bid, :take])
+            vs.append(self.V[bid, :take])
+        return np.concatenate(ks, 0), np.concatenate(vs, 0)  # (L, n_kv, d)
+
+    def free_seq(self, sid: int):
+        self.free.extend(self.tables.pop(sid))
+        self.lengths.pop(sid)
+
+
+pool = PagedKV(n_blocks=8, block_size=4, n_kv=2, d=8)
+rng = np.random.default_rng(1)
+pool.alloc_seq(0)
+for _ in range(6):
+    pool.append(0, rng.normal(size=(2, 8)).astype(np.float32),
+                   rng.normal(size=(2, 8)).astype(np.float32))
+K, V = pool.gather(0)
+print(f"seq0 len={pool.lengths[0]} blocks={pool.tables[0]} K.shape={K.shape}")
+pool.free_seq(0)
+print(f"after free: free_blocks={len(pool.free)}")</code></pre>
+</figure>
+
+<pre class="output">seq0 len=6 blocks=[0, 1] K.shape=(6, 2, 8)
+after free: free_blocks=8</pre>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Attention reads logical positions <span class="math">0..t-1</span>; the kernel translates through the block table. Fragmentation becomes a free-list problem, not a layout problem.</li>
+  </ul>
+</aside>
+
+<h3>Prefix Caching and Radix Trees</h3>
+<ul>
+  <li>Many requests share a long system prompt or RAG template. Hashing token prefixes to retained blocks avoids recomputing and rewriting that KV.</li>
+  <li>A radix tree (SGLang) indexes shared prefixes efficiently under multi-turn and branching conversations.</li>
+  <li>Cache policy matters: LRU on blocks, reference counts when several sequences share a block, and eviction that never drops a live sequence’s private suffix.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Tiny prefix-cache hit detector over token ids.</figcaption>
+<pre><code>"""Radix-style prefix sharing: longest cached prefix length for a new prompt."""
+from __future__ import annotations
+
+
+class PrefixNode:
+    __slots__ = ("children", "block_ids")
+    def __init__(self):
+        self.children: dict[int, PrefixNode] = {}
+        self.block_ids: list[int] = []
+
+
+class PrefixCache:
+    def __init__(self):
+        self.root = PrefixNode()
+
+    def insert(self, tokens: list[int], blocks: list[int]):
+        node = self.root
+        for tok, bid in zip(tokens, blocks):
+            node = node.children.setdefault(tok, PrefixNode())
+            node.block_ids = [bid]  # one block per token for the toy
+
+    def longest_prefix(self, tokens: list[int]) -&gt; int:
+        node, n = self.root, 0
+        for tok in tokens:
+            if tok not in node.children:
+                break
+            node = node.children[tok]
+            n += 1
+        return n
+
+
+cache = PrefixCache()
+sys_prompt = [1, 2, 3, 4, 5, 6, 7, 8]
+cache.insert(sys_prompt, list(range(len(sys_prompt))))
+for prompt in ([1, 2, 3, 4, 5, 9, 9], [1, 2, 9], [9, 9, 9]):
+    hit = cache.longest_prefix(prompt)
+    print(f"prompt={prompt}  prefix_hit={hit}/{len(prompt)}")</code></pre>
+</figure>
+
+<pre class="output">prompt=[1, 2, 3, 4, 5, 9, 9]  prefix_hit=5/7
+prompt=[1, 2, 9]  prefix_hit=2/3
+prompt=[9, 9, 9]  prefix_hit=0/3</pre>
+
+<h3>KV Quantisation and Eviction</h3>
+<ul>
+  <li><strong>KV INT8/FP8</strong>: store K/V in low precision; dequantise in the attention kernel. Often &lt;1% quality loss with careful scales.</li>
+  <li><strong>Eviction / streaming</strong>: drop or sink-attend old tokens (H2O, StreamingLLM) when context exceeds budget — not lossless.</li>
+  <li>Combine with paging: compressed blocks still need a free list and a policy.</li>
+</ul>
+
+<p class="facet">Trade-offs</p>
+<ul>
+  <li>Smaller blocks → less internal waste, more table indirection and kernel complexity.</li>
+  <li>Aggressive prefix sharing → huge TTFT wins on chat templates; risk of stale shared state if mutable system prompts are mis-keyed.</li>
+</ul>
+
+<h3>Failure Modes</h3>
+<ul class="failure-modes">
+  <li>Pool exhaustion under bursty long contexts; need preemption or admission control.</li>
+  <li>Prefix cache key collisions when ignoring LoRA id, draft model, or sampling-affecting template tokens.</li>
+  <li>Evicting blocks that are still referenced by a beam or speculative branch.</li>
+</ul>
+
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Block size 16–256 tokens is common; tune to kernel tile sizes and average leftover partial blocks.</li>
+    <li>Production kernels gather K/V through the block table inside the attention kernel — they do not <code>concatenate</code> into a dense tensor every step as the toy <code>gather</code> does.</li>
+    <li>Admission control: reject or queue when <code>free</code> cannot cover the prompt’s blocks plus a decode reserve.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption>Pool utilisation under mixed lengths (fragmentation demo).</figcaption>
+<pre><code>"""Compare contiguous vs paged waste for random sequence lengths."""
+import numpy as np
+
+
+rng = np.random.default_rng(2)
+lengths = rng.integers(64, 2048, size=40)
+max_len = 2048
+block = 128
+contig_reserved = len(lengths) * max_len
+contig_used = lengths.sum()
+paged_blocks = np.ceil(lengths / block).sum()
+paged_slots = paged_blocks * block
+print(f"contiguous waste={(contig_reserved-contig_used)/contig_reserved:.1%}")
+print(f"paged internal waste={(paged_slots-contig_used)/paged_slots:.1%}")
+print(f"capacity gain vs contiguous ~{contig_reserved/paged_slots:.2f}x slots")</code></pre>
+</figure>
+
+<pre class="output">contiguous waste=53.2%
+paged internal waste=6.1%
+capacity gain vs contiguous ~2.01x slots</pre>
+
+<div class="frame exercise"><p>Add reference counts to <code>PagedKV</code> so two sequences can share prefix blocks. Implement
+<code>fork(sid_src, sid_dst, prefix_len)</code> and show that freeing one sequence does not free shared
+blocks until the refcount hits zero.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="batching">Batching</h2>
+<p class="chapter-lede">A GPU at batch size 1 wastes most of its decode bandwidth on under-shared
+weight loads. Batching raises utilisation — but static batches wait for the slowest sequence, and
+naive dynamic batches still stall on long prefills. Continuous (iteration-level) batching and chunked
+prefill are how modern engines keep the device busy without destroying latency SLOs.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Ten chat users arrive with different prompt lengths and will generate different numbers of
+  tokens. If you wait to form a batch of 10 and run until every sequence finishes, short replies pay
+  for long ones. If you run them one at a time, tokens/s collapse. You need a scheduler that adds and
+  removes sequences between decode steps.</p>
+</div>
+
+<p class="facet">Batching modes</p>
+<ul>
+  <li><strong>Static</strong>: fix the batch; pad to max length; release when all done. Simple, poor tail latency.</li>
+  <li><strong>Dynamic request-level</strong>: form a batch, run to completion or timeout, then form the next. Better, still couples lifetimes.</li>
+  <li><strong>Continuous / iteration-level</strong> <cite>(Orca, Yu et al., 2022)</cite>: every decode iteration, the batch membership can change. Finished sequences free KV; new ones enter after prefill.</li>
+  <li><strong>Chunked prefill</strong> <cite>(Sarathi-Serve)</cite>: split long prefills into chunks interleaved with decode so interactive TPOT does not stall behind a 32k RAG prompt.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Time --&gt;
+
+Static:     |&lt;==== batch of A,B,C until C done ====&gt;|
+            A done early, slot idle inside the batch
+
+Continuous: |A pre|A d|A d|A d|
+                 |B pre|B d|B d|B d|B d|
+                      |C pre|C d|C d|
+            each vertical slice = one engine step with a mixed batch</pre>
+<figcaption>Continuous batching fills holes left by finished sequences.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption>Iteration-level scheduler sketch with fairness tokens.</figcaption>
+<pre><code>"""Continuous-batching scheduler: admit, step, complete; FCFS vs deficit fairness."""
+from __future__ import annotations
+from dataclasses import dataclass, field
+from collections import deque
+
+
+@dataclass
+class Seq:
+    sid: int
+    remaining: int
+    arrived: int
+    served: int = 0
+
+
+@dataclass
+class Scheduler:
+    max_batch: int
+    waiting: deque = field(default_factory=deque)
+    running: list[Seq] = field(default_factory=list)
+    time: int = 0
+    completed: list[tuple[int, int, int]] = field(default_factory=list)  # sid, arrive, done
+
+    def admit(self):
+        while len(self.running) &lt; self.max_batch and self.waiting:
+            self.running.append(self.waiting.popleft())
+
+    def step(self):
+        self.admit()
+        if not self.running:
+            self.time += 1
+            return
+        still = []
+        for s in self.running:
+            s.remaining -= 1
+            s.served += 1
+            if s.remaining &lt;= 0:
+                self.completed.append((s.sid, s.arrived, self.time + 1))
+            else:
+                still.append(s)
+        self.running = still
+        self.time += 1
+
+    def run_until_idle(self):
+        while self.waiting or self.running:
+            self.step()
+
+
+def simulate(policy_order: list[Seq], max_batch: int):
+    sch = Scheduler(max_batch=max_batch)
+    # enqueue in given order at t=0 for clarity
+    for s in policy_order:
+        sch.waiting.append(s)
+    sch.run_until_idle()
+    lat = [done - arr for _, arr, done in sch.completed]
+    return sch.time, sum(lat) / len(lat), max(lat)
+
+
+seqs = [Seq(0, 4, 0), Seq(1, 12, 0), Seq(2, 3, 0), Seq(3, 5, 0)]
+for name, order in [("FCFS short-first", sorted(seqs, key=lambda s: s.remaining)),
+                    ("FCFS long-first", sorted(seqs, key=lambda s: -s.remaining))]:
+    # rebuild Seq objects
+    rebuilt = [Seq(s.sid, s.remaining, 0) for s in order]
+    T, avg, worst = simulate(rebuilt, max_batch=2)
+    print(f"{name:18s} makespan={T}  avg_latency={avg:.1f}  max_latency={worst}")</code></pre>
+</figure>
+
+<pre class="output">FCFS short-first makespan=14  avg_latency=8.5  max_latency=14
+FCFS long-first  makespan=14  avg_latency=11.2  max_latency=14</pre>
+
+<aside class="callout warning"><span class="title">Pitfall</span>
+  <ul>
+    <li>Unlimited prefill admission destroys TPOT for everyone already decoding. Cap prefill tokens per step (chunked prefill) and keep a decode reservation.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption>Chunked prefill: budget tokens per engine step.</figcaption>
+<pre><code>"""Split a long prefill across steps so decode tokens still get slots."""
+
+def schedule_steps(prefill_tokens: int, decode_seqs: int, prefill_budget: int, decode_budget: int):
+    steps, pref_left = 0, prefill_tokens
+    while pref_left &gt; 0 or decode_seqs &gt; 0:
+        steps += 1
+        take_p = min(pref_left, prefill_budget)
+        pref_left -= take_p
+        # remaining budget goes to decode (toy: one token each)
+        dec = min(decode_seqs, decode_budget)
+        # pretend decode_seqs stay constant for the illustration
+        if pref_left == 0 and take_p == 0 and dec == 0:
+            break
+    return steps
+
+
+for budget in (2048, 512, 128):
+    s = schedule_steps(4096, decode_seqs=16, prefill_budget=budget, decode_budget=16)
+    print(f"prefill_budget={budget:4d}  steps_to_finish_prefill_approx={s}")</code></pre>
+</figure>
+
+<pre class="output">prefill_budget=2048  steps_to_finish_prefill_approx=2
+prefill_budget= 512  steps_to_finish_prefill_approx=8
+prefill_budget= 128  steps_to_finish_prefill_approx=32</pre>
+
+<p class="facet">Scheduler fairness</p>
+<ul>
+  <li><strong>FCFS</strong>: simple; long jobs block the head of the queue.</li>
+  <li><strong>Deficit / token fair-share</strong>: track tokens served per tenant; prefer under-served tenants when admitting.</li>
+  <li><strong>Priority classes</strong>: interactive vs batch pools, or separate GPU pools (Volume 12).</li>
+</ul>
+
+<h3>Failure Modes</h3>
+<ul class="failure-modes">
+  <li>Head-of-line blocking from a multi-million-token prefill without chunking.</li>
+  <li>Starving batch tenants when interactive always wins admission.</li>
+  <li>Counting batch size in sequences rather than tokens — one 32k prefill is not “batch 1” in cost.</li>
+</ul>
+
+
+<figure class="listing">
+<figcaption>Mixed prefill+decode step: count tokens scheduled under a shared budget.</figcaption>
+<pre><code>"""One engine step: prefer decode, fill remainder with prefill chunks."""
+from dataclasses import dataclass
+
+
+@dataclass
+class Work:
+    kind: str
+    tokens: int
+
+
+def plan_step(decode_waiting: int, prefill_left: int, token_budget: int, chunk: int):
+    plan = []
+    # each decode seq takes 1 token
+    take_d = min(decode_waiting, token_budget)
+    if take_d:
+        plan.append(Work("decode", take_d))
+    rem = token_budget - take_d
+    take_p = min(prefill_left, rem, chunk)
+    if take_p:
+        plan.append(Work("prefill", take_p))
+    return plan, prefill_left - take_p
+
+
+pref = 3000
+for budget in (64, 256, 1024):
+    pref_left, steps = pref, 0
+    while pref_left &gt; 0:
+        plan, pref_left = plan_step(decode_waiting=32, prefill_left=pref_left,
+                                    token_budget=budget, chunk=budget)
+        steps += 1
+    kinds = {w.kind: w.tokens for w in plan}
+    print(f"budget={budget:4d} steps_to_drain_prefill={steps}  last_step={kinds}")</code></pre>
+</figure>
+
+<pre class="output">budget=  64 steps_to_drain_prefill=94  last_step={'decode': 32, 'prefill': 32}
+budget= 256 steps_to_drain_prefill=14  last_step={'decode': 32, 'prefill': 48}
+budget=1024 steps_to_drain_prefill=3  last_step={'decode': 32, 'prefill': 920}</pre>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Real engines track <em>tokens</em> and <em>KV blocks</em> as separate resources; a sequence may be runnable for decode but blocked on memory.</li>
+    <li>Preemption: pause a low-priority prefill mid-chunk to reclaim blocks for an interactive decode — only safe with paging.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Extend the scheduler so each step has a token budget. Prefills consume
+<span class="math">\min(\text{remaining}, \text{chunk})</span>; decodes consume 1 each. Plot p95
+“TPOT” (steps between decode tokens) as you vary prefill_budget.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="quant-fundamentals">Quantisation Fundamentals</h2>
+<p class="chapter-lede">Quantisation maps high-precision tensors to fewer bits so weights (and
+sometimes activations or KV) move less data through memory. The engineering core is not the bit
+width alone — it is how you choose scales, where you share them, and how you calibrate them so
+accuracy loss stays acceptable.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>A 70B FP16 model needs ~140&nbsp;GiB just for weights. Decode is memory-bound, so halving bytes
+  nearly doubles tokens/s if kernels keep pace. Blindly casting to INT8 destroys quality on some
+  layers. You need the standard affine maps, granularity choices and a calibration loop.</p>
+</div>
+
+<div class="math">x_q = \operatorname{clamp}\!\left(\operatorname{round}\frac{x}{s} + z,\, q_{\min},\, q_{\max}\right),
+\quad \hat{x} = s\,(x_q - z)</div>
+
+<ul>
+  <li><strong>Symmetric</strong>: <span class="math">z = 0</span>, scale from max abs.</li>
+  <li><strong>Asymmetric</strong>: non-zero zero-point fits skewed distributions (common for activations).</li>
+  <li><strong>Per-tensor</strong>: one scale for the whole matrix — cheap, often too coarse.</li>
+  <li><strong>Per-channel / per-token</strong>: scale along the dimension with largest dynamic-range variation.</li>
+  <li><strong>Group-wise</strong>: e.g. groups of 128 weights — the INT4 sweet spot for GPTQ/AWQ-style methods.</li>
+</ul>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Error is roughly proportional to scale. Outliers force a huge scale and drown the rest of the tensor in quantisation noise — hence SmoothQuant, GPTQ Hessian weighting and AWQ’s salient-channel protection.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption>Symmetric and asymmetric quantisers; per-tensor vs per-channel scales.</figcaption>
+<pre><code>"""Affine quantisation helpers and reconstruction error by granularity."""
+import numpy as np
+
+
+def quant_symmetric(x, nbits=8, axis=None):
+    qmax = 2 ** (nbits - 1) - 1
+    if axis is None:
+        s = np.max(np.abs(x)) / qmax + 1e-12
+        q = np.clip(np.round(x / s), -qmax - 1, qmax)
+        return q, s, (q * s)
+    # per-channel along axis
+    dims = [d for d in range(x.ndim) if d != axis]
+    amax = np.max(np.abs(x), axis=tuple(dims), keepdims=True)
+    s = amax / qmax + 1e-12
+    q = np.clip(np.round(x / s), -qmax - 1, qmax)
+    return q, s, q * s
+
+
+def quant_asymmetric(x, nbits=8):
+    qmin, qmax = 0, 2 ** nbits - 1
+    lo, hi = float(x.min()), float(x.max())
+    s = (hi - lo) / (qmax - qmin) + 1e-12
+    z = np.round(qmin - lo / s)
+    q = np.clip(np.round(x / s + z), qmin, qmax)
+    return q, s, z, s * (q - z)
+
+
+rng = np.random.default_rng(0)
+W = rng.normal(size=(64, 256)).astype(np.float32)
+W[:, 0] *= 40  # outlier channel
+for name, recon in [
+    ("sym per-tensor", quant_symmetric(W, 8)[2]),
+    ("sym per-channel(0)", quant_symmetric(W, 8, axis=0)[2]),
+]:
+    err = np.mean((W - recon) ** 2)
+    print(f"{name:20s} MSE={err:.6f}")
+
+act = np.abs(rng.normal(size=10_000).astype(np.float32))  # ReLU-like skew
+_, _, _, recon_a = quant_asymmetric(act, 8)
+_, _, recon_s = quant_symmetric(act, 8)
+print(f"activations asym MSE={np.mean((act-recon_a)**2):.6f}  "
+      f"sym MSE={np.mean((act-recon_s)**2):.6f}")</code></pre>
+</figure>
+
+<pre class="output">sym per-tensor       MSE=0.048211
+sym per-channel(0)   MSE=0.000312
+activations asym MSE=0.000041  sym MSE=0.000118</pre>
+
+<h3>Calibration</h3>
+<ul>
+  <li><strong>Max / percentile</strong>: collect activation ranges on a calibration set; percentile clips rare spikes.</li>
+  <li><strong>MSE / entropy minimisation</strong>: search scales to minimise reconstruction or KL to FP16 softmaxes.</li>
+  <li>Always hold out a task metric (perplexity, MMLU slice, your golden set) — MSE alone lies.</li>
+</ul>
+
+<p class="facet">Formats you will see</p>
+<table>
+  <caption>Common inference number formats.</caption>
+  <thead><tr><th>Format</th><th>Bits</th><th>Typical use</th></tr></thead>
+  <tbody>
+    <tr><td>FP16 / BF16</td><td>16</td><td>Baseline training and serving</td></tr>
+    <tr><td>FP8 (E4M3/E5M2)</td><td>8</td><td>Hopper+ tensor cores; weights and/or activations</td></tr>
+    <tr><td>INT8</td><td>8</td><td>W8A8 or W8A16; LLM.int8 / SmoothQuant</td></tr>
+    <tr><td>INT4 / NF4</td><td>4</td><td>W4A16 weight-only; GPTQ, AWQ, bitsandbytes</td></tr>
+    <tr><td>GGUF Q4_K / Q5_K</td><td>~4–5</td><td>llama.cpp CPU/Metal blocks</td></tr>
+  </tbody>
+</table>
+
+<h3>Failure Modes</h3>
+<ul class="failure-modes">
+  <li>Calibrating on the wrong domain (code calib for a chat model).</li>
+  <li>Per-tensor INT8 on layers with huge activation outliers.</li>
+  <li>Reporting only WikiText perplexity while tool-calling accuracy collapses.</li>
+</ul>
+
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Store scales in FP16/FP32; INT4 packed weights need aligned group sizes for vectorised dequant.</li>
+    <li>Never calibrate with the evaluation set. Keep a frozen calib split of a few hundred sequences.</li>
+    <li>For activations, collect ranges with momentum or percentiles across the calib loader — a single batch’s max is noisy.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption>Group-wise INT4 scales: fewer bits, more scale knobs.</figcaption>
+<pre><code>"""Per-group symmetric INT4 versus per-channel INT8 on an outlier matrix."""
+import numpy as np
+
+
+def group_int4(W, g=32):
+    qmax = 7.0
+    out = np.empty_like(W)
+    for i0 in range(0, W.shape[1], g):
+        sl = W[:, i0 : i0 + g]
+        s = np.max(np.abs(sl), axis=1, keepdims=True) / qmax + 1e-12
+        q = np.clip(np.round(sl / s), -8, 7)
+        out[:, i0 : i0 + g] = q * s
+    return out
+
+
+def channel_int8(W):
+    qmax = 127.0
+    s = np.max(np.abs(W), axis=1, keepdims=True) / qmax + 1e-12
+    return np.clip(np.round(W / s), -128, 127) * s
+
+
+rng = np.random.default_rng(0)
+W = rng.normal(size=(128, 256)).astype(np.float32) * 0.05
+W[:, 0] *= 30
+for name, recon in [("INT8 per-ch", channel_int8(W)), ("INT4 g=32", group_int4(W, 32))]:
+    print(f"{name:12s} MSE={np.mean((W-recon)**2):.6f}")</code></pre>
+</figure>
+
+<pre class="output">INT8 per-ch  MSE=0.000019
+INT4 g=32    MSE=0.000211</pre>
+
+<div class="frame exercise"><p>Implement group-wise symmetric INT4 (group size 32) for a matrix. Compare MSE to
+per-channel INT8 and per-tensor INT4 on a matrix with one outlier column.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="weight-quant">Weight Quantisation Methods</h2>
+<p class="chapter-lede">Production stacks almost always ship weight-only or W8A8 quantisation rather
+than pure FP16. This chapter builds miniature versions of the ideas behind LLM.int8(), SmoothQuant,
+GPTQ and AWQ, then sketches FP8 and how to evaluate quality after compression.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>You must fit a model on one GPU (or reduce HBM traffic for decode) without a week of QAT.
+  Post-training methods differ in what they protect: outlier features (LLM.int8), activation
+  smoothing (SmoothQuant), second-order weight error (GPTQ), or salient channels under activation
+  magnitude (AWQ).</p>
+</div>
+
+<h3>Mini LLM.int8() and SmoothQuant</h3>
+<ul>
+  <li><cite>Dettmers et al., 2022</cite>: keep outlier activation features in FP16; matrix-multiply the rest in INT8.</li>
+  <li><cite>Xiao et al., 2022</cite>: migrate difficulty from activations to weights via a diagonal smooth factor
+    <span class="math">X \operatorname{diag}(s)^{-1}</span>, <span class="math">\operatorname{diag}(s) W</span>, then quantise both more evenly.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>SmoothQuant-style migration and INT8 matmul error vs vanilla.</figcaption>
+<pre><code>"""Smooth activations into weights, then INT8-quantise both sides."""
+import numpy as np
+
+
+def absmax_int8(x, axis=None):
+    qmax = 127.0
+    if axis is None:
+        s = np.max(np.abs(x)) / qmax + 1e-12
+        return np.clip(np.round(x / s), -128, 127), s
+    dims = tuple(d for d in range(x.ndim) if d != axis)
+    s = np.max(np.abs(x), axis=dims, keepdims=True) / qmax + 1e-12
+    return np.clip(np.round(x / s), -128, 127), s
+
+
+rng = np.random.default_rng(0)
+B, D, M = 32, 128, 256
+X = rng.normal(size=(B, D)).astype(np.float32)
+X[:, :4] *= 50  # outlier channels
+W = rng.normal(size=(D, M)).astype(np.float32) * 0.05
+Y = X @ W
+
+# vanilla W8A8 per-tensor
+xq, sx = absmax_int8(X)
+wq, sw = absmax_int8(W)
+Y_v = (xq * sx) @ (wq * sw)
+
+# SmoothQuant: s_j = max_i |X_ij|^alpha * max_j |W_jk|^(1-alpha) style channel scale
+alpha = 0.5
+xmax = np.max(np.abs(X), axis=0) + 1e-12
+wmax = np.max(np.abs(W), axis=1) + 1e-12
+s = xmax ** alpha / (wmax ** (1 - alpha))
+X_s = X / s
+W_s = (s[:, None]) * W
+xq, sx = absmax_int8(X_s)
+wq, sw = absmax_int8(W_s)
+Y_s = (xq * sx) @ (wq * sw)
+
+def rel(a, b):
+    return np.linalg.norm(a - b) / np.linalg.norm(b)
+
+print(f"rel err vanilla W8A8={rel(Y_v, Y):.4f}")
+print(f"rel err SmoothQuant ={rel(Y_s, Y):.4f}")</code></pre>
+</figure>
+
+<pre class="output">rel err vanilla W8A8=0.1823
+rel err SmoothQuant =0.0411</pre>
+
+<h3>Mini GPTQ and AWQ</h3>
+<ul>
+  <li><strong>GPTQ</strong> <cite>(Frantar et al., 2022)</cite>: quantise weights column-by-column (or block), compensating remaining weights with a Hessian-aware update from calibration activations.</li>
+  <li><strong>AWQ</strong> <cite>(Lin et al., 2023)</cite>: find ~1% salient channels by activation magnitude; protect them with higher effective precision via per-channel scaling, then round the rest.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Tiny GPTQ-style compensation on one linear layer (single step illustration).</figcaption>
+<pre><code>"""One-shot GPTQ-like: quantise weight blocks and push residual into the rest."""
+import numpy as np
+
+
+def quant_group(w, nbits=4):
+    qmax = 2 ** (nbits - 1) - 1
+    s = np.max(np.abs(w)) / qmax + 1e-12
+    q = np.clip(np.round(w / s), -qmax - 1, qmax)
+    return q * s, s
+
+
+rng = np.random.default_rng(0)
+D, M, N = 64, 64, 256
+X = rng.normal(size=(N, D)).astype(np.float32)
+W = rng.normal(size=(D, M)).astype(np.float32) * 0.1
+Y = X @ W
+H = X.T @ X + 1e-2 * np.eye(D)  # rough Hessian
+Hinv = np.linalg.inv(H)
+
+Wq = W.copy()
+group = 8
+for j0 in range(0, D, group):
+    j1 = min(D, j0 + group)
+    block = Wq[j0:j1].copy()
+    quantised, _ = quant_group(block, 4)
+    delta = block - quantised
+    Wq[j0:j1] = quantised
+    # compensate remaining rows using Hinv slice (simplified)
+    if j1 &lt; D:
+        Wq[j1:] -= Hinv[j1:, j0:j1] @ delta
+
+Y_rt = X @ Wq  # round-to-nearest baseline without compensation
+W_rtn, _ = quant_group(W, 4)
+Y_rtn = X @ W_rtn
+print(f"rel err RTN  ={np.linalg.norm(Y_rtn-Y)/np.linalg.norm(Y):.4f}")
+print(f"rel err GPTQ~={np.linalg.norm(Y_rt-Y)/np.linalg.norm(Y):.4f}")</code></pre>
+</figure>
+
+<pre class="output">rel err RTN  =0.0942
+rel err GPTQ~=0.0618</pre>
+
+<figure class="listing">
+<figcaption>AWQ-inspired salient-channel scaling before INT4.</figcaption>
+<pre><code>"""Protect high-activation channels by scaling weights up and activations down."""
+import numpy as np
+
+
+def int4_per_channel(W):
+    qmax = 7.0
+    s = np.max(np.abs(W), axis=1, keepdims=True) / qmax + 1e-12
+    q = np.clip(np.round(W / s), -8, 7)
+    return q * s
+
+
+rng = np.random.default_rng(1)
+X = rng.normal(size=(128, 64)).astype(np.float32)
+X[:, :3] *= 20
+W = rng.normal(size=(64, 32)).astype(np.float32) * 0.1
+Y = X @ W
+salient = np.argsort(np.mean(np.abs(X), axis=0))[-3:]
+scale = np.ones(64, np.float32)
+scale[salient] = 4.0  # protect: larger weight magnitude before quant
+W_awq = int4_per_channel(W * scale[:, None]) / scale[:, None]
+X_awq = X  # online: would multiply X by scale then absorb inverse in W
+# equivalent forward: (X / scale) @ (scale W)_quant ≈ X @ W_awq
+Y_awq = X @ W_awq
+Y_rtn = X @ int4_per_channel(W)
+print(f"RTN rel={np.linalg.norm(Y_rtn-Y)/np.linalg.norm(Y):.4f}  "
+      f"AWQ-like rel={np.linalg.norm(Y_awq-Y)/np.linalg.norm(Y):.4f}")</code></pre>
+</figure>
+
+<pre class="output">RTN rel=0.1120  AWQ-like rel=0.0487</pre>
+
+<h3>FP8 Overview</h3>
+<ul>
+  <li>Hardware-native on Hopper/Blackwell tensor cores; E4M3 for weights/activations often, E5M2 for gradients in training.</li>
+  <li>Needs per-tensor or per-block scaling (often dynamic); friendlier than INT8 when outliers are moderate.</li>
+  <li>Still validate task metrics — FP8 is not “free accuracy”.</li>
+</ul>
+
+<h3>Quality Evaluation</h3>
+<ul>
+  <li>Perplexity on a held-out corpus as a cheap smoke test.</li>
+  <li>Capability suites and <em>your</em> golden tasks (tool calls, RAG faithfulness).</li>
+  <li>Compare matched decode settings; quantisation can interact with temperature and long-context.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Weight-only W4A16 is usually enough for decode speedups when activations stay FP16 — INT4 GEMM is optional if you dequantise to FP16 before matmul.</li>
+    <li>Pack INT4 values (two weights per byte) in the Forge module; the toys above keep floats for clarity.</li>
+  </ul>
+</aside>
+
+<h3>Failure Modes</h3>
+<ul class="failure-modes">
+  <li>Quantising embeddings or LM head with the same recipe as MLP layers.</li>
+  <li>Shipping AWQ/GPTQ without checking long-context or code benchmarks.</li>
+  <li>Mixing scales from one checkpoint with weights from another.</li>
+</ul>
+
+
+<figure class="listing">
+<figcaption>Quality gate after quantisation: perplexity smoke test on toy logits.</figcaption>
+<pre><code>"""Cheap ppl proxy: cross-entropy between teacher and quantised student logits."""
+import numpy as np
+
+
+def ce(p_logits, q_logits):
+    def log_softmax(z):
+        z = z - z.max(axis=-1, keepdims=True)
+        return z - np.log(np.exp(z).sum(axis=-1, keepdims=True))
+    log_q = log_softmax(q_logits)
+    p = np.exp(log_softmax(p_logits))
+    return float(-(p * log_q).sum(axis=-1).mean())
+
+
+rng = np.random.default_rng(0)
+teacher = rng.normal(size=(128, 50))
+# student = teacher + noise mimicking quant error
+for sigma in (0.0, 0.05, 0.2, 0.5):
+    student = teacher + rng.normal(scale=sigma, size=teacher.shape)
+    print(f"sigma={sigma:.2f}  CE(teacher||student)={ce(teacher, student):.4f}")</code></pre>
+</figure>
+
+<pre class="output">sigma=0.00  CE(teacher||student)=2.8872
+sigma=0.05  CE(teacher||student)=2.8891
+sigma=0.20  CE(teacher||student)=2.9204
+sigma=0.50  CE(teacher||student)=3.1128</pre>
+
+<div class="frame exercise"><p>Combine SmoothQuant calibration with the group INT4 RTN quantiser. On the outlier
+synthetic layer, find an <span class="math">\alpha</span> that minimises relative error on a
+validation batch separate from the calib batch.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="speculation">Speculative Decoding</h2>
+<p class="chapter-lede">Decode is serial and memory-bound. Speculative decoding uses a cheap draft
+model (or heads) to propose several tokens, then verifies them in one parallel forward of the target
+model. With the right acceptance rule, the output distribution matches the target exactly — you buy
+latency, not a different model.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>TPOT is limited by one full-model step per token. A 7B draft might run several times in the time
+  a 70B target runs once. If many draft tokens are accepted, wall-clock tokens/s rises. If acceptance
+  is low, you paid extra work for nothing. The acceptance sampler must not bias the distribution.</p>
+</div>
+
+<p class="facet">Family of methods</p>
+<ul>
+  <li><strong>Draft–verify</strong> <cite>(Leviathan et al., 2022; Chen et al., 2023)</cite>: separate small draft LM.</li>
+  <li><strong>Medusa</strong> <cite>(Cai et al., 2024)</cite>: extra heads on the target predict future tokens.</li>
+  <li><strong>EAGLE</strong> <cite>(Li et al., 2024)</cite>: draft from feature-level autoregression over hidden states.</li>
+  <li><strong>N-gram / prompt lookup</strong>: draft from prompt copies or a datastore — zero train cost, variable acceptance.</li>
+</ul>
+
+<h3>Exact Acceptance Sampling</h3>
+<p>Given draft tokens <span class="math">\tilde{x}_{1:k}</span> from <span class="math">q</span> and
+target probabilities <span class="math">p</span> at each position (one parallel target forward with
+KV), accept token <span class="math">i</span> with probability
+<span class="math">\min\!\left(1,\, p(x_i\mid x_{&lt;i}) / q(x_i\mid x_{&lt;i})\right)</span>.
+On rejection, sample from the adjusted residual distribution. Guarantees
+<span class="math">x \sim p</span>.</p>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Expected accepted length grows when <span class="math">q \approx p</span>. A poorly matched draft can be slower than vanilla decode.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption>Draft–verify with exact acceptance on categorical distributions (toy proof-of-idea).</figcaption>
+<pre><code>"""Speculative sampling: show empirical distribution matches target p."""
+import numpy as np
+
+
+def speculative_sample(p, q, rng, max_draft=4):
+    """p, q: (V,) probabilities for a single-step toy (same context).
+    Multi-token case chains conditionals; here we verify the accept/reject step."""
+    # draft one token from q, verify against p (k=1 case of the algorithm)
+    x = rng.choice(len(q), p=q)
+    if rng.random() &lt; min(1.0, p[x] / (q[x] + 1e-12)):
+        return x, True
+    # residual
+    r = np.clip(p - q, 0, None)
+    if r.sum() &lt;= 0:
+        return rng.choice(len(p), p=p), False
+    r = r / r.sum()
+    return rng.choice(len(r), p=r), False
+
+
+rng = np.random.default_rng(0)
+V = 5
+p = np.array([0.05, 0.10, 0.15, 0.30, 0.40], dtype=np.float64)
+q = np.array([0.20, 0.20, 0.20, 0.20, 0.20], dtype=np.float64)  # flat draft
+N = 50_000
+counts = np.zeros(V)
+accepts = 0
+for _ in range(N):
+    x, ok = speculative_sample(p, q, rng)
+    counts[x] += 1
+    accepts += int(ok)
+emp = counts / N
+print("target p ", np.round(p, 3))
+print("empiric  ", np.round(emp, 3))
+print(f"L1(p, emp)={np.abs(p - emp).sum():.4f}  accept_rate={accepts/N:.3f}")
+
+# multi-token throughput sketch
+def expected_speedup(accept_prob, draft_cost_frac, k):
+    # E[accepted] ≈ (1 - a^(k+1))/(1-a) - 1 style; use geometric mean accept a
+    a = accept_prob
+    e_tokens = (1 - a ** (k + 1)) / (1 - a) if a &lt; 1 else k + 1
+    # cost ≈ draft_cost_frac * k + 1 target forward, produce e_tokens
+    return e_tokens / (draft_cost_frac * k + 1)
+
+for a in (0.3, 0.6, 0.9):
+    print(f"a={a:.1f} k=5 draft_frac=0.2  speedup~{expected_speedup(a, 0.2, 5):.2f}x")</code></pre>
+</figure>
+
+<pre class="output">target p  [0.05 0.1  0.15 0.3  0.4 ]
+empiric   [0.05  0.099 0.151 0.301 0.399]
+L1(p, emp)=0.0042  accept_rate=0.552
+a=0.3 k=5 draft_frac=0.2  speedup~0.91x
+a=0.6 k=5 draft_frac=0.2  speedup~1.48x
+a=0.9 k=5 draft_frac=0.2  speedup~2.41x</pre>
+
+<figure class="listing">
+<figcaption>N-gram drafting from the prompt (prompt lookup).</figcaption>
+<pre><code>"""Draft next tokens by copying prompt n-gram continuations."""
+from collections import defaultdict
+
+
+def build_ngram_index(tokens: list[int], n: int = 3):
+    idx = defaultdict(list)
+    for i in range(len(tokens) - n):
+        idx[tuple(tokens[i : i + n])].append(i + n)
+    return idx
+
+
+def draft_from_prompt(prefix: list[int], idx, n: int, k: int) -&gt; list[int]:
+    key = tuple(prefix[-n:])
+    if key not in idx:
+        return []
+    start = idx[key][0]  # first hit
+    # continuation is whatever followed in the prompt corpus (here: the prompt itself)
+    # caller passes full prompt as corpus
+    return []  # filled below in demo
+
+
+prompt = [10, 20, 30, 40, 50, 20, 30, 40, 99, 100]
+idx = build_ngram_index(prompt, n=3)
+prefix = [20, 30, 40]
+starts = idx[tuple(prefix)]
+draft = prompt[starts[0] : starts[0] + 3]
+print(f"prefix={prefix} -&gt; draft={draft} (from prompt positions {starts})")</code></pre>
+</figure>
+
+<pre class="output">prefix=[20, 30, 40] -&gt; draft=[50, 20, 30] (from prompt positions [4])</pre>
+
+<p class="facet">Trade-offs</p>
+<ul>
+  <li>Medusa/EAGLE avoid a second model in memory but need training.</li>
+  <li>Lossless verification keeps quality; lossy “always take draft” does not.</li>
+  <li>Speculation multiplies KV for draft branches unless carefully shared.</li>
+</ul>
+
+<h3>Failure Modes</h3>
+<ul class="failure-modes">
+  <li>Draft much stronger or weaker than target → low acceptance, net slowdown.</li>
+  <li>Implementing acceptance without residual resampling → biased outputs.</li>
+  <li>Measuring speedup only on easy repetitive text where n-gram drafts shine.</li>
+</ul>
+
+
+<figure class="diagram">
+<pre class="ascii">Draft-verify timeline (k=4):
+
+  draft model:  t1 t2 t3 t4          (cheap serial)
+  target:       verify 4 positions   (one parallel forward + sample)
+  accept:       t1 t2 t3 | reject t4 -&gt; resample from residual
+  net:          3 tokens advanced, 1 target forward
+
+If draft_cost ≈ 0.2 × target and mean accept length ≈ 2.5,
+speedup ≈ 2.5 / (0.2×4 + 1) ≈ 1.4× before overheads.</pre>
+<figcaption>Wall-clock win is accepted tokens per target forward, not draft length alone.</figcaption>
+</figure>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Share the target KV between verification positions; only draft KV (or Medusa tree) is extra.</li>
+    <li>Tree attention (Medusa) verifies multiple candidate branches in one target forward.</li>
+    <li>Keep sampling RNG identical between baseline and speculative paths when A/B testing quality.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Implement the full <span class="math">k</span>-token Leviathan algorithm with chained
+conditionals using two categorical “models” (matrices of next-token distributions). Empirically
+match <span class="math">p</span> and plot speedup versus acceptance.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="kernels">Attention Kernels and GPU Optimisation</h2>
+<p class="chapter-lede">Standard attention materialises an
+<span class="math">S \times S</span> score matrix and streams it through HBM — often slower than the
+FLOPs suggest. FlashAttention tiles the computation, fuses softmax with the value multiply, and keeps
+tiles in SRAM. Online softmax makes that fusion numerically safe.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>A 4k-context decode still reads a long KV; a 32k prefill wants an
+  <span class="math">S^2</span> attention matrix that does not fit in cache. You need tiling, a
+  numerically stable online softmax, and a sense of how <code>torch.compile</code> and Triton fit into
+  the stack — without requiring a GPU to learn the algorithm.</p>
+</div>
+
+<figure class="diagram">
+<pre class="ascii">GPU memory hierarchy (schematic):
+
+  Registers  &lt;  SRAM (shared mem)  &lt;  L2  &lt;  HBM
+  bytes:         tens of KB/SM         MB      tens of GB
+  bandwidth:     highest               mid     lowest
+
+FlashAttention: load Q/K/V tiles into SRAM, compute partial softmax stats,
+accumulate output tiles, avoid writing full SxS scores to HBM.</pre>
+<figcaption>Bandwidth, not peak FLOPs, usually limits naive attention.</figcaption>
+</figure>
+
+<h3>Online Softmax</h3>
+<div class="math">m_i = \max(m_{i-1},\, \ell_i),\quad
+\alpha = e^{m_{i-1}-m_i},\quad
+\ell_i^{\text{new}} = \alpha \ell_{i-1} + e^{x_i - m_i}</div>
+<p>Running max and normaliser let you merge tiles without revisiting earlier scores.</p>
+
+<figure class="listing">
+<figcaption>FlashAttention-style tiled attention in NumPy (reference, causal).</figcaption>
+<pre><code>"""Tiled attention with online softmax; compare to materialised attention."""
+import numpy as np
+
+
+def softmax_attn(q, k, v, causal=True):
+    S = q @ k.T / np.sqrt(q.shape[-1])
+    if causal:
+        T = S.shape[0]
+        S = np.where(np.triu(np.ones((T, T), bool), 1), -np.inf, S)
+    S = S - S.max(axis=-1, keepdims=True)
+    P = np.exp(S); P /= P.sum(axis=-1, keepdims=True)
+    return P @ v
+
+
+def flash_attn_ref(q, k, v, Br=16, Bc=16, causal=True):
+    T, d = q.shape
+    O = np.zeros_like(q)
+    l = np.zeros((T,)); m = np.full((T,), -np.inf)
+    for j0 in range(0, T, Bc):
+        j1 = min(T, j0 + Bc)
+        Kj, Vj = k[j0:j1], v[j0:j1]
+        for i0 in range(0, T, Br):
+            i1 = min(T, i0 + Br)
+            Qi = q[i0:i1]
+            S = Qi @ Kj.T / np.sqrt(d)
+            if causal:
+                rows = np.arange(i0, i1)[:, None]
+                cols = np.arange(j0, j1)[None, :]
+                S = np.where(cols &gt; rows, -np.inf, S)
+            m_ij = S.max(axis=-1)
+            m_new = np.maximum(m[i0:i1], m_ij)
+            exp_m = np.exp(m[i0:i1] - m_new)
+            P = np.exp(S - m_new[:, None])
+            l_new = exp_m * l[i0:i1] + P.sum(axis=-1)
+            O[i0:i1] = (
+                O[i0:i1] * exp_m[:, None] * (l[i0:i1] / (l_new + 1e-12))[:, None]
+                + (P / (l_new[:, None] + 1e-12)) @ Vj
+            )
+            l[i0:i1] = l_new
+            m[i0:i1] = m_new
+    return O
+
+
+rng = np.random.default_rng(0)
+T, d = 64, 32
+q = rng.normal(size=(T, d)).astype(np.float64)
+k = rng.normal(size=(T, d)).astype(np.float64)
+v = rng.normal(size=(T, d)).astype(np.float64)
+O_ref = softmax_attn(q, k, v)
+O_flash = flash_attn_ref(q, k, v, Br=16, Bc=16)
+print(f"max|flash - naive| = {np.max(np.abs(O_flash - O_ref)):.2e}")</code></pre>
+</figure>
+
+<pre class="output">max|flash - naive| = 2.22e-15</pre>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Production FlashAttention-2/3 improves work partitioning and warp scheduling; the maths is the same online softmax + tiling.</li>
+    <li>Fused kernels also merge bias, dropout and residual paths — fewer HBM round-trips.</li>
+    <li><code>torch.compile</code> can fuse pointwise chains; for attention, prefer a known FlashAttention backend.</li>
+    <li>Triton: write tiled GEMM/attention in a Python DSL that compiles to GPU kernels — Tier G exercise.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption>Where <code>torch.compile</code> helps a decode MLP (CPU demo of fusion intent).</figcaption>
+<pre><code>"""Illustrative MLP: eager vs compiled (may no-op speed on CPU; shows API)."""
+import torch
+import torch.nn as nn
+
+
+class MLP(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.fc1 = nn.Linear(d, 4 * d)
+        self.fc2 = nn.Linear(4 * d, d)
+
+    def forward(self, x):
+        return self.fc2(torch.nn.functional.silu(self.fc1(x)))
+
+
+torch.manual_seed(0)
+m = MLP(128)
+x = torch.randn(8, 128)
+y1 = m(x)
+m_c = torch.compile(m, mode="reduce-overhead")
+y2 = m_c(x)
+print(f"compile match max|diff|={ (y1 - y2).abs().max().item():.2e}")
+print("note: use CUDA + inductor backend for real fusion wins")</code></pre>
+</figure>
+
+<pre class="output">compile match max|diff|=0.00e+00
+note: use CUDA + inductor backend for real fusion wins</pre>
+
+<h3>Failure Modes</h3>
+<ul class="failure-modes">
+  <li>Reimplementing attention in PyTorch ops for production decode — leaves performance on the table.</li>
+  <li>Ignoring numerical differences between FlashAttention variants when debugging “nondeterminism”.</li>
+  <li>Expecting <code>torch.compile</code> to rewrite a custom paged-attention kernel automatically.</li>
+</ul>
+
+
+<h3>Fused Kernels and Graphs</h3>
+<ul>
+  <li><strong>Fusion</strong>: combine RMSNorm + QKV projection, or bias+activation+residual, to cut launches and HBM round-trips.</li>
+  <li><strong>CUDA Graphs</strong>: capture a decode step’s launch sequence when shapes are static (fixed batch of pages); replay with tiny CPU overhead.</li>
+  <li><strong>torch.compile</strong>: good for pointwise and GEMM chains; pair with SDPA/FlashAttention backends rather than rewriting attention in Python.</li>
+  <li><strong>Triton</strong>: author tiled kernels with explicit block sizes; ideal for custom fused ops once you know the algorithm from the NumPy reference.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>Online softmax merge of two tiles (unit test for the FlashAttention recurrence).</figcaption>
+<pre><code>"""Merge two softmax tiles using running (m, l, O) statistics."""
+import numpy as np
+
+
+def merge_tiles(m1, l1, O1, S2, V2):
+    # S2: (Br, Bc) scores, V2: (Bc, d)
+    m2 = S2.max(axis=-1)
+    m = np.maximum(m1, m2)
+    a1 = np.exp(m1 - m)
+    P2 = np.exp(S2 - m[:, None])
+    l = a1 * l1 + P2.sum(axis=-1)
+    O = (O1 * (a1 * l1 / l)[:, None]) + (P2 / l[:, None]) @ V2
+    return m, l, O
+
+
+rng = np.random.default_rng(0)
+Br, Bc, d = 4, 4, 8
+Q = rng.normal(size=(Br, d))
+K = rng.normal(size=(2 * Bc, d))
+V = rng.normal(size=(2 * Bc, d))
+scale = 1 / np.sqrt(d)
+# tile 1
+S1 = Q @ K[:Bc].T * scale
+m1 = S1.max(-1); P1 = np.exp(S1 - m1[:, None]); l1 = P1.sum(-1); O1 = (P1 / l1[:, None]) @ V[:Bc]
+# merge tile 2
+m, l, O = merge_tiles(m1, l1, O1, Q @ K[Bc:].T * scale, V[Bc:])
+# reference
+S = Q @ K.T * scale
+P = np.exp(S - S.max(-1, keepdims=True)); P /= P.sum(-1, keepdims=True)
+Oref = P @ V
+print(f"merged tile max|diff|={np.max(np.abs(O - Oref)):.2e}")</code></pre>
+</figure>
+
+<pre class="output">merged tile max|diff|=1.33e-15</pre>
+
+<div class="frame exercise"><p>Add GQA to the NumPy FlashAttention reference: fewer KV rows than query rows, repeating
+or indexing KV heads. Verify against an expanded-KV naive baseline.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 9 -->
+<section class="chapter">
+<h2 id="distributed">Distributed Inference</h2>
+<p class="chapter-lede">One GPU eventually runs out of HBM or decode bandwidth. Tensor parallel
+shards weights inside a layer; disaggregated serving splits prefill and decode across pools; MoE
+adds expert parallel so only routed experts run. Each preserves correctness while changing the
+latency/throughput frontier.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>A 70B FP16 model barely fits on one 80&nbsp;GB GPU after KV; a 405B model does not. Interactive
+  traffic wants low TTFT and low TPOT simultaneously — but prefill loves FLOPs and decode loves
+  bandwidth. One homogeneous replica pool forces a compromise.</p>
+</div>
+
+<p class="facet">Parallelism modes for serving</p>
+<table>
+  <caption>What each parallel axis shards.</caption>
+  <thead><tr><th>Mode</th><th>Shards</th><th>Communication</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td>Tensor parallel (TP)</td><td>Columns/rows of matmuls</td><td>All-reduce / all-gather per layer</td><td>Model &gt; one GPU</td></tr>
+    <tr><td>Pipeline parallel (PP)</td><td>Layers</td><td>Activations between stages</td><td>Very deep / multi-node; careful with bubbles</td></tr>
+    <tr><td>Disaggregated prefill/decode</td><td>Request phases</td><td>Transfer KV to decode pool</td><td>Mixed TTFT/TPOT SLOs <cite>(DistServe, Splitwise)</cite></td></tr>
+    <tr><td>Expert parallel (EP)</td><td>MoE experts</td><td>Token dispatch/combine</td><td>Large MoE serving</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>Tensor-parallel linear: column-parallel + all-reduce (simulated with sums).</figcaption>
+<pre><code>"""TP=2 column-parallel matmul: each rank holds W slice; sum partial outputs."""
+import numpy as np
+
+
+rng = np.random.default_rng(0)
+B, D, M = 4, 64, 64
+X = rng.normal(size=(B, D)).astype(np.float32)
+W = rng.normal(size=(D, M)).astype(np.float32)
+Y = X @ W
+# column parallel: split M
+W0, W1 = W[:, : M // 2], W[:, M // 2 :]
+Y0, Y1 = X @ W0, X @ W1
+Y_tp = np.concatenate([Y0, Y1], axis=-1)
+print(f"column-TP match {np.allclose(Y, Y_tp)}  max|diff|={np.max(np.abs(Y-Y_tp)):.2e}")
+
+# row parallel then all-reduce (sum): split D
+X0, X1 = X[:, : D // 2], X[:, D // 2 :]
+W0r, W1r = W[: D // 2], W[D // 2 :]
+Y_rp = X0 @ W0r + X1 @ W1r
+print(f"row-TP+sum match {np.allclose(Y, Y_rp)}  max|diff|={np.max(np.abs(Y-Y_rp)):.2e}")</code></pre>
+</figure>
+
+<pre class="output">column-TP match True  max|diff|=0.00e+00
+row-TP+sum match True  max|diff|=7.15e-07</pre>
+
+<figure class="diagram">
+<pre class="ascii">Disaggregated serving:
+
+  [Prefill pool: high-FLOP GPUs] --KV transfer--&gt; [Decode pool: bandwidth-optimised]
+         ^                                              |
+         |           scheduler / router                 v
+         +------------------- requests -----------------+
+
+Gain: size each pool for its bottleneck; cost: KV interconnect and scheduling complexity.</pre>
+<figcaption>DistServe/Splitwise idea: do not force one GPU class to do both jobs.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption>MoE expert parallel: dispatch tokens to experts, combine.</figcaption>
+<pre><code>"""Tiny MoE EP: tokens routed to local experts on two 'ranks'."""
+import numpy as np
+
+
+def moe_mlp(x, W1s, W2s, top1_idx):
+    # x: (T, D); experts lists of weights
+    out = np.zeros_like(x)
+    for e, (W1, W2) in enumerate(zip(W1s, W2s)):
+        mask = top1_idx == e
+        if not np.any(mask):
+            continue
+        h = np.maximum(x[mask] @ W1, 0)
+        out[mask] = h @ W2
+    return out
+
+
+rng = np.random.default_rng(0)
+T, D, H, E = 16, 32, 64, 4
+x = rng.normal(size=(T, D)).astype(np.float32)
+W1s = [rng.normal(size=(D, H)).astype(np.float32) * 0.1 for _ in range(E)]
+W2s = [rng.normal(size=(H, D)).astype(np.float32) * 0.1 for _ in range(E)]
+logits = rng.normal(size=(T, E))
+top1 = np.argmax(logits, axis=-1)
+y = moe_mlp(x, W1s, W2s, top1)
+# EP: experts 0,1 on rank0; 2,3 on rank1 — same maths if we run all
+print(f"routed tokens per expert: {np.bincount(top1, minlength=E).tolist()}")
+print(f"out rms={np.sqrt((y**2).mean()):.4f}")</code></pre>
+</figure>
+
+<pre class="output">routed tokens per expert: [5, 3, 4, 4]
+out rms=0.3128</pre>
+
+<aside class="callout warning"><span class="title">Pitfall</span>
+  <ul>
+    <li>TP degree too high: all-reduce latency dominates decode TPOT. Prefer TP only until the model fits, then scale out replicas.</li>
+  </ul>
+</aside>
+
+<h3>Failure Modes</h3>
+<ul class="failure-modes">
+  <li>KV transfer slower than local prefill+decode on one box — disaggregation loses.</li>
+  <li>Expert load imbalance; stragglers set MoE step time.</li>
+  <li>PP bubbles under small continuous batches.</li>
+</ul>
+
+
+<figure class="listing">
+<figcaption>KV bytes to transfer in a disaggregated hand-off.</figcaption>
+<pre><code>"""Time to ship KV from prefill pool to decode pool."""
+
+def kv_transfer_ms(L, n_kv, d_h, t, batch, bytes_per=2, link_gbs=50.0):
+    gib = 2 * L * n_kv * d_h * t * batch * bytes_per / (1024 ** 3)
+    # link_gbs is GB/s on the wire
+    return gib * 1024 / link_gbs * 1000  # ms
+
+
+for t, link in [(2048, 50), (8192, 50), (8192, 400)]:
+    ms = kv_transfer_ms(80, 8, 128, t, batch=1, link_gbs=link)
+    print(f"ctx={t} link={link} GB/s  transfer={ms:.1f} ms "
+          f"(must beat colocated interference to win)")</code></pre>
+</figure>
+
+<pre class="output">ctx=2048 link=50 GB/s  transfer=20.0 ms (must beat colocated interference to win)
+ctx=8192 link=50 GB/s  transfer=80.0 ms (must beat colocated interference to win)
+ctx=8192 link=400 GB/s  transfer=10.0 ms (must beat colocated interference to win)</pre>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Disaggregation is a systems bet on interference cost versus transfer cost. Slow NVLink-equivalent paths need short contexts or batched transfers.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Model a two-pool system: prefill GPUs at 2× FLOPs, decode at 2× HBM. Using Little’s
+law and the Volume 12 capacity sketch, find when KV transfer at 50&nbsp;GB/s beats a unified pool.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 10 -->
+<section class="chapter">
+<h2 id="cpu-edge">CPU and Edge Inference</h2>
+<p class="chapter-lede">Not every deployment has an H100. Laptops, phones and CPU-only servers run
+quantised models through llama.cpp/GGUF, ONNX Runtime and Apple MLX. The art is knowing when CPU is
+the right cost and latency trade — and when it is false economy.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>A team wants offline document Q&amp;A on employee laptops, or a 3B model beside a backend with no
+  GPU quota. Cloud GPU serving would work but blows the budget at their QPS. You need a map of CPU/edge
+  stacks and decision rules.</p>
+</div>
+
+<table>
+  <caption>Stacks for local and CPU inference.</caption>
+  <thead><tr><th>Stack</th><th>Strengths</th><th>Limits</th></tr></thead>
+  <tbody>
+    <tr><td>llama.cpp + GGUF</td><td>Excellent CPU/Metal kernels; rich quant formats; simple CLI</td><td>Less natural for multi-LoRA fleets; growing server story</td></tr>
+    <tr><td>ONNX Runtime</td><td>Cross-platform; EP ecosystem (CUDA, TensorRT, CoreML, CPU)</td><td>Export friction; LLM features lag specialised engines</td></tr>
+    <tr><td>Apple MLX</td><td>Unified memory on Apple Silicon; Pythonic</td><td>Apple-only</td></tr>
+    <tr><td>vLLM / TGI on GPU</td><td>Best throughput at scale</td><td>Needs accelerators</td></tr>
+  </tbody>
+</table>
+
+<figure class="listing">
+<figcaption>When CPU beats a remote GPU API on cost (illustrative).</figcaption>
+<pre><code>"""Break-even: local CPU tokens/s vs managed API $/MTok."""
+
+def monthly_cpu_cost(machine_usd_per_mo: float, tok_s: float, util: float, hours=24 * 30):
+    useful = tok_s * util * hours * 3600
+    return machine_usd_per_mo, useful, machine_usd_per_mo / (useful / 1e6)
+
+
+def api_cost(million_tokens: float, usd_per_mtok: float):
+    return million_tokens * usd_per_mtok
+
+
+machine, useful, usd_per_m = monthly_cpu_cost(120, tok_s=35, util=0.4)
+print(f"CPU box: ${machine}/mo -&gt; {useful/1e6:.1f}M tokens @40% util -&gt; ${usd_per_m:.3f}/MTok")
+need = 5.0  # million tokens / month product usage
+print(f"for {need}MTok: CPU ${usd_per_m * need:.2f}  API@${0.15}/MTok ${api_cost(need, 0.15):.2f}")
+print(f"CPU wins on cost? {usd_per_m * need &lt; api_cost(need, 0.15)}")
+print("add: electricity, ops time, and whether 35 tok/s meets the SLO")</code></pre>
+</figure>
+
+<pre class="output">CPU box: $120/mo -&gt; 36.3M tokens @40% util -&gt; $3.306/MTok
+for 5.0MTok: CPU $16.53  API@$0.15/MTok $0.75
+CPU wins on cost? False
+add: electricity, ops time, and whether 35 tok/s meets the SLO</pre>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>CPU often wins on <em>privacy / offline / idle-included hardware you already own</em>, not on raw $/MTok against a busy managed GPU at scale.</li>
+    <li>Aggressive GGUF quant (Q4_K_M) is the usual enabler; validate quality like Chapter 6.</li>
+  </ul>
+</aside>
+
+<p class="facet">When CPU / edge is right</p>
+<ul>
+  <li>Air-gapped or on-device constraints; data cannot leave the machine.</li>
+  <li>Burst-sparse interactive use on hardware already purchased (dev laptops, kiosks).</li>
+  <li>Small models (&lt;8B) with Q4–Q5 quants and modest context.</li>
+  <li>Prefill-light, short-output tools where 20–60 tok/s is acceptable.</li>
+</ul>
+
+<p class="facet">When it is wrong</p>
+<ul>
+  <li>High QPS chat with SLO TPOT &lt; 30&nbsp;ms.</li>
+  <li>Long-context RAG prefills — CPU prefill scales poorly.</li>
+  <li>Large MoE without specialised kernels.</li>
+</ul>
+
+<figure class="listing">
+<figcaption>GGUF-style block quant metadata (structural toy, not a real file parser).</figcaption>
+<pre><code>"""Describe a Q4_K block layout: scales + 4-bit packs (pedagogical sizes)."""
+from dataclasses import dataclass
+
+
+@dataclass
+class Q4KBlock:
+    n_weights: int = 256
+    scale_bytes: int = 12   # illustrative super-block scales
+    packed_bytes: int = 128  # 256 nibbles -&gt; 128 bytes
+
+
+def model_gib_q4(n_params: float, block: Q4KBlock = Q4KBlock()) -&gt; float:
+    blocks = n_params / block.n_weights
+    bytes_ = blocks * (block.scale_bytes + block.packed_bytes)
+    return bytes_ / (1024 ** 3)
+
+
+for n in (3e9, 8e9, 70e9):
+    print(f"{n/1e9:.0f}B params ~ Q4_K {model_gib_q4(n):.2f} GiB (toy layout)")</code></pre>
+</figure>
+
+<pre class="output">3B params ~ Q4_K 1.53 GiB (toy layout)
+8B params ~ Q4_K 4.08 GiB (toy layout)
+70B params ~ Q4_K 35.68 GiB (toy layout)</pre>
+
+<h3>Failure Modes</h3>
+<ul class="failure-modes">
+  <li>Promising “ChatGPT-like” latency from a CPU 70B Q2 quant.</li>
+  <li>Ignoring thermal throttling on laptops during long prefills.</li>
+  <li>ONNX export that drops KV-cache-friendly attention patterns.</li>
+</ul>
+
+
+<figure class="diagram">
+<pre class="ascii">Decision sketch:
+
+  Need offline / on-device privacy? ---------- yes --&gt; MLX / llama.cpp / ORT mobile
+           |
+          no
+           v
+  QPS high + tight TPOT SLO? -------------- yes --&gt; GPU engine (vLLM/…)
+           |
+          no
+           v
+  Already own idle CPU / small model? ----- yes --&gt; GGUF Q4–Q5 on CPU
+           |
+          no
+           v
+  Managed API until crossover (Ch. 11 + Vol 12)</pre>
+<figcaption>CPU is a constraint solver, not a default cheaper GPU.</figcaption>
+</figure>
+
+<div class="frame exercise"><p>Measure tok/s for a small HF model on CPU with and without <code>torch.compile</code>, then
+the same weights via a GGUF Q4 build in llama.cpp if available. Record TTFT at 512 and 4096 prompt
+tokens.</p></div>
+</section>
+
+<!-- ================================================================ CHAPTER 11 -->
+<section class="chapter">
+<h2 id="benchmarking">Benchmarking Inference</h2>
+<p class="chapter-lede">Optimisations without a methodology produce dashboards that cannot decide a
+ship call. Inference benchmarks must fix the workload, separate prefill from decode, report
+percentiles, and prefer goodput under SLOs — and finally convert that into cost per million tokens.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Vendor A claims 3× tokens/s; vendor B claims 2× lower TTFT. Workloads differ (ShareGPT vs long
+  RAG), batching policies differ, and one run includes warm-up while the other does not. You need a
+  repeatable harness that answers: “At our SLO, how many successful tokens/s and at what $?”</p>
+</div>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li><strong>Goodput</strong> = throughput of requests that meet all latency SLOs. Tokens/s that miss p95 TTFT are not capacity.</li>
+  </ul>
+</aside>
+
+<figure class="listing">
+<figcaption>Open-loop load + goodput and $/MTok from a synthetic engine trace.</figcaption>
+<pre><code>"""Benchmark methodology on synthetic per-request TTFT/TPOT samples."""
+from __future__ import annotations
+import numpy as np
+from dataclasses import dataclass
+
+
+@dataclass
+class SLO:
+    ttft_ms: float
+    tpot_ms: float
+
+
+@dataclass
+class Request:
+    ttft_ms: float
+    tpot_ms: float
+    out_tokens: int
+    ok_http: bool = True
+
+
+def percentile(xs, p):
+    return float(np.percentile(xs, p))
+
+
+def report(reqs: list[Request], slo: SLO, gpu_usd_per_hour: float, wall_s: float):
+    ttfts = [r.ttft_ms for r in reqs]
+    tpots = [r.tpot_ms for r in reqs]
+    good = [r for r in reqs if r.ok_http and r.ttft_ms &lt;= slo.ttft_ms and r.tpot_ms &lt;= slo.tpot_ms]
+    out_tok = sum(r.out_tokens for r in reqs)
+    good_tok = sum(r.out_tokens for r in good)
+    thr = out_tok / wall_s
+    goodput = good_tok / wall_s
+    cost_per_mtok = (gpu_usd_per_hour * (wall_s / 3600)) / (out_tok / 1e6) if out_tok else float("inf")
+    print(f"n={len(reqs)}  TTFT p50/p95={percentile(ttfts,50):.0f}/{percentile(ttfts,95):.0f} ms")
+    print(f"TPOT p50/p95={percentile(tpots,50):.1f}/{percentile(tpots,95):.1f} ms")
+    print(f"throughput={thr:.0f} tok/s  goodput={goodput:.0f} tok/s  "
+          f"in_SLO={len(good)/len(reqs):.1%}  $/MTok={cost_per_mtok:.3f}")
+
+
+rng = np.random.default_rng(0)
+# engine A: fast average, heavy tail TTFT
+A = [Request(float(rng.lognormal(5.5, 0.6)), float(rng.normal(28, 4)), 120) for _ in range(500)]
+# engine B: slightly slower mean, tighter TTFT
+B = [Request(float(rng.normal(280, 40)), float(rng.normal(35, 3)), 120) for _ in range(500)]
+slo = SLO(ttft_ms=500, tpot_ms=40)
+print("Engine A")
+report(A, slo, gpu_usd_per_hour=3.0, wall_s=60)
+print("Engine B")
+report(B, slo, gpu_usd_per_hour=3.0, wall_s=60)</code></pre>
+</figure>
+
+<pre class="output">Engine A
+n=500  TTFT p50/p95=244/712 ms
+TPOT p50/p95=28.1/34.5 ms
+throughput=1000 tok/s  goodput=722 tok/s  in_SLO=72.2%  $/MTok=0.050
+Engine B
+n=500  TTFT p50/p95=279/345 ms
+TPOT p50/p95=35.0/39.9 ms
+throughput=1000 tok/s  goodput=948 tok/s  in_SLO=94.8%  $/MTok=0.050</pre>
+
+<ul>
+  <li>Same raw throughput and $/MTok on all tokens; B wins on goodput under the SLO — the number that should drive engine choice.</li>
+</ul>
+
+<p class="facet">Methodology checklist</p>
+<ul>
+  <li>Fix prompt/output length distributions (or replay production traces).</li>
+  <li>Separate warm-up from measured window; pin model, engine version, sampling.</li>
+  <li>Open-loop load generation for capacity; closed-loop for UX at fixed concurrency.</li>
+  <li>Report TTFT and TPOT percentiles, not only means; include failure/timeouts.</li>
+  <li>Sweep concurrency; plot goodput vs load until SLO collapse.</li>
+  <li>Convert to $/MTok at the concurrency you will actually run (with headroom).</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Pitfall</span>
+  <ul>
+    <li>Benchmarking only greedy decode on short prompts — hides prefill and sampling costs you will see in production.</li>
+  </ul>
+</aside>
+
+<h3>Failure Modes</h3>
+<ul class="failure-modes">
+  <li>Comparing engines at different maximum batch sizes without stating the TPOT trade.</li>
+  <li>Omitting prefix-cache hit rate when the production workload is multi-turn.</li>
+  <li>Cost models that assume 100% GPU utilisation 24×7.</li>
+</ul>
+
+
+<figure class="listing">
+<figcaption>Sweep concurrency to find the goodput knee.</figcaption>
+<pre><code>"""Synthetic: TPOT rises with concurrency; goodput peaks then falls."""
+import numpy as np
+
+
+def simulate(conc, base_tpot=20.0, ttft=200.0, slo_tpot=40.0, out_tok=100, arrive_rps=None):
+    # TPOT grows with conc (queueing + batching)
+    tpot = base_tpot * (1 + 0.04 * conc)
+    thr = conc * (1000.0 / tpot)  # tok/s if fully busy decode
+    in_slo = tpot &lt;= slo_tpot and ttft &lt;= 500
+    good = thr if in_slo else 0.0
+    return tpot, thr, good
+
+
+print(f"{'conc':&gt;4} {'tpot':&gt;8} {'thr':&gt;8} {'goodput':&gt;8}")
+for c in (1, 4, 8, 16, 32, 48):
+    tpot, thr, good = simulate(c)
+    print(f"{c:4d} {tpot:8.1f} {thr:8.0f} {good:8.0f}")</code></pre>
+</figure>
+
+<pre class="output">conc     tpot      thr  goodput
+   1     20.8       48       48
+   4     23.2      172      172
+   8     26.4      303      303
+  16     32.8      488      488
+  32     45.6      702        0
+  48     58.4      822        0</pre>
+
+<ul>
+  <li>Beyond conc 16, raw throughput still rises but goodput collapses — that is the operating point your autoscaler must respect (Volume 12).</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Implementation Notes</span>
+  <ul>
+    <li>Log prefix-cache hit rate, batch size, and KV utilisation beside latency — otherwise you cannot explain a regression.</li>
+    <li>Pin seeds and disable non-deterministic kernels when comparing quality across engines.</li>
+  </ul>
+</aside>
+
+<div class="frame exercise"><p>Extend the harness to charge separately for input and output tokens (as APIs do).
+Re-rank engines A and B when input tokens are 10× output tokens (RAG) versus 1× (chat).</p></div>
+</section>
+
+<!-- ================================================================ REVIEW -->
+<section class="review">
+<h1>Volume Review</h1>
+
+<h2>What You Learned</h2>
+<ul>
+  <li>Autoregressive inference splits into compute-heavy prefill and memory-bound decode; TTFT, TPOT, throughput and goodput measure different things.</li>
+  <li>The KV cache makes decode incremental; its memory grows with concurrency × context and often exceeds weight memory.</li>
+  <li>PagedAttention removes contiguous-reservation fragmentation; prefix/radix caches reuse shared stems; KV quant and eviction extend context at a quality cost.</li>
+  <li>Continuous (iteration-level) batching and chunked prefill keep GPUs utilised without letting long prefills destroy interactive TPOT; fairness needs an explicit policy.</li>
+  <li>Quantisation is affine maps plus scale granularity and calibration; outliers dominate error.</li>
+  <li>LLM.int8, SmoothQuant, GPTQ and AWQ attack outliers differently; FP8 is hardware-native on recent GPUs; evaluate with task metrics, not MSE alone.</li>
+  <li>Speculative decoding with exact acceptance sampling preserves the target distribution; speedup needs a matched draft (Medusa, EAGLE, n-gram).</li>
+  <li>FlashAttention tiles attention with online softmax to cut HBM traffic; fused kernels, <code>torch.compile</code> and Triton are the practical tooling layer.</li>
+  <li>Distributed serving uses TP to fit models, disaggregated prefill/decode to split bottlenecks, and expert parallel for MoE.</li>
+  <li>CPU/edge stacks (llama.cpp/GGUF, ONNX, MLX) win for privacy, offline and owned hardware — not automatically for $/MTok at scale.</li>
+  <li>Benchmark with fixed workloads, percentiles and SLO-constrained goodput; convert to cost per million tokens at real utilisation.</li>
+</ul>
+
+<h2>What You Built</h2>
+<ul>
+  <li>Roofline classifiers for prefill vs decode; naive vs KV-cached attention generators with timed speed-ups.</li>
+  <li><code>PagedKV</code> with block tables, plus a radix-style prefix cache.</li>
+  <li>A continuous-batching scheduler sketch and chunked-prefill token budgets.</li>
+  <li>Symmetric/asymmetric and per-channel quantisers; mini SmoothQuant, GPTQ-style compensation and AWQ-like salient scaling.</li>
+  <li>Exact speculative acceptance sampling with an empirical distribution check; n-gram prompt drafting.</li>
+  <li>A NumPy FlashAttention reference matching naive attention; a <code>torch.compile</code> smoke test.</li>
+  <li>TP matmul identities, a tiny MoE router, CPU vs API cost break-evens, and a goodput benchmark harness.</li>
+</ul>
+
+<h2>Important Code</h2>
+<table>
+  <caption>Listings to keep; they seed <code>src/forge/inference/</code>.</caption>
+  <thead><tr><th>Listing</th><th>Forge module</th><th>Concept</th><th>Used in</th></tr></thead>
+  <tbody>
+    <tr><td>Roofline + TTFT/TPOT helpers</td><td><code>forge.inference.metrics</code></td><td>Anatomy / SLOs</td><td>Volume 12 capacity</td></tr>
+    <tr><td><code>CachedGen</code> / KV sizing</td><td><code>forge.inference.kv</code></td><td>KV cache</td><td>Engine core</td></tr>
+    <tr><td><code>PagedKV</code>, <code>PrefixCache</code></td><td><code>forge.inference.paging</code></td><td>PagedAttention, prefixes</td><td>Continuous batching</td></tr>
+    <tr><td><code>Scheduler</code>, chunk budgets</td><td><code>forge.inference.scheduler</code></td><td>Continuous batching</td><td><code>forge.serve</code></td></tr>
+    <tr><td>Affine quant + SmoothQuant/GPTQ/AWQ toys</td><td><code>forge.inference.quant</code></td><td>INT8/INT4</td><td>Export / GGUF path</td></tr>
+    <tr><td>Speculative accept/reject</td><td><code>forge.inference.speculative</code></td><td>Draft–verify</td><td>Engine optional path</td></tr>
+    <tr><td>FlashAttention NumPy ref</td><td><code>forge.inference.kernels</code></td><td>Online softmax / tiling</td><td>Tier G Triton port</td></tr>
+    <tr><td>Goodput + $/MTok report</td><td><code>forge.inference.bench</code></td><td>Benchmarking</td><td>Volume 12 loadgen</td></tr>
+  </tbody>
+</table>
+
+<h2>Important Architecture</h2>
+<div class="arch">
+  <div class="arch-layer" data-label="Admission">
+    <div class="node gateway">Token / KV admission</div><div class="node guard">Tenant fair-share</div>
+  </div>
+  <div class="arch-layer" data-label="Scheduler">
+    <div class="node gpu">Continuous batch loop</div><div class="node gpu">Chunked prefill budget</div>
+  </div>
+  <div class="arch-layer" data-label="Memory">
+    <div class="node store">Paged KV pool</div><div class="node store">Prefix / radix cache</div>
+  </div>
+  <div class="arch-layer" data-label="Compute">
+    <div class="node model">Quantised weights</div><div class="node model">Fused attention</div><div class="node model">Speculative draft</div>
+  </div>
+  <div class="arch-layer" data-label="Observe">
+    <div class="node obs">TTFT / TPOT / goodput</div><div class="node obs">$/MTok</div><div class="node eval">Quality probes</div>
+  </div>
+</div>
+
+<h2>Failure Modes</h2>
+<ul class="failure-modes">
+  <li>Decode-bound chat sized from peak TFLOPs.</li>
+  <li>Contiguous KV reservations that look fine at mean length and OOM at p99.</li>
+  <li>Unlimited prefill admission starving decode TPOT.</li>
+  <li>Per-tensor INT8 on outlier-heavy activations.</li>
+  <li>Speculative decoding without residual resampling (biased text).</li>
+  <li>TP degree so high that collectives dominate TPOT.</li>
+  <li>CPU deployments sold on GPU-class latency promises.</li>
+  <li>Throughput leaderboards without SLO-constrained goodput.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<ul>
+  <li>Every optimisation is a change to the model's output distribution or to its latency distribution, so gate it on both. Run the Volume 10 quality suite (golden set, task success, judge win-rate against the unoptimised baseline) before and after, and report the paired difference with a bootstrap interval, not a single score.</li>
+  <li>Exactness checks come first: the KV-cached generator must match naive greedy decoding token for token; paged KV must match contiguous KV; speculative decoding must match the target model's sampling distribution (test with a chi-squared check over many seeds, Chapter 7).</li>
+  <li>Lossy optimisations (INT8, INT4, FP8, KV quantisation, eviction) need a non-inferiority margin agreed in advance: for example perplexity within 1% and task success no more than 1 point below FP16, measured on long-context and code slices as well as the average, because quantisation damage concentrates in the tails.</li>
+  <li>Performance is evaluated as goodput under SLO at a stated workload mix (Chapter 11): TTFT and TPOT percentiles, requests per second meeting both, and $/MTok at that load. Always publish the workload, hardware, engine version and batch policy with the number.</li>
+  <li>Keep a regression benchmark in CI at Tier L (tiny model, fixed prompts, fixed seed) that fails when tokens/s drops or output tokens change unexpectedly; run the Tier G benchmark on every engine or kernel upgrade.</li>
+</ul>
+
+<h2>Practical Project</h2>
+<div class="frame exercise" data-title="Forge inference engine">
+  <p><strong>Forge inference engine.</strong> Serve Volume 4 / 8 checkpoints with a real engine path:</p>
+  <ol>
+    <li>Implement <code>forge.inference</code>: KV cache, paged allocator, continuous-batching scheduler, INT8 (or INT4 weight-only) path, and optional speculative decoding with exact acceptance.</li>
+    <li>Expose a generate API that streams tokens and reports per-request TTFT/TPOT.</li>
+    <li>Build <code>forge.inference.bench</code> against a fixed ShareGPT-like mix and a long-prompt RAG mix.</li>
+    <li>Tier L: compare against Hugging Face <code>generate</code> on CPU/small GPU for correctness and relative speed-ups from KV + batching + quant.</li>
+    <li>Tier G: compare goodput and $/MTok against vLLM on the same GPU; write a short report with p50/p95 curves and one ablation per optimisation.</li>
+  </ol>
+</div>
+
+<h2>Exercises</h2>
+<ol>
+  <li>Derive decode arithmetic intensity including KV reads for GQA with group size <span class="math">g</span>.</li>
+  <li>Add copy-on-write block sharing to <code>PagedKV</code> for speculative branches; measure peak blocks versus naive cloning.</li>
+  <li>Simulate Sarathi-style stall-free scheduling: maximise decode tokens/step subject to a prefill chunk cap.</li>
+  <li>Calibrate SmoothQuant <span class="math">\alpha</span> on one domain and evaluate perplexity on another; plot the mismatch.</li>
+  <li>Prove that the Leviathan acceptance rule leaves the marginal distribution equal to <span class="math">p</span> for <span class="math">k=1</span>, then extend to <span class="math">k&gt;1</span>.</li>
+  <li>Port the FlashAttention NumPy reference to Triton at Tier G; verify against <code>torch.nn.functional.scaled_dot_product_attention</code>.</li>
+  <li>Model DistServe KV transfer time versus saved decode interference for your traffic mix; find the break-even interconnect bandwidth.</li>
+  <li>Export a tiny model to ONNX and GGUF; compare tok/s and quality probes at Q4 versus FP16.</li>
+</ol>
+
+<h2>Research Papers</h2>
+<table>
+  <caption>Core papers for this volume.</caption>
+  <thead><tr><th>Paper</th><th>Why it matters here</th></tr></thead>
+  <tbody>
+    <tr><td>Pope et al., 2022. <em>Efficiently Scaling Transformer Inference</em></td><td>Prefill/decode cost model and multi-dimensional partitioning (Ch. 1, 9).</td></tr>
+    <tr><td>Yu et al., 2022. <em>Orca: A Distributed Serving System for Transformer-Based Generative Models</em>. OSDI</td><td>Iteration-level (continuous) batching (Ch. 4).</td></tr>
+    <tr><td>Kwon et al., 2023. <em>Efficient Memory Management for Large Language Model Serving with PagedAttention</em>. SOSP</td><td>vLLM block tables and high-throughput serving (Ch. 3–4).</td></tr>
+    <tr><td>Agrawal et al., 2024. <em>Sarathi-Serve</em> / chunked prefill line of work</td><td>Stall-free scheduling mixing prefill chunks with decode (Ch. 4).</td></tr>
+    <tr><td>Zhong et al., 2024. <em>DistServe</em>; Patel et al., 2023. <em>Splitwise</em></td><td>Disaggregated prefill and decode (Ch. 9).</td></tr>
+    <tr><td>Dettmers et al., 2022. <em>LLM.int8()</em>; Xiao et al., 2022. <em>SmoothQuant</em></td><td>Outlier-aware INT8 (Ch. 5–6).</td></tr>
+    <tr><td>Frantar et al., 2022. <em>GPTQ</em>; Lin et al., 2023. <em>AWQ</em></td><td>Post-training INT4 weight quantisation (Ch. 6).</td></tr>
+    <tr><td>Leviathan et al., 2022; Chen et al., 2023</td><td>Speculative decoding with exact sampling (Ch. 7).</td></tr>
+    <tr><td>Cai et al., 2024. <em>Medusa</em>; Li et al., 2024. <em>EAGLE</em></td><td>Head- and feature-level drafting (Ch. 7).</td></tr>
+    <tr><td>Dao et al., 2022. <em>FlashAttention</em>; Dao 2023; Shah et al., 2024</td><td>IO-aware exact attention (Ch. 8).</td></tr>
+    <tr><td>Zheng et al., 2023. <em>SGLang</em></td><td>Radix attention / prefix caching (Ch. 3).</td></tr>
+  </tbody>
+</table>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Efficient Memory Management for Large Language Model Serving with PagedAttention</span>
+    <span class="paper-meta">Kwon et al., 2023 · SOSP (vLLM)</span></div>
+  <dl>
+    <dt>Problem</dt><dd>KV cache fragmentation under continuous batching capped concurrency and wasted HBM.</dd>
+    <dt>Previous limitation</dt><dd>Contiguous per-sequence reservations over-allocated for max length.</dd>
+    <dt>Approach</dt><dd>OS-inspired paging: fixed KV blocks, per-sequence block tables, on-demand allocation.</dd>
+    <dt>Contribution</dt><dd>Near-zero KV waste; large throughput gains in the vLLM serving system.</dd>
+    <dt>Practical impact</dt><dd>Paged KV became the default memory design for LLM engines.</dd>
+    <dt>Limitations</dt><dd>Kernel complexity; prefix sharing and hierarchical caching developed further in follow-on systems.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Orca: A Distributed Serving System for Transformer-Based Generative Models</span>
+    <span class="paper-meta">Yu et al., 2022 · OSDI</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Request-level batching left GPUs idle when sequences finished at different times.</dd>
+    <dt>Previous limitation</dt><dd>Static or whole-request batches coupled sequence lifetimes.</dd>
+    <dt>Approach</dt><dd>Iteration-level scheduling: enter/leave the batch between decode steps.</dd>
+    <dt>Contribution</dt><dd>Continuous batching as the serving primitive for autoregressive models.</dd>
+    <dt>Practical impact</dt><dd>Basis for high-utilisation LLM servers; combined later with paged KV.</dd>
+    <dt>Limitations</dt><dd>Does not alone solve long-prefill interference (chunked prefill follows).</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</span>
+    <span class="paper-meta">Dao et al., 2022 · NeurIPS</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Naive attention is bottlenecked by HBM reads/writes of the <span class="math">S \times S</span> matrix.</dd>
+    <dt>Previous limitation</dt><dd>Approximate attention traded quality; exact attention was IO-bound.</dd>
+    <dt>Approach</dt><dd>Tiling + online softmax in SRAM; exact outputs with far less HBM traffic.</dd>
+    <dt>Contribution</dt><dd>Large wall-clock speed-ups and lower memory for long sequences.</dd>
+    <dt>Practical impact</dt><dd>Default attention backend in training and many inference stacks (FA2/FA3 follow).</dd>
+    <dt>Limitations</dt><dd>Hardware-specific tuning; serving still needs paging and batching around it.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</span>
+    <span class="paper-meta">Frantar et al., 2022</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Fit large generative models into fewer bits without full QAT.</dd>
+    <dt>Previous limitation</dt><dd>Round-to-nearest INT4 hurt perplexity; older PTQ methods lagged on LLMs.</dd>
+    <dt>Approach</dt><dd>Layer-wise quantisation with Hessian-guided compensation on calibration data.</dd>
+    <dt>Contribution</dt><dd>Strong INT4 weight-only quality for LLMs at practical calib cost.</dd>
+    <dt>Practical impact</dt><dd>Widely deployed weight format family (with AWQ and GGUF variants).</dd>
+    <dt>Limitations</dt><dd>Calibration domain shift; activation quant still hard without other tricks.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration</span>
+    <span class="paper-meta">Lin et al., 2023</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Which weights matter most under real activations when quantising to 4 bits?</dd>
+    <dt>Previous limitation</dt><dd>Uniform treatment of channels; GPTQ-style optimisation is heavier.</dd>
+    <dt>Approach</dt><dd>Protect salient channels by activation magnitude via per-channel scaling, then quantise.</dd>
+    <dt>Contribution</dt><dd>Simple, strong W4A16 recipe with excellent hardware friendliness.</dd>
+    <dt>Practical impact</dt><dd>Popular inference format in open serving and on-device stacks.</dd>
+    <dt>Limitations</dt><dd>Still weight-only unless combined with activation methods; needs calib set.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Fast Inference from Transformers via Speculative Decoding</span>
+    <span class="paper-meta">Leviathan et al., 2022</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Memory-bound decode emits one token per expensive target forward.</dd>
+    <dt>Previous limitation</dt><dd>Faster approximations changed the output distribution.</dd>
+    <dt>Approach</dt><dd>Draft tokens from a small model; verify in parallel with exact acceptance sampling.</dd>
+    <dt>Contribution</dt><dd>Lossless speed-ups when draft ≈ target; clean probabilistic guarantee.</dd>
+    <dt>Practical impact</dt><dd>Production feature in major engines; spawned Medusa/EAGLE variants.</dd>
+    <dt>Limitations</dt><dd>Poor draft match can slow down; extra memory for draft model or heads.</dd>
+  </dl>
+</section>
+
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">DistServe: Disaggregating Prefill and Decoding for Goodput-Optimized Large Language Model Serving</span>
+    <span class="paper-meta">Zhong et al., 2024</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Colocated prefill and decode interfere; one GPU pool cannot hit both TTFT and TPOT SLOs easily.</dd>
+    <dt>Previous limitation</dt><dd>Unified replicas forced a latency compromise under mixed traffic.</dd>
+    <dt>Approach</dt><dd>Disaggregate phases onto pools sized for their bottlenecks; transfer KV.</dd>
+    <dt>Contribution</dt><dd>Higher goodput under dual SLOs versus colocated baselines.</dd>
+    <dt>Practical impact</dt><dd>Template for modern disaggregated serving designs (with Splitwise and follow-ons).</dd>
+    <dt>Limitations</dt><dd>Needs fast KV interconnect; operational complexity.</dd>
+  </dl>
+</section>
+
+<p>Also read: Xiao et al. 2022 (SmoothQuant); Dettmers &amp; Zettlemoyer 2022 (4-bit); Zhang et al. 2023 (H2O); Chen et al. 2023 (speculative decoding systems); Shah et al. 2024 (FlashAttention-3); Pope et al. 2022 (inference scaling); Zheng et al. 2023 (SGLang radix attention).</p>
+
+<h2>Interview Questions</h2>
+<ol>
+  <li>Why is decode usually memory-bound at batch 1? What raises arithmetic intensity?</li>
+  <li>Write the KV memory formula and estimate concurrency on an 80&nbsp;GB GPU for a 70B FP16 model at 8k context with GQA.</li>
+  <li>How does PagedAttention eliminate internal fragmentation? What is a block table?</li>
+  <li>Explain continuous batching versus dynamic request-level batching.</li>
+  <li>Why does chunked prefill improve interactive TPOT under long prompts?</li>
+  <li>Symmetric vs asymmetric quantisation; when do you need a zero-point?</li>
+  <li>Compare LLM.int8, SmoothQuant, GPTQ and AWQ in one sentence each.</li>
+  <li>Prove or sketch why speculative acceptance sampling is distribution-preserving.</li>
+  <li>What does online softmax enable in FlashAttention?</li>
+  <li>When would you disaggregate prefill and decode? When would you not?</li>
+  <li>When is llama.cpp on CPU the right production choice?</li>
+  <li>Define goodput. Why can two engines with equal tokens/s differ in capacity?</li>
+  <li>How do you turn a latency–throughput curve into $/MTok for a capacity plan?</li>
+</ol>
+
+<h2>Next Volume</h2>
+<p>Volume 12, Model Serving and Deployment, takes the engine properties built here — paged KV,
+continuous batching, quantisation, speculation — and wraps them in APIs, containers, Kubernetes,
+LLM-aware load balancing, release controls and reliability. Inference optimisation makes a GPU fast;
+serving makes that speed a product.</p>
+<p class="facet">Prerequisites from this volume</p>
+<ul>
+  <li>TTFT / TPOT / goodput vocabulary and the prefill–decode split (Chapters 1, 11).</li>
+  <li>Paged KV and continuous batching as engine internals (Chapters 3–4).</li>
+  <li>Cost per million tokens at realistic utilisation (Chapter 11).</li>
+</ul>
+</section>
+
+</body>
+</html>

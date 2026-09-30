@@ -1,0 +1,1849 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Volume 5 · LLM Data Engineering</title>
+<meta name="volume" content="Volume 5 · LLM Data Engineering">
+<link rel="stylesheet" href="../vendor/katex/katex.min.css">
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+
+<section class="title-page">
+  <p class="tp-series">AI Engineering: From First Principles to Production</p>
+  <p class="tp-number">Volume 5</p>
+  <h1 class="no-toc">LLM Data Engineering</h1>
+  <p class="tp-subtitle">Collection, Cleaning, Deduplication, Mixtures and Contamination</p>
+</section>
+
+<nav class="toc"></nav>
+
+<section class="intro">
+<h1>About This Volume</h1>
+
+<p class="facet">Objective</p>
+<ul>
+  <li>Build an LLM data pipeline that turns raw web and document data into versioned, deduplicated, filtered, PII-scrubbed training mixtures.</li>
+  <li>Understand why each stage exists, what it removes, what it wrongly removes, and how to measure both.</li>
+  <li>Implement every core algorithm from scratch: extraction, heuristic filters, perplexity and classifier filters, MinHash + LSH, PII validators, mixture sampling, contamination checks and content-addressed manifests.</li>
+  <li>Learn how the published open pipelines (C4, The Pile, RefinedWeb, Dolma, FineWeb, DCLM) made their choices, and where those choices are still contested.</li>
+</ul>
+
+<p class="facet">What this volume assumes</p>
+<ul>
+  <li>Volumes 3 and 4: tokenisation, the pretraining objective and training dynamics.</li>
+  <li>Strong database knowledge. Hashing, partitioning, joins, shuffles, idempotent batch jobs and bloom filters are used without explanation. The mapping to data-engineering ideas you already know is made explicit where it helps.</li>
+</ul>
+
+<p class="facet">How to read the code</p>
+<ul>
+  <li>Every listing is standard-library Python 3.12 and runs on small in-memory fixture corpora. Nothing is downloaded.</li>
+  <li>Printed output is real. Numbers from toy fixtures illustrate mechanisms; they are <strong>not</strong> estimates of real-corpus behaviour.</li>
+  <li>The listings together form the <code>forge.data</code> package: <code>extract</code>, <code>heuristics</code>, <code>quality</code>, <code>minhash</code>, <code>pii</code>, <code>mixture</code>, <code>contamination</code>, <code>manifest</code>.</li>
+  <li>Chapter listings are pedagogical; the continuous package path is <code>src/forge/data/</code>.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">Chapter 1   Data as the lever       why data dominates at fixed compute
+Chapter 2   Collection              WARC/WET, robots.txt, provenance
+Chapter 3   Extraction              HTML -> text, boilerplate, language ID, Unicode
+Chapter 4   Heuristic filtering     Gopher/C4 rules and why each exists
+Chapter 5   Model-based filtering   perplexity, classifiers, LLM-annotated labels
+Chapter 6   Deduplication           exact, MinHash + LSH, suffix arrays
+Chapter 7   PII and safety          regex + checksums, redaction vs removal
+Chapter 8   Mixtures                temperature weights, epochs, DoReMi
+Chapter 9   Synthetic data          generation, verification, model collapse
+Chapter 10  Contamination           n-gram overlap, canaries, reporting
+Chapter 11  Versioning and cards    manifests, lineage, datasheets, cost</pre>
+<figcaption>Map of Volume 5.</figcaption>
+</figure>
+
+<pre class="mermaid">flowchart TD
+  A[Common Crawl WARC / APIs / documents / code] --> B[Extraction and normalisation]
+  B --> C[Language ID]
+  C --> D[Heuristic filters]
+  D --> E[Exact and near dedup]
+  E --> F[Model-based quality filter]
+  F --> G[PII and safety filtering]
+  G --> H[Decontamination vs benchmarks]
+  H --> I[Tokenise and shard]
+  I --> J[Mixture sampler]
+  J --> K[Training run]
+  I --> L[(Manifest + lineage + data card)]</pre>
+</section>
+
+<!-- ================================================================ CHAPTER 1 -->
+<section class="chapter">
+<h2 id="lever">Data as the Primary Lever</h2>
+<p class="chapter-lede">At a fixed compute budget, the single largest controllable variable in a
+pretraining run is the data. Architecture changes move benchmark numbers by small amounts; data
+curation choices routinely move them by more. This chapter frames data work as an engineering
+discipline with measurable outputs, not a pre-processing chore.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>You have a fixed GPU budget that buys roughly <span class="math">C \approx 6ND</span> FLOPs.
+  Model size <span class="math">N</span> and tokens <span class="math">D</span> trade off, but every
+  token you train on costs the same whether it is a well-written textbook paragraph or a cookie
+  banner. The question is not "how much data can we get" but "which <span class="math">D</span>
+  tokens give the lowest loss on the capabilities we care about".</p>
+</div>
+
+<p class="facet">Why data dominates at fixed compute</p>
+<ul>
+  <li><strong>Every token has the same price.</strong> Junk tokens do not merely fail to help; they displace useful tokens from a fixed budget.</li>
+  <li><strong>Web text is mostly junk.</strong> Navigation, boilerplate, spam, machine-generated pages and duplicates make up the majority of raw crawl bytes.</li>
+  <li><strong>Duplicates distort the objective.</strong> Repeated text is effectively upweighted, increases memorisation and wastes compute (Chapter 6).</li>
+  <li><strong>Evidence from open pipelines.</strong> RefinedWeb, FineWeb and DCLM each reported that models trained on their curated web data matched or beat models trained on less-filtered data of the same size <span class="evidence documented">Documented</span> (Penedo et al. 2023; Penedo et al. 2024; Li et al. 2024).</li>
+  <li><strong>The web is finite.</strong> Estimates of the stock of high-quality public text suggest frontier runs are approaching it (Villalobos et al., approximate). Better filters and repetition policies matter more as the supply tightens.</li>
+</ul>
+
+<h3>How Much Raw Data Do You Need?</h3>
+<p>The filtering funnel means raw crawl volume must be an order of magnitude or more above the
+training budget. The survival rates below are <em>illustrative assumptions</em>; measure your own.</p>
+<figure class="listing">
+<figcaption>Token budget from a filtering funnel (illustrative survival rates). (<code>budget.py</code>)</figcaption>
+<pre><code># Token budget: how much raw crawl is needed to train a model compute-optimally.
+params = [1e9, 8e9, 70e9]
+TOK_PER_PARAM = 20            # Chinchilla-style heuristic (approximate)
+# Survival rates per stage: illustrative assumptions, not measured values
+stages = [("extraction + lang-id (English)", 0.45), ("heuristic filters", 0.55),
+          ("dedup (exact + near)", 0.60), ("model-based quality", 0.30)]
+keep = 1.0
+for name, r in stages:
+    keep *= r
+    print(f"{name:32s} keep {r:.2f}  cumulative {keep:.4f}")
+for n in params:
+    need = TOK_PER_PARAM * n
+    raw = need / keep
+    print(f"N={n/1e9:&gt;4.0f}B  optimal tokens={need/1e12:5.2f}T  "
+          f"raw tokens needed={raw/1e12:6.1f}T")</code></pre>
+</figure>
+<pre class="output">extraction + lang-id (English)   keep 0.45  cumulative 0.4500
+heuristic filters                keep 0.55  cumulative 0.2475
+dedup (exact + near)             keep 0.60  cumulative 0.1485
+model-based quality              keep 0.30  cumulative 0.0446
+N=   1B  optimal tokens= 0.02T  raw tokens needed=   0.4T
+N=   8B  optimal tokens= 0.16T  raw tokens needed=   3.6T
+N=  70B  optimal tokens= 1.40T  raw tokens needed=  31.4T</pre>
+
+<aside class="callout core"><span class="title">Key Idea</span>
+  <ul>
+    <li>Pipelines are funnels: multiplying survival rates quickly gives single-digit percentage yields.</li>
+    <li>A stage that removes "only" 10% more on a 30T-token crawl is a 3T-token decision. Every threshold is a budget decision.</li>
+    <li>Treat each stage like a query plan operator: know its selectivity, cost and error rate.</li>
+  </ul>
+</aside>
+
+<h3>The Data Flywheel</h3>
+<ul>
+  <li><strong>Pretraining:</strong> filter and mix web-scale corpora. Feedback comes from small-scale ablation runs.</li>
+  <li><strong>Post-training:</strong> instruction, preference and tool-use data. Feedback comes from evaluations and production traffic.</li>
+  <li><strong>Production:</strong> user interactions, failures and ratings flow back (with consent and PII controls) into evaluation sets and fine-tuning data.</li>
+  <li>The flywheel only turns if every artefact is versioned and every model is traceable to exact data versions (Chapter 11).</li>
+</ul>
+
+<h3>Ablations: How Data Decisions Are Evaluated</h3>
+<ul>
+  <li>Train small proxy models (hundreds of millions to a few billion parameters) on each data variant with identical token budgets.</li>
+  <li>Evaluate on benchmarks that give signal early in training (FineWeb and DCLM both used suites chosen for low variance at small scale) <span class="evidence documented">Documented</span>.</li>
+  <li>Use several seeds or at least report seed variance; many filter differences are within noise at small scale.</li>
+  <li>Risk: rankings at small scale do not always transfer to large scale. DCLM studied this explicitly and found reasonable but imperfect transfer <span class="evidence documented">Documented</span> (Li et al. 2024).</li>
+</ul>
+
+<h3>Legal and Licensing Landscape</h3>
+<table>
+  <caption>Data sources and the questions each raises. This is engineering orientation, not legal advice.</caption>
+  <thead><tr><th>Source</th><th>Typical terms</th><th>Engineering controls</th></tr></thead>
+  <tbody>
+    <tr><td>Public web crawl</td><td>Copyright unresolved in several jurisdictions; TDM exceptions differ (EU opt-out regime vs US fair use litigation)</td><td>Honour robots.txt and opt-out signals; keep URL and crawl date for takedown</td></tr>
+    <tr><td>Code repositories</td><td>Per-repo licences (permissive, copyleft, none)</td><td>Licence detection per file; filter by allow-list; keep attribution metadata</td></tr>
+    <tr><td>Licensed corpora</td><td>Contract terms: use, retention, derivative models</td><td>Tag every shard with licence ID; enforce in the mixture sampler</td></tr>
+    <tr><td>User data</td><td>Privacy law (GDPR, CCPA), product terms, consent</td><td>Consent flags, PII scrubbing, deletion propagation</td></tr>
+    <tr><td>Synthetic data</td><td>Generator model terms may restrict training competitors</td><td>Record generator model and version in lineage</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout warning"><span class="title">Right to erasure</span>
+  <ul>
+    <li>Deletion requests must propagate from raw storage through every derived shard. Without document-level lineage (Chapter 11) this becomes a full-corpus rescan.</li>
+    <li>Removing data from a trained model is far harder than removing it from a dataset. Prevention (filtering before training) is much cheaper than unlearning.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 2 -->
+<section class="chapter">
+<h2 id="collection">Collection</h2>
+<p class="chapter-lede">Collection decides what the model can ever know. It is also where provenance is
+either captured or lost for good.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>You need trillions of tokens from heterogeneous sources, each with different formats, licences and
+  update cadences. Later stages must be able to answer "where did this token come from, when, and were we
+  allowed to use it?" for any document, years later.</p>
+</div>
+
+<h3>Common Crawl</h3>
+<ul>
+  <li>A non-profit crawl released roughly monthly since 2008-era; each crawl covers billions of pages (approximate; varies by crawl).</li>
+  <li>Three formats per crawl:
+    <ul>
+      <li><strong>WARC</strong>: raw HTTP request/response records including HTML. Largest; needed if you want your own extraction.</li>
+      <li><strong>WAT</strong>: JSON metadata (headers, links) computed from WARC.</li>
+      <li><strong>WET</strong>: plain text extracted by Common Crawl. Cheap, but the extraction keeps boilerplate and loses structure.</li>
+    </ul>
+  </li>
+  <li>RefinedWeb and FineWeb extracted from WARC with <code>trafilatura</code> rather than using WET, reporting better downstream results <span class="evidence documented">Documented</span> (Penedo et al. 2023, 2024). C4 used WET.</li>
+  <li>Files are gzip members concatenated per record, so they can be read in streaming fashion and split by byte offset; this is what makes them easy to shard across workers.</li>
+</ul>
+
+<table>
+  <caption>Collection sources compared.</caption>
+  <thead><tr><th>Source</th><th>Strength</th><th>Weakness</th></tr></thead>
+  <tbody>
+    <tr><td>Common Crawl WARC</td><td>Scale, diversity, free</td><td>Mostly low quality; heavy processing cost</td></tr>
+    <tr><td>Own crawler</td><td>Freshness, control of domains</td><td>Operational cost, politeness, legal exposure</td></tr>
+    <tr><td>APIs and dumps (Wikipedia, arXiv, Stack Exchange)</td><td>Clean structure, clear licences</td><td>Small; rate limits; formats differ (LaTeX, wikitext)</td></tr>
+    <tr><td>Documents (PDF, DOCX)</td><td>High-value long-form text</td><td>Extraction is lossy: columns, tables, equations</td></tr>
+    <tr><td>Code (The Stack, own repos)</td><td>Reasoning and tool-use gains</td><td>Licences, secrets, generated and vendored files</td></tr>
+  </tbody>
+</table>
+
+<h3>Reading WET Records and Recording Provenance</h3>
+<p>A minimal WARC reader over an in-memory fixture. The same loop, with gzip decompression and S3 range
+reads, is what a production worker runs.</p>
+<figure class="listing">
+<figcaption>Reading WET-style records, applying robots.txt and recording provenance. (<code>collect.py</code>)</figcaption>
+<pre><code># Parse a WET-style record stream and check robots.txt, keeping provenance.
+import io, hashlib
+from urllib.robotparser import RobotFileParser
+
+WET = b"""WARC/1.0\r
+WARC-Type: conversion\r
+WARC-Target-URI: https://example.org/blog/post-1\r
+WARC-Date: 2024-03-01T10:00:00Z\r
+WARC-Record-ID: &lt;urn:uuid:0001&gt;\r
+Content-Type: text/plain\r
+Content-Length: 44\r
+\r
+Data pipelines decide what the model knows.\n\r
+\r
+WARC/1.0\r
+WARC-Type: conversion\r
+WARC-Target-URI: https://shop.example.com/private/cart\r
+WARC-Date: 2024-03-01T10:00:05Z\r
+WARC-Record-ID: &lt;urn:uuid:0002&gt;\r
+Content-Type: text/plain\r
+Content-Length: 19\r
+\r
+Your cart is empty\n\r
+\r
+"""
+
+def read_records(stream):
+    while True:
+        line = stream.readline()
+        if not line:
+            return
+        if not line.startswith(b"WARC/"):
+            continue
+        headers = {}
+        while (line := stream.readline().rstrip(b"\r\n")):
+            k, v = line.decode().split(": ", 1)
+            headers[k] = v
+        body = stream.read(int(headers["Content-Length"]))
+        yield headers, body.decode("utf-8", errors="replace")
+
+robots = RobotFileParser()
+robots.parse(["User-agent: *", "Disallow: /private/"])
+
+for h, text in read_records(io.BytesIO(WET)):
+    url = h["WARC-Target-URI"]
+    allowed = robots.can_fetch("forge-bot", url)
+    prov = {"url": url, "fetched": h["WARC-Date"], "record": h["WARC-Record-ID"],
+            "sha256": hashlib.sha256(text.encode()).hexdigest()[:12],
+            "robots_ok": allowed}
+    print(prov, "|", text.strip())</code></pre>
+</figure>
+<pre class="output">{'url': 'https://example.org/blog/post-1', 'fetched': '2024-03-01T10:00:00Z', 'record': '&lt;urn:uuid:0001&gt;', 'sha256': 'd2ac54c1ba9e', 'robots_ok': True} | Data pipelines decide what the model knows.
+{'url': 'https://shop.example.com/private/cart', 'fetched': '2024-03-01T10:00:05Z', 'record': '&lt;urn:uuid:0002&gt;', 'sha256': 'd72aa6e72fc9', 'robots_ok': False} | Your cart is empty</pre>
+
+<ul>
+  <li><strong>Provenance fields to keep per document:</strong> URL, crawl ID, fetch timestamp, WARC record ID, WARC file and byte offset, content hash, robots decision, licence tag.</li>
+  <li><strong>Why the offset matters:</strong> it lets you re-extract a single document with a new extractor without re-reading the whole crawl.</li>
+</ul>
+
+<h3>robots.txt, Terms and Opt-Out</h3>
+<ul>
+  <li>robots.txt is advisory but it is the most widely recognised opt-out signal. Check it <em>at crawl time</em> and record the decision; the file can change later.</li>
+  <li>AI-specific user agents (for example crawler names used for training) let site owners block training while allowing search. Your crawler must identify itself honestly.</li>
+  <li>Common Crawl honours robots.txt for its own crawler, but its data predates later changes to a site's policy. Some pipelines re-apply current opt-outs at processing time <span class="evidence inferred">Inferred</span>.</li>
+  <li>Terms of service may prohibit scraping even where robots.txt allows it. Keep a domain-level policy table and join against it.</li>
+</ul>
+
+<aside class="callout security"><span class="title">Collection is an attack surface</span>
+  <ul>
+    <li><strong>Split-view poisoning:</strong> datasets distributed as URL lists (for example image–text sets) can be poisoned by buying expired domains so the content at download time differs from curation time. Mitigate with content hashes recorded at curation (Carlini et al. 2024).</li>
+    <li><strong>Front-running poisoning:</strong> if an attacker knows when a snapshot (for example of Wikipedia) is taken, a malicious edit only has to survive until the snapshot.</li>
+    <li>Treat any source an adversary can write to as untrusted input. Chapter 6 and Chapter 11 return to this.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 3 -->
+<section class="chapter">
+<h2 id="extraction">Extraction and Normalisation</h2>
+<p class="chapter-lede">Extraction turns bytes into the text the tokeniser sees. Errors here are
+invisible to every later stage: a filter cannot remove boilerplate it cannot distinguish from content,
+and a tokeniser cannot recover a paragraph the extractor dropped.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>A typical HTML page is mostly navigation, scripts, ads, cookie banners and footers. The main content
+  may be a few hundred words inside several kilobytes of markup. You need the main content, in reading
+  order, with paragraph structure, in a single canonical Unicode form, labelled with its language.</p>
+</div>
+
+<p class="facet">Possible solutions</p>
+<ul>
+  <li><strong>Tag stripping</strong>: fast, keeps all boilerplate. Does not solve main-content detection.</li>
+  <li><strong>Block heuristics</strong> (text density, link density, stop-word ratio; jusText, boilerpipe, trafilatura): good default. Does not handle unusual layouts or JavaScript-rendered pages.</li>
+  <li><strong>DOM / visual models</strong>: best quality on hard pages. Too expensive for billions of pages.</li>
+  <li><strong>Common Crawl WET</strong>: free, but keeps menus and footers, so later filters must work harder.</li>
+</ul>
+
+<h3>How Block-Based Extraction Works</h3>
+<ul>
+  <li>Parse the DOM; drop subtrees that are almost never content (<code>script</code>, <code>style</code>, <code>nav</code>, <code>footer</code>, <code>form</code>).</li>
+  <li>Split the rest into blocks at block-level tags.</li>
+  <li>Score each block: word count, link density (characters inside anchors ÷ block characters), stop-word density, keyword patterns ("cookie", "all rights reserved").</li>
+  <li>Keep blocks that look like prose. Production extractors also use context: a short block between two content blocks is probably content.</li>
+</ul>
+
+<div class="math">\text{link\_density}(B) = \frac{\sum_{a \in \text{anchors}(B)} |a|}{|B|}</div>
+
+<h3>Implementation: Extractor, Normaliser, Language ID</h3>
+<figure class="listing">
+<figcaption>HTML extraction with boilerplate removal, NFKC normalisation and language ID. (<code>extract.py</code>)</figcaption>
+<pre><code># HTML -&gt; text with boilerplate removal, Unicode normalisation and language ID.
+import re, unicodedata
+from html.parser import HTMLParser
+
+SKIP = {"script", "style", "noscript", "nav", "footer", "header", "aside", "form"}
+BLOCK = {"p", "div", "li", "h1", "h2", "h3", "h4", "article", "section", "br", "tr"}
+
+class Extractor(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.depth_skip, self.blocks, self.buf = 0, [], []
+        self.link_chars = 0
+        self.in_a = False
+    def handle_starttag(self, tag, attrs):
+        if tag in SKIP:
+            self.depth_skip += 1
+        if tag in BLOCK:
+            self.flush()
+        if tag == "a":
+            self.in_a = True
+    def handle_endtag(self, tag):
+        if tag in SKIP and self.depth_skip:
+            self.depth_skip -= 1
+        if tag in BLOCK:
+            self.flush()
+        if tag == "a":
+            self.in_a = False
+    def handle_data(self, data):
+        if self.depth_skip:
+            return
+        self.buf.append(data)
+        if self.in_a:
+            self.link_chars += len(data.strip())
+    def flush(self):
+        text = " ".join("".join(self.buf).split())
+        if text:
+            self.blocks.append((text, self.link_chars))
+        self.buf, self.link_chars = [], 0
+
+def is_boilerplate(text, link_chars):
+    words = text.split()
+    link_density = link_chars / max(1, len(text))
+    return (len(words) &lt; 5 or link_density &gt; 0.5
+            or re.search(r"(?i)cookie|all rights reserved|subscribe", text) is not None)
+
+def normalise(text):
+    text = unicodedata.normalize("NFKC", text)           # fold compat forms
+    text = re.sub(r"[​-‍﻿]", "", text)    # zero-width chars
+    text = "".join(c for c in text if unicodedata.category(c) != "Cc" or c == "\n")
+    return text
+
+STOP = {"en": {"the", "and", "of", "to", "is", "in", "that", "it"},
+        "de": {"der", "die", "und", "das", "ist", "nicht", "zu", "ein"},
+        "fr": {"le", "la", "et", "les", "des", "est", "une", "pas"}}
+
+def lang_id(text):
+    toks = re.findall(r"\w+", text.lower())
+    scores = {l: sum(t in s for t in toks) / max(1, len(toks)) for l, s in STOP.items()}
+    best = max(scores, key=scores.get)
+    return (best, round(scores[best], 2)) if scores[best] &gt;= 0.05 else ("unk", 0.0)
+
+def extract(html):
+    p = Extractor()
+    p.feed(html)
+    p.flush()
+    kept = [t for t, lc in p.blocks if not is_boilerplate(t, lc)]
+    return normalise("\n".join(kept))
+
+PAGE = """&lt;html&gt;&lt;head&gt;&lt;style&gt;body{}&lt;/style&gt;&lt;script&gt;track()&lt;/script&gt;&lt;/head&gt;&lt;body&gt;
+&lt;nav&gt;&lt;a href=/&gt;Home&lt;/a&gt; &lt;a href=/a&gt;About&lt;/a&gt; &lt;a href=/b&gt;Blog&lt;/a&gt;&lt;/nav&gt;
+&lt;article&gt;&lt;h1&gt;Why ﬁltering matters&lt;/h1&gt;
+&lt;p&gt;The quality of pretraining data is the single largest lever at a fixed
+compute budget, and it is cheaper to fix than the model.&lt;/p&gt;
+&lt;p&gt;Deduplication removes repeated pages that​ otherwise get memorised.&lt;/p&gt;
+&lt;p&gt;&lt;a href=/x&gt;Related post one&lt;/a&gt; &lt;a href=/y&gt;Related post two here&lt;/a&gt;&lt;/p&gt;
+&lt;/article&gt;&lt;div&gt;We use cookies to improve your experience. Accept all?&lt;/div&gt;
+&lt;footer&gt;© 2024 All rights reserved&lt;/footer&gt;&lt;/body&gt;&lt;/html&gt;"""
+
+if __name__ == "__main__":
+    text = extract(PAGE)
+    print(text)
+    print("---")
+    for s in ["The model is trained on the data and it is good.",
+              "Die Daten sind nicht das Problem, und das ist gut.",
+              "Le modèle est entraîné sur les données et la qualité.",
+              "SELECT id FROM t WHERE x = 1;"]:
+        print(lang_id(s), "|", s[:40])
+    print(repr(normalise("ﬁne café ①​")))</code></pre>
+</figure>
+<pre class="output">The quality of pretraining data is the single largest lever at a fixed compute budget, and it is cheaper to fix than the model.
+Deduplication removes repeated pages that otherwise get memorised.
+---
+('en', 0.55) | The model is trained on the data and it 
+('de', 0.6) | Die Daten sind nicht das Problem, und da
+('fr', 0.5) | Le modèle est entraîné sur les données e
+('unk', 0.0) | SELECT id FROM t WHERE x = 1;
+'fine café 1'</pre>
+
+<p class="facet">What the output shows</p>
+<ul>
+  <li>Scripts, navigation, the related-links block (link density above 0.5), the cookie banner and the footer are gone.</li>
+  <li>The zero-width space and the "ﬁ" ligature were normalised: NFKC turned "ﬁ" into "fi" and "①" into "1".</li>
+  <li><strong>A real failure:</strong> the heading "Why filtering matters" was dropped because it has fewer than five words. Production extractors keep headings by tag, not by length.</li>
+  <li>SQL gets "unk" from the stop-word identifier. Code needs its own route, not a language filter.</li>
+</ul>
+
+<h3>Language Identification</h3>
+<ul>
+  <li>Production pipelines use character n-gram classifiers such as fastText <code>lid.176</code> (CCNet, RefinedWeb, FineWeb) or CLD3 <span class="evidence documented">Documented</span>. They are fast (microseconds per document) and cover about 176 languages.</li>
+  <li>The threshold matters. FineWeb kept English documents with fastText score ≥ 0.65; C4 used <code>langdetect</code> with probability ≥ 0.99 <span class="evidence documented">Documented</span>.</li>
+  <li>Failure modes: short texts, code-switching, closely related languages (Bosnian/Croatian/Serbian, Hindi/Urdu in Latin script), and dialects labelled as "low quality" by thresholds tuned on standard varieties.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Bias enters here</span>
+  <ul>
+    <li>A strict language threshold removes dialectal English and code-switched text disproportionately. Measure retention rates per region or dialect on a labelled sample before choosing a threshold.</li>
+  </ul>
+</aside>
+
+<h3>Unicode Normalisation</h3>
+<table>
+  <caption>Normalisation forms.</caption>
+  <thead><tr><th>Form</th><th>What it does</th><th>Use in pipelines</th></tr></thead>
+  <tbody>
+    <tr><td>NFC</td><td>Canonical composition (é as one code point)</td><td>Safe default for stored text; no meaning lost</td></tr>
+    <tr><td>NFD</td><td>Canonical decomposition</td><td>Rarely; accent stripping</td></tr>
+    <tr><td>NFKC</td><td>Compatibility composition: ligatures, full-width, circled digits folded</td><td>Dedup keys and filter features; lossy for maths (<code>x²</code> → <code>x2</code>)</td></tr>
+    <tr><td>NFKD</td><td>Compatibility decomposition</td><td>Search keys</td></tr>
+  </tbody>
+</table>
+<ul>
+  <li>Keep two views: an NFC <em>training text</em> and an aggressively normalised <em>key text</em> (NFKC, case-folded, punctuation stripped) for dedup and filtering.</li>
+  <li>Also fix mojibake (UTF-8 decoded as Latin-1, for example with <code>ftfy</code>), strip control characters and zero-width characters, and canonicalise whitespace.</li>
+  <li>Tokeniser interaction: normalisation must match what the tokeniser was trained on, or rare byte sequences appear only at inference.</li>
+</ul>
+
+<h3>PDF and Document Extraction</h3>
+<ul>
+  <li>PDF stores glyphs at positions, not text in reading order. Two-column layouts, footnotes, headers and tables are the main failure sources.</li>
+  <li>Options, in increasing cost: text-layer extraction (pdfminer, PyMuPDF), layout-aware parsing, OCR, and vision-language models trained to emit Markdown/LaTeX (Nougat-style).</li>
+  <li>Equations are the hardest case; for scientific text, sources with LaTeX (arXiv) beat PDF extraction.</li>
+  <li>Evaluate on a small hand-labelled set with edit distance against gold text, per layout type.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 4 -->
+<section class="chapter">
+<h2 id="heuristics">Heuristic Quality Filtering</h2>
+<p class="chapter-lede">Heuristic filters are cheap, interpretable rules that remove documents which
+are obviously not natural prose. They run before expensive stages and typically remove a large share
+of the extracted web.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>After extraction and language ID you still have spam, keyword-stuffed pages, product listings,
+  tables of numbers, code fragments, auto-generated text and pages dominated by repetition. You need
+  filters that run at hundreds of thousands of documents per core-second and that you can explain to a
+  reviewer rule by rule.</p>
+</div>
+
+<p class="facet">Possible solutions</p>
+<ul>
+  <li><strong>Hand rules</strong> (this chapter): cheap, auditable. Do not capture "is this well written".</li>
+  <li><strong>Perplexity filters</strong>: capture fluency relative to a reference. Bias towards the reference domain.</li>
+  <li><strong>Learned classifiers</strong> (Chapter 5): capture a target notion of quality. Need labels; less auditable.</li>
+</ul>
+
+<h3>Gopher Rules</h3>
+<p>MassiveText (Gopher; Rae et al. 2021) published a set of document-level rules that many later pipelines
+reused, including RefinedWeb, Dolma and FineWeb in modified form <span class="evidence documented">Documented</span>.</p>
+
+<table>
+  <caption>Gopher-style quality rules, as published in Rae et al. (2021). A document failing any rule is removed.</caption>
+  <thead><tr><th>Rule</th><th>Threshold</th><th>Why it exists</th></tr></thead>
+  <tbody>
+    <tr><td>Word count</td><td class="num">50 – 100,000</td><td>Very short pages are fragments; very long ones are dumps or logs</td></tr>
+    <tr><td>Mean word length</td><td class="num">3 – 10 chars</td><td>Outside this range: number tables, URLs, hashes, concatenated tokens</td></tr>
+    <tr><td>Symbol-to-word ratio (<code>#</code>, ellipsis)</td><td class="num">&le; 0.1</td><td>Hashtag spam; truncated snippet lists</td></tr>
+    <tr><td>Lines starting with a bullet</td><td class="num">&le; 90%</td><td>Navigation menus and link lists</td></tr>
+    <tr><td>Lines ending with an ellipsis</td><td class="num">&le; 30%</td><td>Teaser pages and search results</td></tr>
+    <tr><td>Words containing an alphabetic character</td><td class="num">&ge; 80%</td><td>Tables, code, numeric dumps</td></tr>
+    <tr><td>Stop words present (the, be, to, of, and, that, have, with)</td><td class="num">&ge; 2</td><td>Real English prose always contains them; keyword lists do not</td></tr>
+  </tbody>
+</table>
+
+<table>
+  <caption>Gopher repetition rules (Rae et al. 2021). Fractions are of characters unless stated.</caption>
+  <thead><tr><th>Metric</th><th>Remove if above</th></tr></thead>
+  <tbody>
+    <tr><td>Duplicate lines (fraction of lines)</td><td class="num">0.30</td></tr>
+    <tr><td>Duplicate paragraphs (fraction of paragraphs)</td><td class="num">0.30</td></tr>
+    <tr><td>Characters in duplicate lines</td><td class="num">0.20</td></tr>
+    <tr><td>Characters in duplicate paragraphs</td><td class="num">0.20</td></tr>
+    <tr><td>Top 2-gram / 3-gram / 4-gram character fraction</td><td class="num">0.20 / 0.18 / 0.16</td></tr>
+    <tr><td>Duplicate 5- to 10-gram character fraction</td><td class="num">0.15 down to 0.10</td></tr>
+  </tbody>
+</table>
+
+<p>The duplicate n-gram metric for a document with words <span class="math">w_1,\dots,w_L</span>:</p>
+<div class="math">\text{dup}_n = \frac{\sum_{i \in \mathcal{C}_n} |w_i|}{\sum_{i=1}^{L} |w_i|},\quad
+\mathcal{C}_n = \{\, i : w_i \text{ lies in an } n\text{-gram occurring more than once} \,\}</div>
+
+<h3>C4 Rules</h3>
+<ul>
+  <li>C4 (Raffel et al. 2020) worked at <strong>line</strong> level on WET text <span class="evidence documented">Documented</span>:
+    <ul>
+      <li>Keep only lines ending in terminal punctuation, with at least three words.</li>
+      <li>Drop pages with fewer than five sentences.</li>
+      <li>Drop lines containing "javascript"; drop pages with "lorem ipsum", a curly brace, or a word from a bad-words list.</li>
+      <li>Deduplicate three-sentence spans; keep English with <code>langdetect</code> probability ≥ 0.99.</li>
+    </ul>
+  </li>
+  <li>The curly-brace rule removes most code; the bad-words list was later shown to disproportionately remove text about and by minority groups (Dodge et al. 2021) <span class="evidence documented">Documented</span>.</li>
+</ul>
+
+<h3>Implementation</h3>
+<figure class="listing">
+<figcaption>Gopher-style and C4-style heuristic filters that return a reason. (<code>heuristics.py</code>)</figcaption>
+<pre><code># Gopher/C4-style heuristic filters. Each returns (passed, reason).
+import re
+from collections import Counter
+
+STOP = {"the", "be", "to", "of", "and", "that", "have", "with"}
+BAD = {"lorem", "ipsum"}    # stand-in for a blocklist
+
+def words(t): return re.findall(r"\S+", t)
+
+def dup_ngram_frac(ws, n):
+    """Fraction of characters covered by n-grams that occur more than once."""
+    grams = [tuple(ws[i:i + n]) for i in range(len(ws) - n + 1)]
+    c = Counter(grams)
+    covered = set()
+    for i, g in enumerate(grams):
+        if c[g] &gt; 1:
+            covered.update(range(i, i + n))
+    total = sum(len(w) for w in ws)
+    return sum(len(ws[i]) for i in covered) / max(1, total)
+
+def gopher(t):
+    ws = words(t)
+    n = len(ws)
+    if not 50 &lt;= n &lt;= 100_000:
+        return False, f"word_count={n}"
+    mwl = sum(len(w) for w in ws) / n
+    if not 3 &lt;= mwl &lt;= 10:
+        return False, f"mean_word_len={mwl:.1f}"
+    if (t.count("#") + t.count("...")) / n &gt; 0.1:
+        return False, "symbol_ratio"
+    alpha = sum(bool(re.search(r"[A-Za-z]", w)) for w in ws) / n
+    if alpha &lt; 0.8:
+        return False, f"alpha_words={alpha:.2f}"
+    if sum(w.lower() in STOP for w in ws) &lt; 2:
+        return False, "stopwords&lt;2"
+    lines = [l for l in t.splitlines() if l.strip()]
+    if sum(l.lstrip().startswith(("-", "*", "•")) for l in lines) / len(lines) &gt; 0.9:
+        return False, "bullet_lines"
+    if dup_ngram_frac(ws, 5) &gt; 0.15:
+        return False, f"dup_5gram={dup_ngram_frac(ws, 5):.2f}"
+    return True, "ok"
+
+def c4(t):
+    lines = [l.strip() for l in t.splitlines() if l.strip()]
+    kept = [l for l in lines if l[-1] in ".!?\"'" and len(words(l)) &gt;= 3
+            and "javascript" not in l.lower()]
+    if len(kept) &lt; 3:
+        return False, f"sentences={len(kept)}"
+    body = " ".join(kept)
+    if "{" in body or any(b in body.lower() for b in BAD):
+        return False, "curly_or_blocklist"
+    return True, "ok"
+
+PROSE = ("Data quality matters more than quantity when the compute budget is fixed, "
+         "and engineers have to decide which documents to keep.\n"
+         "Filtering removes spam, menus and machine generated text. "
+         "Each rule has a reason and a cost.\nDeduplication stops the model from "
+         "memorising repeated pages. It also saves compute during training runs. "
+         "The best pipelines measure what each stage removes.")
+DOCS = {
+    "prose": PROSE,
+    "spam": "buy cheap pills now " * 20,
+    "table": " ".join(str(i) for i in range(80)),
+    "short": "Click here to continue.",
+    "code_ish": "function f(x) { return x + 1; }\n" * 12,
+    "lorem": PROSE + "\nLorem ipsum dolor sit amet, consectetur elit.",
+}
+if __name__ == "__main__":
+    for name, d in DOCS.items():
+        print(f"{name:9s} gopher={gopher(d)}  c4={c4(d)}")</code></pre>
+</figure>
+<pre class="output">prose     gopher=(True, 'ok')  c4=(True, 'ok')
+spam      gopher=(False, 'stopwords&lt;2')  c4=(False, 'sentences=0')
+table     gopher=(False, 'mean_word_len=1.9')  c4=(False, 'sentences=0')
+short     gopher=(False, 'word_count=4')  c4=(False, 'sentences=1')
+code_ish  gopher=(False, 'alpha_words=0.50')  c4=(False, 'sentences=0')
+lorem     gopher=(True, 'ok')  c4=(False, 'curly_or_blocklist')</pre>
+
+<ul>
+  <li>Each rule returns its <em>reason</em>, not just a boolean. Logging reasons lets you compute a removal histogram per rule, which is how you find a rule that is silently eating good data.</li>
+  <li>The toy C4 variant uses three sentence-lines instead of five because the fixtures are tiny.</li>
+  <li>Note the <code>lorem</code> case: Gopher passes it and C4 removes it. Rules are complementary; pipelines stack several families.</li>
+</ul>
+
+<aside class="callout impl"><span class="title">Engineering the filter stage</span>
+  <ul>
+    <li>Implement as a pure function <code>doc -&gt; (keep, reason, features)</code>. Persist features (a few floats) rather than decisions so thresholds can change without recomputation.</li>
+    <li>This is predicate push-down: run the cheapest, most selective rules first.</li>
+    <li>Sample 100 removed and 100 kept documents per rule for human review before every threshold change.</li>
+  </ul>
+</aside>
+
+<ul class="failure-modes">
+  <li><strong>Domain collateral:</strong> mean-word-length and alphabetic-ratio rules remove maths, chemistry and code. Route those domains around the web filters.</li>
+  <li><strong>Language assumptions:</strong> stop-word lists and word-length ranges are English-specific. Chinese and Japanese have no spaces; Finnish has long words.</li>
+  <li><strong>Poetry and lists:</strong> legitimate repetition (lyrics, liturgy, recipes) fails repetition rules.</li>
+  <li><strong>Adversarial SEO spam</strong> is written to pass these rules. That is why model-based filters exist.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 5 -->
+<section class="chapter">
+<h2 id="model-filtering">Model-Based Quality Filtering</h2>
+<p class="chapter-lede">Heuristics remove what is obviously not prose. Model-based filters try to
+select what is <em>useful</em>: fluent, informative, educational text. They are the largest single lever
+in recent open datasets, and the most opinionated.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>After heuristic filtering, most surviving pages are grammatical but uninformative: product
+  descriptions, thin SEO articles, forum noise. You want a scalar quality score per document, cheap enough
+  for billions of documents, that correlates with downstream benchmark gains.</p>
+</div>
+
+<h3>Perplexity Filtering</h3>
+<ul>
+  <li>Train a small language model on a reference corpus (CCNet used a 5-gram KenLM model on Wikipedia) and score each document by perplexity <span class="evidence documented">Documented</span> (Wenzek et al. 2019).</li>
+  <li>Low perplexity means "looks like the reference". CCNet bucketed documents into head, middle and tail by perplexity percentile per language.</li>
+</ul>
+<div class="math">\text{PPL}(x) = \exp\!\Big(-\frac{1}{T}\sum_{t=1}^{T} \log p_{\text{ref}}(x_t \mid x_{t-1})\Big)</div>
+<ul>
+  <li>What it does not solve: the reference defines "quality". A Wikipedia reference penalises dialogue, fiction, informal and non-standard text; it also rewards boring, repetitive text that has low perplexity.</li>
+</ul>
+
+<h3>Classifier Filtering</h3>
+<ul>
+  <li>Train a binary classifier: positives from a "high-quality" source, negatives from random web text. Score is the log-odds of the positive class.</li>
+  <li>GPT-3 used a classifier with WebText, books and Wikipedia as positives <span class="evidence documented">Documented</span> (Brown et al. 2020).</li>
+  <li>DCLM trained a fastText bigram classifier with instruction-style data (OpenHermes and ELI5 answers) as positives and RefinedWeb samples as negatives, and found it beat several alternatives in their ablations <span class="evidence documented">Documented</span> (Li et al. 2024).</li>
+  <li>With naive Bayes the score for document <span class="math">x</span> with words <span class="math">w_1..w_T</span> is</li>
+</ul>
+<div class="math">s(x) = \log\frac{P(+)}{P(-)} + \sum_{t=1}^{T}\log\frac{P(w_t\mid +)}{P(w_t\mid -)},\qquad P(w\mid c)=\frac{n_{c,w}+1}{n_c+|V|}</div>
+
+<h3>Implementation: Both Filters, With Threshold Sweeps</h3>
+<figure class="listing">
+<figcaption>Bigram perplexity filter and naive Bayes quality classifier with threshold sweeps. (<code>quality.py</code>)</figcaption>
+<pre><code># Perplexity filter (bigram LM on a reference corpus) and a naive Bayes classifier.
+import math, random, re
+from collections import Counter
+
+random.seed(0)
+def toks(t): return re.findall(r"[a-z']+", t.lower())
+
+GOOD_T = ["the {n} is a {a} method used to {v} large datasets in practice",
+          "researchers {v} the {n} because it gives a {a} estimate of error",
+          "in this chapter we explain why the {n} is {a} and how to {v} it",
+          "a {a} {n} allows engineers to {v} results and compare experiments"]
+BAD_T = ["click here {n} {n} best price {a} deal buy now free shipping",
+         "{n} {n} {n} login signup cart {a} offer limited time only",
+         "win free {n} now click {v} subscribe {a} bonus casino",
+         "home about contact {n} privacy terms {a} sitemap {v}"]
+N = ["estimator", "index", "pipeline", "model", "sample", "shard"]
+A = ["robust", "simple", "useful", "biased", "cheap", "hot"]
+V = ["measure", "filter", "reproduce", "deduplicate", "sort", "rank"]
+def gen(tmpls, k):
+    return [random.choice(tmpls).format(n=random.choice(N), a=random.choice(A),
+            v=random.choice(V)) for _ in range(k)]
+
+class BigramLM:
+    def __init__(self, docs):
+        self.uni, self.bi = Counter(), Counter()
+        for d in docs:
+            w = ["&lt;s&gt;"] + toks(d)
+            self.uni.update(w)
+            self.bi.update(zip(w, w[1:]))
+        self.V = len(self.uni) + 1
+    def perplexity(self, doc):
+        w = ["&lt;s&gt;"] + toks(doc)
+        nll = -sum(math.log((self.bi[(a, b)] + 1) / (self.uni[a] + self.V))
+                   for a, b in zip(w, w[1:]))
+        return math.exp(nll / max(1, len(w) - 1))
+
+class NaiveBayes:
+    def fit(self, pos, neg):
+        self.c = {1: Counter(), 0: Counter()}
+        for d in pos: self.c[1].update(toks(d))
+        for d in neg: self.c[0].update(toks(d))
+        self.vocab = set(self.c[1]) | set(self.c[0])
+        self.tot = {k: sum(v.values()) for k, v in self.c.items()}
+        self.prior = math.log(len(pos) / len(neg))
+        return self
+    def score(self, doc):   # log-odds of "high quality"
+        V = len(self.vocab)
+        return self.prior + sum(
+            math.log((self.c[1][w] + 1) / (self.tot[1] + V))
+            - math.log((self.c[0][w] + 1) / (self.tot[0] + V)) for w in toks(doc))
+
+def prf(scores, labels, thr):
+    tp = sum(s &gt;= thr and y for s, y in zip(scores, labels))
+    fp = sum(s &gt;= thr and not y for s, y in zip(scores, labels))
+    fn = sum(s &lt; thr and y for s, y in zip(scores, labels))
+    p, r = tp / max(1, tp + fp), tp / max(1, tp + fn)
+    return p, r, sum(s &gt;= thr for s in scores) / len(scores)
+
+reference = gen(GOOD_T, 200)                       # "Wikipedia-like" reference
+train_pos, train_neg = gen(GOOD_T, 200), gen(BAD_T, 200)
+# Held-out web: 30% good, 70% junk, plus hard cases (junk written in good style)
+test = [(d, 1) for d in gen(GOOD_T, 60)] + [(d, 0) for d in gen(BAD_T, 130)]
+test += [("buy now the pipeline is a robust method used to click here", 0)] * 10
+test += [(d + " home about contact privacy", 1) for d in gen(GOOD_T, 20)]  # good+nav
+
+lm = BigramLM(reference)
+nb = NaiveBayes().fit(train_pos, train_neg)
+labels = [y for _, y in test]
+ppl = [-lm.perplexity(d) for d, _ in test]         # negate: higher = better
+nbs = [nb.score(d) for d, _ in test]
+print("example ppl good/bad:", round(lm.perplexity(test[0][0]), 1),
+      round(lm.perplexity(test[100][0]), 1))
+for name, s, thrs in [("perplexity", ppl, [-6, -12, -25]),
+                      ("naive_bayes", nbs, [8.0, 2.0, -2.0])]:
+    for t in thrs:
+        p, r, keep = prf(s, labels, t)
+        print(f"{name:11s} thr={t:7.1f} precision={p:.2f} recall={r:.2f} "
+              f"keep={keep:.2f}")</code></pre>
+</figure>
+<pre class="output">example ppl good/bad: 4.0 64.1
+perplexity  thr=   -6.0 precision=1.00 recall=0.75 keep=0.27
+perplexity  thr=  -12.0 precision=1.00 recall=1.00 keep=0.36
+perplexity  thr=  -25.0 precision=0.89 recall=1.00 keep=0.41
+naive_bayes thr=    8.0 precision=1.00 recall=1.00 keep=0.36
+naive_bayes thr=    2.0 precision=0.89 recall=1.00 keep=0.41
+naive_bayes thr=   -2.0 precision=0.89 recall=1.00 keep=0.41</pre>
+
+<p class="facet">Reading the result</p>
+<ul>
+  <li>Both methods separate the easy cases. Both are fooled by the ten "junk written in good style" documents: loosening the threshold admits them and precision drops to 0.89.</li>
+  <li>The perplexity filter at the strictest threshold loses recall on good documents with a navigation tail appended. This is the extraction–filter interaction: poor extraction lowers perplexity-based scores of good pages.</li>
+  <li>Thresholds are chosen on <strong>keep rate</strong> as much as precision: the token budget sets how much you can afford to discard.</li>
+</ul>
+
+<h3>LLM-Annotated Quality Labels (the FineWeb-Edu Pattern)</h3>
+<ul>
+  <li>Prompt a strong LLM to rate a sample of documents (FineWeb-Edu: roughly 450k documents, rated 0–5 for educational value by Llama-3-70B-Instruct) <span class="evidence documented">Documented</span>.</li>
+  <li>Train a cheap regressor on embeddings of those documents to predict the rating; apply it to the whole corpus.</li>
+  <li>Threshold: FineWeb-Edu kept documents scoring ≥ 3, reducing FineWeb's roughly 15T tokens to roughly 1.3T tokens, with large gains on knowledge and reasoning benchmarks such as MMLU and ARC <span class="evidence documented">Documented</span> (Penedo et al. 2024; figures approximate).</li>
+</ul>
+
+<pre class="mermaid">flowchart TD
+  A[Sample ~100k-500k docs] --> B[LLM rates each doc with a rubric]
+  B --> C[Embed docs with a small encoder]
+  C --> D[Train linear regressor on ratings]
+  D --> E[Score full corpus on CPU/GPU]
+  E --> F{score >= threshold?}
+  F -->|yes| G[Keep]
+  F -->|no| H[Drop, but log score]</pre>
+
+<h3>Threshold Selection</h3>
+<ul>
+  <li>Plot keep rate against proxy-model benchmark score for several thresholds. The curve usually rises then plateaus or falls as diversity drops.</li>
+  <li>Aggressive filtering trades <strong>quality for repetition</strong>: a smaller pool means more epochs for the same budget. Muennighoff et al. (2023) found up to about four epochs of repetition costs little, with diminishing returns beyond <span class="evidence documented">Documented</span>.</li>
+  <li>Prefer soft filtering (use the score to set sampling weight) over hard cut-offs when you are near the repetition limit.</li>
+</ul>
+
+<div class="tradeoffs">
+  <div class="pros"><p class="facet">Advantages</p><ul>
+    <li>Captures quality notions rules cannot express.</li>
+    <li>fastText-class models score millions of documents per core-hour.</li>
+    <li>Target is explicit and changeable (edit the rubric).</li>
+  </ul></div>
+  <div class="cons"><p class="facet">Disadvantages</p><ul>
+    <li>Imports the biases of the positive set or annotator LLM.</li>
+    <li>Narrows diversity; optimises benchmarks that resemble the positive set.</li>
+    <li>Hard to audit why a document was removed.</li>
+  </ul></div>
+</div>
+
+<aside class="callout warning"><span class="title">Benchmark leakage through the filter</span>
+  <ul>
+    <li>If the positive set or rubric is tuned to "look like" a benchmark, the filter selects benchmark-like text. Gains may be partly contamination by style. Run Chapter 10 checks on the filtered output, not only the input.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 6 -->
+<section class="chapter">
+<h2 id="dedup">Deduplication</h2>
+<p class="chapter-lede">The web is massively redundant: mirrors, syndicated news, templated pages,
+license texts and boilerplate. Deduplication is a join on similarity at trillion-token scale, and it is
+one of the few data interventions with consistently positive published results.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>You have billions of documents. Some are byte-identical, many are identical up to whitespace or a
+  date, and many share long passages. You need to remove redundancy without an all-pairs comparison
+  (<span class="math">\sim 10^{18}</span> pairs for <span class="math">10^9</span> documents).</p>
+</div>
+
+<p class="facet">Why deduplicate</p>
+<ul>
+  <li>Lee et al. (2022) found duplicated sequences are memorised and regurgitated far more often, and that deduplicated training reached similar or better perplexity with fewer steps <span class="evidence documented">Documented</span>.</li>
+  <li>Duplicates silently change the mixture: a boilerplate page repeated 100k times is a 100k× upweight.</li>
+  <li>Duplicates between train and test inflate evaluation (Chapter 10).</li>
+</ul>
+
+<table>
+  <caption>Deduplication methods.</caption>
+  <thead><tr><th>Method</th><th>Finds</th><th>Does not find</th><th>Cost</th></tr></thead>
+  <tbody>
+    <tr><td>Exact hash of normalised doc</td><td>Identical docs after normalisation</td><td>One changed word</td><td>O(n), trivial to shard</td></tr>
+    <tr><td>Line / paragraph hash (CCNet)</td><td>Shared boilerplate lines</td><td>Paraphrase; may cut legitimate repeated lines</td><td>O(total lines)</td></tr>
+    <tr><td>MinHash + LSH</td><td>Documents with high shingle Jaccard</td><td>Shared passage inside different long docs</td><td>O(n · num_perm) + buckets</td></tr>
+    <tr><td>Suffix array exact substring</td><td>Any repeated span ≥ k tokens</td><td>Paraphrase</td><td>O(N log N) over all tokens; memory-heavy</td></tr>
+    <tr><td>Embedding (SemDeDup)</td><td>Semantic near-duplicates</td><td>Precise control; expensive</td><td>Embedding + ANN search</td></tr>
+  </tbody>
+</table>
+
+<h3>Exact Deduplication</h3>
+<figure class="listing">
+<figcaption>Exact document dedup on normalised keys, and CCNet-style line dedup. (<code>exact_dedup.py</code>)</figcaption>
+<pre><code># Exact dedup: hash a normalised document, keep the first occurrence.
+import hashlib, re, unicodedata
+
+def key(doc):
+    t = unicodedata.normalize("NFKC", doc).lower()
+    t = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", t)).strip()
+    return hashlib.sha1(t.encode()).digest()[:8]      # 64-bit key
+
+docs = ["Terms of Service. Last updated 2024.",
+        "terms of service   last updated 2024",
+        "Terms of Service — last updated 2024!",
+        "Terms of Service. Last updated 2023.",
+        "A genuinely unique article about hash joins."]
+seen, kept = set(), []
+for i, d in enumerate(docs):
+    k = key(d)
+    if k not in seen:
+        seen.add(k)
+        kept.append(i)
+print("kept indices:", kept)
+# Line-level exact dedup (CCNet-style): drop lines seen in many documents
+from collections import Counter
+pages = [["Home | Blog | Contact", "Post about B-trees.", "(c) Example Ltd"],
+         ["Home | Blog | Contact", "Post about LSM trees.", "(c) Example Ltd"],
+         ["Home | Blog | Contact", "Post about WAL design.", "(c) Example Ltd"]]
+freq = Counter(l for p in pages for l in set(p))
+print([[l for l in p if freq[l] &lt; 3] for p in pages])</code></pre>
+</figure>
+<pre class="output">kept indices: [0, 3, 4]
+[['Post about B-trees.'], ['Post about LSM trees.'], ['Post about WAL design.']]</pre>
+<ul>
+  <li>Document 3 differs only in the year and is kept: exact dedup is blind to near-duplicates.</li>
+  <li>64-bit keys give a collision probability of about <span class="math">n^2/2^{65}</span>; at <span class="math">n=10^{10}</span> that is a few expected collisions. Use 128-bit keys at web scale.</li>
+  <li>At scale: this is a <code>GROUP BY key</code> with <code>min(doc_id)</code>, or a distributed bloom filter if a small false-positive rate is acceptable.</li>
+</ul>
+
+<h3>MinHash: Estimating Jaccard Without Comparing Sets</h3>
+<p>Represent a document by its set of word <span class="math">k</span>-shingles <span class="math">S</span>. For a random hash
+function <span class="math">h</span>, the probability that two sets share the same minimum hash equals their Jaccard similarity (Broder 1997):</p>
+<div class="math">J(A,B) = \frac{|A\cap B|}{|A\cup B|} = \Pr_h\big[\min_{a\in A} h(a) = \min_{b\in B} h(b)\big]</div>
+<p>With <span class="math">m</span> independent hashes the estimator and its standard error are</p>
+<div class="math">\hat J = \frac{1}{m}\sum_{i=1}^{m} \mathbf{1}\big[\text{sig}_i(A)=\text{sig}_i(B)\big],\qquad
+\operatorname{SE}(\hat J)=\sqrt{\frac{J(1-J)}{m}}</div>
+<ul>
+  <li>With <span class="math">m=128</span> and <span class="math">J=0.9</span>, SE ≈ 0.027. The listing below measures 0.883 against a true 0.903.</li>
+  <li>Hash family: <span class="math">h_i(x) = (a_i x + b_i) \bmod p</span> over a 64-bit base hash, with <span class="math">p = 2^{61}-1</span>.</li>
+</ul>
+
+<h3>LSH Banding</h3>
+<p>Split each signature into <span class="math">b</span> bands of <span class="math">r</span> rows. Two documents become
+candidates if any band matches exactly. For a pair with Jaccard <span class="math">s</span>:</p>
+<div class="math">\Pr[\text{candidate}] = 1-\big(1-s^{r}\big)^{b},\qquad s^{*} \approx \Big(\frac{1}{b}\Big)^{1/r}</div>
+
+<figure class="diagram">
+<pre class="ascii">signature (m = b * r = 128 values)
+|-- band 1 (r) --|-- band 2 (r) --| ... |-- band b (r) --|
+        |                |                       |
+   hash to bucket   hash to bucket          hash to bucket
+        v                v                       v
+   table 1          table 2                 table b
+Pair is a candidate if it shares a bucket in ANY table.
+P(one band equal) = s^r ;  P(no band equal) = (1 - s^r)^b</pre>
+<figcaption>LSH banding: an OR of ANDs over signature rows.</figcaption>
+</figure>
+
+<figure class="listing">
+<figcaption>The LSH S-curve: candidate probability for several (b, r) choices. (<code>scurve.py</code>)</figcaption>
+<pre><code># Probability that a pair with Jaccard s becomes an LSH candidate: 1-(1-s^r)^b
+configs = [(32, 4), (16, 8), (8, 16), (20, 5)]
+sims = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+print("   s  " + "  ".join(f"b={b},r={r}".rjust(9) for b, r in configs))
+for s in sims:
+    row = [1 - (1 - s ** r) ** b for b, r in configs]
+    print(f"{s:4.1f}  " + "  ".join(f"{p:9.3f}" for p in row))</code></pre>
+</figure>
+<pre class="output">   s   b=32,r=4   b=16,r=8   b=8,r=16   b=20,r=5
+ 0.2      0.050      0.000      0.000      0.006
+ 0.3      0.229      0.001      0.000      0.047
+ 0.4      0.564      0.010      0.000      0.186
+ 0.5      0.873      0.061      0.000      0.470
+ 0.6      0.988      0.237      0.002      0.802
+ 0.7      1.000      0.613      0.026      0.975
+ 0.8      1.000      0.947      0.204      1.000
+ 0.9      1.000      1.000      0.806      1.000</pre>
+
+<ul>
+  <li>Larger <span class="math">r</span> sharpens the step and moves it right; larger <span class="math">b</span> moves it left.</li>
+  <li><code>b=20, r=5</code> (100 hashes) puts the step near 0.55–0.6. FineWeb used 112 hashes as 14 buckets of 8 for a threshold near 0.75 on 5-gram shingles <span class="evidence documented">Documented</span>; treat such values as starting points, not constants.</li>
+</ul>
+
+<h3>Implementation and Measured Precision and Recall</h3>
+<p>150 random base documents plus 150 near-duplicates at edit rates of 1%, 3%, 5% and 10% of words.
+Ground truth is exact Jaccard ≥ 0.5 over all 44,850 pairs.</p>
+<figure class="listing">
+<figcaption>MinHash + LSH from scratch with measured precision and recall. (<code>minhash.py</code>)</figcaption>
+<pre><code># MinHash + LSH near-duplicate detection from scratch, with measured P/R.
+import random, re, hashlib
+from collections import defaultdict
+from itertools import combinations
+
+P = (1 &lt;&lt; 61) - 1                       # Mersenne prime for universal hashing
+
+def shingles(text, k=5):
+    w = re.findall(r"\w+", text.lower())
+    return {" ".join(w[i:i + k]) for i in range(max(1, len(w) - k + 1))}
+
+def h64(s):
+    return int.from_bytes(hashlib.blake2b(s.encode(), digest_size=8).digest(), "big")
+
+class MinHasher:
+    def __init__(self, num_perm=128, seed=1):
+        rng = random.Random(seed)
+        self.ab = [(rng.randrange(1, P), rng.randrange(0, P)) for _ in range(num_perm)]
+    def signature(self, sh):
+        hs = [h64(s) for s in sh]
+        return [min((a * x + b) % P for x in hs) for a, b in self.ab]   # (num_perm,)
+
+def jaccard(a, b): return len(a &amp; b) / len(a | b)
+def est(s1, s2): return sum(x == y for x, y in zip(s1, s2)) / len(s1)
+
+class LSH:
+    def __init__(self, b, r):
+        self.b, self.r = b, r
+        self.tables = [defaultdict(list) for _ in range(b)]
+    def insert(self, key, sig):
+        for i in range(self.b):
+            band = tuple(sig[i * self.r:(i + 1) * self.r])
+            self.tables[i][band].append(key)
+    def candidates(self):
+        pairs = set()
+        for t in self.tables:
+            for bucket in t.values():
+                pairs.update(combinations(sorted(bucket), 2))
+        return pairs
+
+# --- synthetic corpus: 150 base docs + 150 near-duplicates with edit rate e --
+rng = random.Random(7)
+VOCAB = [f"w{i}" for i in range(3000)]
+def base_doc(): return " ".join(rng.choice(VOCAB) for _ in range(200))
+def perturb(d, e):
+    w = d.split()
+    for i in range(len(w)):
+        if rng.random() &lt; e:
+            w[i] = rng.choice(VOCAB)
+    return " ".join(w)
+
+docs = {}
+for i in range(150):
+    docs[f"b{i}"] = base_doc()
+for i in range(150):
+    docs[f"d{i}"] = perturb(docs[f"b{i}"], rng.choice([0.01, 0.03, 0.05, 0.10]))
+
+sh = {k: shingles(v) for k, v in docs.items()}
+THRESH = 0.5
+truth = {p for p in combinations(sorted(docs), 2)
+         if jaccard(sh[p[0]], sh[p[1]]) &gt;= THRESH}
+mh = MinHasher(128)
+sig = {k: mh.signature(s) for k, s in sh.items()}
+
+print(f"true J={jaccard(sh['b0'], sh['d0']):.3f} est J={est(sig['b0'], sig['d0']):.3f}")
+print(f"ground-truth pairs with J&gt;={THRESH}: {len(truth)} of "
+      f"{len(docs) * (len(docs) - 1) // 2} total pairs")
+for b, r in [(32, 4), (16, 8), (8, 16)]:
+    lsh = LSH(b, r)
+    for k, s in sig.items():
+        lsh.insert(k, s)
+    cand = lsh.candidates()
+    found = {p for p in cand if est(sig[p[0]], sig[p[1]]) &gt;= THRESH}   # verify
+    tp = len(found &amp; truth)
+    print(f"b={b:2d} r={r:2d} candidates={len(cand):4d} "
+          f"precision={tp / max(1, len(found)):.3f} recall={tp / len(truth):.3f} "
+          f"threshold~{(1 / b) ** (1 / r):.2f}")</code></pre>
+</figure>
+<pre class="output">true J=0.903 est J=0.883
+ground-truth pairs with J&gt;=0.5: 120 of 44850 total pairs
+b=32 r= 4 candidates= 132 precision=0.992 recall=0.975 threshold~0.42
+b=16 r= 8 candidates=  75 precision=1.000 recall=0.625 threshold~0.71
+b= 8 r=16 candidates=  31 precision=1.000 recall=0.258 threshold~0.88</pre>
+
+<ul>
+  <li><strong>b=32, r=4</strong> (threshold ≈ 0.42) finds 97.5% of true pairs with 132 candidates, not 44,850 comparisons. Verification with the signature estimate keeps precision at 0.99.</li>
+  <li><strong>b=8, r=16</strong> (threshold ≈ 0.88) misses three quarters of the pairs: the S-curve is in the wrong place for a 0.5 target.</li>
+  <li>The single false positive is a pair with true Jaccard just below 0.5 whose estimate landed above. Verifying against exact Jaccard removes it at extra cost.</li>
+  <li>After candidate generation, build a graph and take connected components (union–find); keep one document per component.</li>
+</ul>
+
+<h3>Suffix-Array Substring Deduplication</h3>
+<ul>
+  <li>Concatenate all tokens, build a suffix array, and find repeated spans of at least <span class="math">k</span> tokens (Lee et al. used 50) by scanning adjacent suffixes for long common prefixes.</li>
+  <li>Removes shared boilerplate inside otherwise distinct documents, which MinHash misses.</li>
+  <li>Cost: memory proportional to the corpus in tokens times pointer width; built in shards and merged. RefinedWeb applied it after MinHash <span class="evidence documented">Documented</span>.</li>
+  <li>Risk: removing spans can leave documents incoherent; drop documents with too much removed.</li>
+</ul>
+
+<h3>Scale Trade-offs</h3>
+<div class="frame production">
+  <ul>
+    <li><strong>Map:</strong> per document, compute shingles and a signature (CPU-bound; embarrassingly parallel).</li>
+    <li><strong>Shuffle:</strong> emit <code>(band_id, band_hash) -&gt; doc_id</code>; group by key. This is the expensive shuffle; the number of rows is <span class="math">n \cdot b</span>.</li>
+    <li><strong>Reduce:</strong> emit edges for buckets with more than one document; cap bucket size to avoid quadratic blow-ups on templates.</li>
+    <li><strong>Connected components:</strong> distributed union–find or iterative label propagation.</li>
+    <li><strong>Global vs per-snapshot:</strong> FineWeb found deduplicating each crawl separately beat global dedup in their ablations, arguing global dedup disproportionately kept low-quality survivors <span class="evidence documented">Documented</span>. This is contested and corpus-dependent.</li>
+  </ul>
+</div>
+
+<ul class="failure-modes">
+  <li><strong>Template collapse:</strong> forum threads sharing a large template exceed the threshold although content differs. Shingle only the extracted main content.</li>
+  <li><strong>Giant components:</strong> transitive chains (A~B, B~C) merge unrelated documents. Cap component size or verify against the representative.</li>
+  <li><strong>Keeping the wrong copy:</strong> choose the representative by quality score or earliest crawl, not arbitrarily.</li>
+  <li><strong>Over-dedup of valuable repeats:</strong> licences, legal texts and famous quotations are legitimately repeated; decide whether you want the model to know them.</li>
+</ul>
+
+<aside class="callout security"><span class="title">Dedup as a poisoning defence and target</span>
+  <ul>
+    <li>Poisoning often relies on repetition to make a payload learnable. Near-dedup reduces its effect.</li>
+    <li>An attacker who knows your shingle size and threshold can vary text just enough to evade dedup. Do not publish exact parameters for private pipelines, and combine with substring dedup.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 7 -->
+<section class="chapter">
+<h2 id="pii">PII and Safety Filtering</h2>
+<p class="chapter-lede">Models memorise rare strings seen several times. Anything that reaches the
+training set may be extractable later, so personal data and harmful content must be controlled before
+training, with an audit trail that proves it was.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Web and user data contain emails, phone numbers, card numbers, government IDs, addresses, names and
+  credentials. You must detect them at high recall, without destroying useful text (version numbers,
+  ISBNs, maths), and decide per document whether to redact, drop or keep.</p>
+</div>
+
+<p class="facet">Detection options</p>
+<ul>
+  <li><strong>Regex</strong>: high recall for structured PII (email, IP, phone). Precision is poor on digit strings without validation.</li>
+  <li><strong>Checksum validators</strong>: Luhn for payment cards, mod-97 for IBAN, national ID check digits. Dramatically improve precision.</li>
+  <li><strong>NER models</strong> (spaCy, Presidio, transformer taggers): names, addresses and organisations. Slower; recall varies by language and domain.</li>
+  <li><strong>Secret scanners</strong> for code: API key formats and entropy tests (as in detect-secrets-style tools).</li>
+</ul>
+
+<h3>The Luhn Checksum</h3>
+<p>Double every second digit from the right, subtract 9 from results above 9, and sum. Valid card numbers satisfy</p>
+<div class="math">\Big(\sum_{i} d'_i\Big) \bmod 10 = 0</div>
+<p>A random digit string passes with probability 0.1, so Luhn removes about 90% of false card matches.</p>
+
+<h3>Implementation</h3>
+<figure class="listing">
+<figcaption>Regex PII detection with Luhn validation and a redact-or-drop policy. (<code>pii.py</code>)</figcaption>
+<pre><code># PII detection with regex + validators; redaction versus document removal.
+import re
+
+def luhn_ok(digits):
+    s, alt = 0, False
+    for ch in reversed(digits):
+        d = int(ch)
+        if alt:
+            d = d * 2 - 9 if d &gt; 4 else d * 2
+        s, alt = s + d, not alt
+    return s % 10 == 0
+
+PATTERNS = {
+    "EMAIL": re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}\b", re.I),
+    "CARD":  re.compile(r"\b\d(?:[ -]?\d){12,18}\b"),
+    "PHONE": re.compile(r"(?&lt;!\w)(?:\+44\s?7\d{3}|\(?07\d{3}\)?)\s?\d{3}\s?\d{3}(?!\d)"
+                        r"|(?&lt;!\w)(?:\+1[ .-]?)?\(?\d{3}\)?[ .-]?\d{3}[ .-]\d{4}"
+                        r"(?!\d)"),
+    "IPV4":  re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}"
+                        r"(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"),
+}
+
+def find_pii(text):
+    hits = []
+    for label, rx in PATTERNS.items():
+        for m in rx.finditer(text):
+            if label == "CARD":
+                digits = re.sub(r"\D", "", m.group())
+                if not luhn_ok(digits):
+                    continue                     # e.g. order numbers, ISBNs
+            hits.append((m.start(), m.end(), label))
+    hits.sort()
+    out, last = [], -1                           # drop overlapping matches
+    for s, e, l in hits:
+        if s &gt;= last:
+            out.append((s, e, l)); last = e
+    return out
+
+def redact(text):
+    hits = find_pii(text)
+    for s, e, l in reversed(hits):
+        text = text[:s] + f"&lt;|{l}|&gt;" + text[e:]
+    return text, [l for _, _, l in hits]
+
+def policy(text, max_hits=3):
+    red, labels = redact(text)
+    return ("DROP", None) if len(labels) &gt; max_hits else ("KEEP", red)
+
+samples = [
+    "Contact jane.doe@example.co.uk or call 07700 900123 for details.",
+    "Card 4111 1111 1111 1111 was charged; order no 4111 1111 1111 1112.",
+    "US office: (555) 010-4477. Server at 192.168.10.4, version 3.14.159.",
+    "Leaked: a@x.io 4111111111111111 b@y.io c@z.io +44 7700 900456",
+]
+for s in samples:
+    print(policy(s))
+print(luhn_ok("4111111111111111"), luhn_ok("4111111111111112"))</code></pre>
+</figure>
+<pre class="output">('KEEP', 'Contact &lt;|EMAIL|&gt; or call &lt;|PHONE|&gt; for details.')
+('KEEP', 'Card &lt;|CARD|&gt; was charged; order no 4111 1111 1111 1112.')
+('KEEP', 'US office: &lt;|PHONE|&gt;. Server at &lt;|IPV4|&gt;, version 3.14.159.')
+('DROP', None)
+True False</pre>
+
+<ul>
+  <li>The second sample keeps the order number: it matches the card pattern but fails Luhn.</li>
+  <li>The version string <code>3.14.159</code> is not tagged as an IP; the octet-bounded pattern prevents it.</li>
+  <li>The fourth document has more than three PII hits and is dropped entirely: dense PII signals a leak dump, not prose with incidental contact details.</li>
+  <li>Typed placeholders (<code>&lt;|EMAIL|&gt;</code>) preserve sentence structure; use tokens the tokeniser treats atomically, or the model learns to emit fragments of them.</li>
+</ul>
+
+<table>
+  <caption>Redaction versus removal.</caption>
+  <thead><tr><th>Choice</th><th>Keeps</th><th>Risk</th><th>Use when</th></tr></thead>
+  <tbody>
+    <tr><td>Redact with typed placeholder</td><td>Surrounding text</td><td>Missed PII nearby; placeholder artefacts</td><td>Incidental PII in useful prose</td></tr>
+    <tr><td>Redact with realistic fake (surrogate)</td><td>Natural distribution</td><td>Fakes can collide with real people</td><td>Fine-tuning data for PII-handling tasks</td></tr>
+    <tr><td>Drop document</td><td>Nothing</td><td>Loss of good data; bias against some genres</td><td>Dense PII, dumps, leaked databases</td></tr>
+    <tr><td>Keep</td><td>Everything</td><td>Memorisation and extraction</td><td>Public-figure contact info by policy only</td></tr>
+  </tbody>
+</table>
+
+<h3>Toxicity and Safety Filtering</h3>
+<ul>
+  <li>Classifiers (for example trained on Jigsaw-style data) or word lists flag hateful, sexual and violent content. Dolma released its toxicity and PII taggers alongside the data <span class="evidence documented">Documented</span>.</li>
+  <li>Aggressive toxicity filtering removes text <em>about</em> toxicity, which the model needs to recognise and refuse harmful requests, and disproportionately removes dialects and identity terms (Dodge et al. 2021).</li>
+  <li>Common approach: remove the clearly harmful tail (CSAM: always, with hash-matching; extremist propaganda), and let post-training handle behaviour for the rest.</li>
+</ul>
+
+<h3>Audit Trails</h3>
+<ul>
+  <li>Log per document: detector version, hit counts by type, action taken. Never log the detected PII values themselves.</li>
+  <li>Keep a stratified sample of redacted outputs for periodic human review of recall.</li>
+  <li>Evaluate on a labelled set per locale: recall matters more than precision for PII, so report recall with confidence intervals.</li>
+</ul>
+
+<aside class="callout security"><span class="title">Security</span>
+  <ul>
+    <li>Raw stages of the pipeline hold unredacted PII. Apply the same access control as a production customer database: encryption, least privilege, retention limits.</li>
+    <li>Credentials in code data (AWS keys, tokens) are PII-like and actively exploited. Scan code with secret detectors and drop or redact.</li>
+    <li>Data extraction attacks (Carlini et al. 2021) recover verbatim training strings; memorisation is the threat model to test against.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 8 -->
+<section class="chapter">
+<h2 id="mixtures">Dataset Mixtures</h2>
+<p class="chapter-lede">A training set is not a pile of documents; it is a sampling distribution over
+domains. The mixture decides which capabilities get compute.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>You have many sources of very different sizes: tens of trillions of web tokens, a few hundred billion
+  code tokens, tens of billions of books, papers and maths. Sampling in proportion to size gives the
+  small, valuable domains almost no weight; sampling uniformly repeats them dozens of times.</p>
+</div>
+
+<h3>Temperature-Based Domain Weights</h3>
+<p>Let <span class="math">n_i</span> be the tokens available in domain <span class="math">i</span> and
+<span class="math">p_i = n_i / \sum_j n_j</span>. Temperature sampling sets</p>
+<div class="math">w_i = \frac{p_i^{1/T}}{\sum_j p_j^{1/T}}, \qquad \text{epochs}_i = \frac{w_i \, D}{n_i}</div>
+<ul>
+  <li><span class="math">T=1</span>: proportional. <span class="math">T\to\infty</span>: uniform.</li>
+  <li>Used for multilingual balance (XLM-R and mT5 used <span class="math">\alpha = 1/T = 0.3</span>) <span class="evidence documented">Documented</span>.</li>
+  <li>The epochs column is the real constraint: a small domain upweighted too far is repeated past the point of useful returns.</li>
+</ul>
+<figure class="listing">
+<figcaption>Temperature-based domain weights, epochs per domain and a seeded sampler. (<code>mixture.py</code>)</figcaption>
+<pre><code># Temperature-based domain weights and a deterministic mixture sampler.
+import random
+from collections import Counter
+
+tokens = {"web": 5000e9, "code": 800e9, "books": 100e9, "papers": 60e9,
+          "wiki": 20e9, "math": 10e9}                  # available tokens (toy)
+total = sum(tokens.values())
+
+def weights(T):
+    q = {d: (n / total) ** (1 / T) for d, n in tokens.items()}
+    z = sum(q.values())
+    return {d: v / z for d, v in q.items()}
+
+BUDGET = 1000e9                                         # training tokens
+print("domain   " + "  ".join(f"T={T:&lt;4}" for T in (1, 2, 5)) + "  epochs@T=2")
+w1, w2, w5 = weights(1), weights(2), weights(5)
+for d in tokens:
+    ep = w2[d] * BUDGET / tokens[d]
+    print(f"{d:7s}  {w1[d]:.3f}  {w2[d]:.3f}  {w5[d]:.3f}   {ep:6.2f}")
+
+def sample_stream(w, n, seed=0):
+    rng = random.Random(seed)
+    doms, ps = zip(*w.items())
+    return rng.choices(doms, weights=ps, k=n)
+
+c = Counter(sample_stream(w2, 100_000))
+print({d: round(c[d] / 100_000, 3) for d in tokens})</code></pre>
+</figure>
+<pre class="output">domain   T=1     T=2     T=5     epochs@T=2
+web      0.835  0.569  0.314     0.11
+code     0.134  0.227  0.218     0.28
+books    0.017  0.080  0.144     0.80
+papers   0.010  0.062  0.130     1.04
+wiki     0.003  0.036  0.104     1.80
+math     0.002  0.025  0.091     2.54
+{'web': 0.569, 'code': 0.226, 'books': 0.081, 'papers': 0.062, 'wiki': 0.036, 'math': 0.025}</pre>
+<ul>
+  <li>At <span class="math">T=2</span> the maths domain is seen 2.5 times and wiki 1.8 times within a 1T budget; web is seen only 11%.</li>
+  <li>The sampler draws domain first, then a document within the domain. Seeded sampling makes the stream reproducible and resumable.</li>
+</ul>
+
+<h3>Upsampling, Epochs and Curriculum</h3>
+<ul>
+  <li><strong>Upsampling</strong> small high-quality domains is common; The Pile explicitly assigned per-component epochs (for example more than one pass over Wikipedia and books) <span class="evidence documented">Documented</span> (Gao et al. 2020).</li>
+  <li><strong>Repetition limits</strong>: returns diminish after a few epochs (Muennighoff et al. 2023). Beyond that, prefer more diverse data to more repetition.</li>
+  <li><strong>Curriculum / annealing</strong>: many recent training reports describe raising the share of high-quality, maths and code data in the final phase while the learning rate decays <span class="evidence documented">Documented</span> (for example the Llama 3 report). Ordering effects are otherwise small and hard to measure.</li>
+</ul>
+
+<h3>DoReMi-Style Mixture Optimisation</h3>
+<ul>
+  <li>DoReMi (Xie et al. 2023): train a small reference model on a default mixture; then train a small proxy with Group DRO that upweights domains where the proxy's excess loss over the reference is highest; use the averaged weights for the large model <span class="evidence documented">Documented</span>.</li>
+</ul>
+<div class="math">\alpha_i^{(t)} \propto \alpha_i^{(t-1)} \exp\!\big(\eta \, \max(0,\ \ell_i(\theta_{\text{proxy}}) - \ell_i(\theta_{\text{ref}}))\big)</div>
+<ul>
+  <li>Alternatives: regression-based mixing laws that fit loss as a function of mixture weights from many small runs (RegMix, data mixing laws); grid search over a few candidate mixtures at proxy scale.</li>
+  <li>What none of them solves: the target. Optimising average perplexity is not the same as optimising the capabilities you ship.</li>
+</ul>
+
+<ul class="failure-modes">
+  <li><strong>Hidden domain definitions:</strong> "web" contains code, maths and news. Domain labels from URL are noisy; weights apply to labels, not content.</li>
+  <li><strong>Silent over-repetition</strong> when a source shrinks after re-filtering but weights stay fixed. Recompute epochs on every data version.</li>
+  <li><strong>Non-resumable samplers</strong>: a restart that reseeds changes the data order. Store sampler state in the checkpoint.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 9 -->
+<section class="chapter">
+<h2 id="synthetic">Synthetic Data</h2>
+<p class="chapter-lede">Synthetic data (text generated by models) is now a major input to post-training
+and increasingly to pretraining. It is cheap and controllable. It is also a closed loop that can erode
+the diversity it was meant to add.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>You need more data in a narrow capability (maths reasoning, tool calls, a low-resource language) than
+  exists naturally. A strong model can generate it, but generated data inherits the generator's errors and
+  biases, concentrates on its most likely outputs, and may carry licence restrictions.</p>
+</div>
+
+<h3>Generation Strategies</h3>
+<table>
+  <caption>Common synthetic data patterns.</caption>
+  <thead><tr><th>Pattern</th><th>Example</th><th>Main risk</th></tr></thead>
+  <tbody>
+    <tr><td>Rephrasing web text</td><td>Rewrite pages as Q&amp;A or textbook style (WRAP-style)</td><td>Style homogenisation</td></tr>
+    <tr><td>Seeded generation</td><td>Topic × audience × format grids (Cosmopedia-style); personas</td><td>Topical gaps where seeds are thin</td></tr>
+    <tr><td>Self-instruct / Evol-instruct</td><td>Model writes instructions and answers from seed tasks</td><td>Error propagation; low diversity</td></tr>
+    <tr><td>Verified generation</td><td>Maths with checked answers, code with passing tests</td><td>Only covers verifiable domains</td></tr>
+    <tr><td>Distillation</td><td>Strong model answers, small model learns</td><td>Licence terms; ceiling at teacher quality</td></tr>
+  </tbody>
+</table>
+
+<h3>Diversity Control and Verification</h3>
+<ul>
+  <li>Diversity: vary seeds, personas, formats and temperatures; measure with distinct n-grams, embedding coverage, and MinHash duplicate rates (reuse Chapter 6).</li>
+  <li>Verification: execute code, check maths answers symbolically, use a judge model with a rubric, and sample for human review.</li>
+  <li>Filter synthetic data with the same pipeline as real data, including decontamination: generators reproduce benchmark items they memorised.</li>
+</ul>
+
+<h3>Model Collapse</h3>
+<p>Shumailov et al. (2024) showed that models trained recursively on their own outputs progressively lose
+the tails of the distribution <span class="evidence documented">Documented</span>. The mechanism is visible in a
+categorical toy model: sampling a finite set and refitting cannot recover a token that was not sampled.</p>
+<figure class="listing">
+<figcaption>Model collapse in a categorical model refitted on its own samples. (<code>collapse.py</code>)</figcaption>
+<pre><code># Model collapse in miniature: refit a categorical "model" on its own samples.
+import random, math
+from collections import Counter
+
+rng = random.Random(0)
+V = 1000
+true_p = [1 / (r + 1) ** 1.1 for r in range(V)]         # Zipf-like tail
+z = sum(true_p); true_p = [p / z for p in true_p]
+
+def entropy(p): return -sum(x * math.log2(x) for x in p if x &gt; 0)
+
+def run(mix_real, gens=10, n=5000):
+    p = true_p[:]
+    rows = []
+    for g in range(gens + 1):
+        rows.append((g, sum(x &gt; 0 for x in p), entropy(p)))
+        synth = rng.choices(range(V), weights=p, k=int(n * (1 - mix_real)))
+        real = rng.choices(range(V), weights=true_p, k=int(n * mix_real))
+        c = Counter(synth + real)
+        p = [c[i] / n for i in range(V)]                # MLE refit
+    return rows
+
+for mix in (0.0, 0.2):
+    print(f"real-data fraction per generation = {mix}")
+    for g, support, H in run(mix)[::2]:
+        print(f"  gen {g:2d}  support={support:4d}  entropy={H:.2f} bits")</code></pre>
+</figure>
+<pre class="output">real-data fraction per generation = 0.0
+  gen  0  support=1000  entropy=6.80 bits
+  gen  2  support= 519  entropy=6.57 bits
+  gen  4  support= 410  entropy=6.44 bits
+  gen  6  support= 343  entropy=6.29 bits
+  gen  8  support= 292  entropy=6.10 bits
+  gen 10  support= 253  entropy=5.97 bits
+real-data fraction per generation = 0.2
+  gen  0  support=1000  entropy=6.80 bits
+  gen  2  support= 591  entropy=6.58 bits
+  gen  4  support= 553  entropy=6.53 bits
+  gen  6  support= 538  entropy=6.50 bits
+  gen  8  support= 541  entropy=6.53 bits
+  gen 10  support= 545  entropy=6.53 bits</pre>
+<ul>
+  <li>With pure self-training, support shrinks from 1,000 to 253 tokens in ten generations and entropy falls steadily: the tail disappears first.</li>
+  <li>Mixing 20% fresh real data each generation stabilises support at around 540 (finite sampling still limits it), rather than falling indefinitely. Accumulating real data rather than replacing it is the published mitigation (Gerstgrasser et al. 2024) <span class="evidence documented">Documented</span>.</li>
+  <li>The web itself is increasingly model-generated, so collapse pressure applies to crawls, not only to deliberate synthetic sets. Crawl-date provenance lets you weight older snapshots.</li>
+</ul>
+
+<aside class="callout warning"><span class="title">Licensing of generated data</span>
+  <ul>
+    <li>Some model terms restrict using outputs to train competing models. Record the generator model, version, and terms in lineage for every synthetic shard.</li>
+    <li>Generated text can reproduce copyrighted or personal data memorised by the generator. Run PII and near-dup checks against known sources.</li>
+  </ul>
+</aside>
+</section>
+
+<!-- ================================================================ CHAPTER 10 -->
+<section class="chapter">
+<h2 id="contamination">Contamination</h2>
+<p class="chapter-lede">A benchmark measures generalisation only if the model has not seen the test
+items. Web-scale corpora contain many benchmarks verbatim, and the evaluation is worthless unless you
+check.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>Benchmark questions are published on GitHub, copied into forums, quoted in papers and scraped
+  into crawls. You need to find training documents that contain test items, remove them (or report them),
+  and quantify how much contamination changes the scores.</p>
+</div>
+
+<h3>n-gram Overlap Detection</h3>
+<ul>
+  <li>Index all <span class="math">n</span>-grams of every benchmark item; stream training documents and look up their <span class="math">n</span>-grams.</li>
+  <li>GPT-3 used 13-gram overlap; later reports use 8–13 grams with various thresholds <span class="evidence documented">Documented</span>.</li>
+  <li>Score per item: fraction of the item's n-grams found in a document.</li>
+</ul>
+<div class="math">\text{overlap}(q, d) = \frac{|G_n(q) \cap G_n(d)|}{|G_n(q)|}</div>
+<figure class="listing">
+<figcaption>n-gram contamination index and canary check. (<code>contamination.py</code>)</figcaption>
+<pre><code># Benchmark contamination: n-gram overlap between training docs and test items.
+import re
+from collections import defaultdict
+
+def ngrams(text, n):
+    w = re.findall(r"\w+", text.lower())
+    return [" ".join(w[i:i + n]) for i in range(len(w) - n + 1)]
+
+class ContaminationIndex:
+    def __init__(self, items, n=8):
+        self.n, self.items, self.index = n, items, defaultdict(set)
+        for qid, text in items.items():
+            for g in ngrams(text, n):
+                self.index[g].add(qid)
+    def scan(self, doc):
+        """Return {qid: fraction of that item's n-grams found in doc}."""
+        hits = defaultdict(set)
+        for g in set(ngrams(doc, self.n)):
+            for qid in self.index.get(g, ()):
+                hits[qid].add(g)
+        return {q: len(g) / len(set(ngrams(self.items[q], self.n)))
+                for q, g in hits.items()}
+
+bench = {
+    "q1": "A train leaves the station at 3pm travelling at 60 miles per hour "
+          "towards a city 180 miles away. At what time does it arrive?",
+    "q2": "Which planet in the solar system has the largest number of confirmed "
+          "moons as of the most recent survey by astronomers?",
+}
+train = {
+    "forum": "Homework help: a train leaves the station at 3pm travelling at 60 "
+             "miles per hour towards a city 180 miles away. At what time does it "
+             "arrive? Answer: 6pm.",
+    "paraphrase": "If a train departs at 3pm going 60 mph to a city 180 miles "
+                  "off, when will it get there?",
+    "clean": "Moons are natural satellites. Jupiter and Saturn have many.",
+}
+idx = ContaminationIndex(bench, n=8)
+for name, doc in train.items():
+    r = idx.scan(doc)
+    flag = any(v &gt;= 0.5 for v in r.values())
+    print(f"{name:10s} overlap={ {q: round(v, 2) for q, v in r.items()} } "
+          f"contaminated={flag}")
+# Canary: a unique GUID string published with a benchmark; its presence in
+# a corpus (or model completions) is direct evidence of leakage.
+CANARY = "canary GUID 7f3c2a90-forge-bench-do-not-train"
+print("canary found:", any(CANARY in d for d in train.values()))</code></pre>
+</figure>
+<pre class="output">forum      overlap={'q1': 1.0} contaminated=True
+paraphrase overlap={} contaminated=False
+clean      overlap={} contaminated=False
+canary found: False</pre>
+<ul>
+  <li>The forum copy is caught with full overlap. The paraphrase is <strong>not</strong>: n-gram methods miss rephrased and translated contamination.</li>
+  <li>For semantic contamination, add embedding similarity or an LLM judge on top candidates. Expect lower precision and review manually.</li>
+  <li>At scale the benchmark index is small (millions of n-grams) and fits in memory or a bloom filter broadcast to every worker. It is a broadcast hash join.</li>
+</ul>
+
+<h3>Canaries</h3>
+<ul>
+  <li>BIG-bench introduced a canary GUID string to embed in benchmark files, so data pipelines can drop any document containing it and model developers can test whether a model can complete it <span class="evidence documented">Documented</span>.</li>
+  <li>Canaries only work if (a) benchmark authors include them and (b) copies preserve them. Scrapers and reposts often do not.</li>
+</ul>
+
+<h3>Decontamination and Reporting</h3>
+<ul>
+  <li><strong>Remove</strong> contaminated documents from training (or the overlapping spans), before training. Afterwards you can only report.</li>
+  <li><strong>Report</strong> per benchmark: fraction of items contaminated, and score on clean vs contaminated subsets. A large gap indicates leakage affects the number.</li>
+  <li>Use held-out, private or freshly written evaluation sets for decisions (Volume 10). Dynamic benchmarks with post-cutoff items limit the problem.</li>
+</ul>
+
+<ul class="failure-modes">
+  <li><strong>Tokenisation mismatch:</strong> n-grams on words vs tokens vs normalised text give different results. Normalise both sides identically.</li>
+  <li><strong>Short items:</strong> items with fewer than <span class="math">n</span> words have no n-grams. Fall back to full-string match.</li>
+  <li><strong>Common phrases:</strong> boilerplate n-grams ("which of the following is") create false positives. Drop n-grams that are frequent in the training corpus.</li>
+  <li><strong>Contamination via filters and synthetic data</strong> (Chapters 5 and 9): scan the final mixture, not only raw inputs.</li>
+</ul>
+</section>
+
+<!-- ================================================================ CHAPTER 11 -->
+<section class="chapter">
+<h2 id="versioning">Versioning, Lineage and Data Cards</h2>
+<p class="chapter-lede">A model is a function of its data. If you cannot name the exact bytes a model
+was trained on, you cannot debug it, reproduce it, delete from it, or defend it.</p>
+
+<h3>The Engineering Problem</h3>
+<div class="frame problem">
+  <p>The pipeline has a dozen stages, each rerun many times with changing code and thresholds. Months later
+  someone asks which crawl snapshots, filter versions and dedup parameters produced the data behind a
+  checkpoint, or requests deletion of one URL. The answers must be exact.</p>
+</div>
+
+<h3>Simple Version</h3>
+<div class="frame simple">
+  <ul>
+    <li>Write immutable shards. Name each shard by its content hash.</li>
+    <li>For each stage output, write a manifest listing shard hashes, parent manifest versions and the stage config hash.</li>
+    <li>The manifest's own hash is the dataset version. Training checkpoints record it.</li>
+  </ul>
+</div>
+<figure class="listing">
+<figcaption>Content-addressed shards, manifests with lineage, and tamper detection. (<code>manifest.py</code>)</figcaption>
+<pre><code># Content-addressed shards, a manifest with lineage, and a verification step.
+import hashlib, json
+
+def sha(b): return hashlib.sha256(b).hexdigest()
+
+def write_shards(docs, shard_size):
+    shards = []
+    for i in range(0, len(docs), shard_size):
+        body = "\n".join(json.dumps(d, sort_keys=True) for d in docs[i:i + shard_size])
+        b = body.encode()
+        shards.append({"path": f"shard-{sha(b)[:12]}.jsonl", "sha256": sha(b),
+                       "n_docs": len(docs[i:i + shard_size]), "bytes": len(b),
+                       "_data": b})
+    return shards
+
+def manifest(name, shards, parents, stage, config):
+    m = {"dataset": name, "stage": stage, "parents": parents,
+         "config": config, "config_sha": sha(json.dumps(config, sort_keys=True)
+                                             .encode())[:12],
+         "shards": [{k: v for k, v in s.items() if k != "_data"} for s in shards]}
+    m["version"] = sha(json.dumps(m, sort_keys=True).encode())[:16]
+    return m
+
+raw = [{"id": i, "text": f"document {i}", "url": f"https://e.org/{i}"}
+       for i in range(6)]
+m_raw = manifest("web-raw", write_shards(raw, 3), [], "collect",
+                 {"crawl": "CC-2024-10"})
+dedup = [d for d in raw if d["id"] != 4]
+cfg = {"minhash": {"num_perm": 128, "b": 32, "r": 4, "threshold": 0.5}}
+sh = write_shards(dedup, 3)
+m_dd = manifest("web-dedup", sh, [m_raw["version"]], "near_dedup", cfg)
+print(json.dumps({k: m_dd[k] for k in ("dataset", "version", "parents", "config_sha")}))
+for s in m_dd["shards"]:
+    print(s)
+store = {s["path"]: s["_data"] for s in sh}
+store[sh[1]["path"]] = store[sh[1]["path"]].replace(b"document 5", b"document 5!")
+bad = [s["path"] for s in m_dd["shards"] if sha(store[s["path"]]) != s["sha256"]]
+print("tampered shards:", bad)</code></pre>
+</figure>
+<pre class="output">{"dataset": "web-dedup", "version": "3ad0b44ecd242213", "parents": ["8fe198536967bbc8"], "config_sha": "ee2d5daec5bf"}
+{'path': 'shard-413c3d2b37ce.jsonl', 'sha256': '413c3d2b37ce7e1d901d35d0effbb88ad821363df25899c613c1ab9fbde6be0a', 'n_docs': 3, 'bytes': 173}
+{'path': 'shard-8b6cf9150c5a.jsonl', 'sha256': '8b6cf9150c5ae703971d1f5cf146e92107f2ff64f078741aa1f4406ec9f45574', 'n_docs': 2, 'bytes': 115}
+tampered shards: ['shard-8b6cf9150c5a.jsonl']</pre>
+<ul>
+  <li>Changing any shard, parent or config changes the version: the manifest is a Merkle-style commitment.</li>
+  <li>Verification catches the tampered shard. Run it before every training job reads data; it is also the defence against the split-view poisoning of Chapter 2.</li>
+</ul>
+
+<figure class="diagram">
+<pre class="ascii">web-raw@8fe1..  --(extract v3, lid 0.65)-->  web-text@..
+      |                                          |
+      |                                  (gopher+c4 v2)
+      v                                          v
+code-raw@..  --(licence filter)-->  code@..   web-filtered@..
+                                        \          |
+                                         \   (minhash b=32 r=4)
+                                          \        v
+                                           \  web-dedup@3ad0..
+                                            \      |
+                                        (pii v5, decontam v2)
+                                                   v
+                                           mix-2024-10@..  --> checkpoint ckpt-17</pre>
+<figcaption>A lineage graph: nodes are manifest versions, edges are stage runs with config hashes.</figcaption>
+</figure>
+
+<h3>Production Version</h3>
+<div class="frame production">
+  <ul>
+    <li><strong>Storage:</strong> object store with Parquet or JSONL.zst shards; table formats (Iceberg, Delta) or tools like lakeFS/DVC for snapshots and time travel.</li>
+    <li><strong>Document IDs:</strong> stable ID from (source, URL, crawl, offset) so that deletion can be joined through every stage.</li>
+    <li><strong>Orchestration:</strong> stage DAG in Airflow, Dagster or similar; each task idempotent and keyed by (input version, config hash) so reruns are cache hits.</li>
+    <li><strong>Processing:</strong> Spark or Ray Data for shuffles (dedup, contamination join); plain batch jobs for embarrassingly parallel map stages (extraction, filters). DataTrove (FineWeb) and the Dolma toolkit are open examples <span class="evidence documented">Documented</span>.</li>
+    <li><strong>Data cards:</strong> generated from manifests, not written by hand.</li>
+  </ul>
+</div>
+
+<div class="frame why-complex">
+  <ul>
+    <li>Deletion requests mutate "immutable" data: implement as a new version with a tombstone list, and track which checkpoints predate it.</li>
+    <li>Nondeterminism (thread scheduling in dedup, floating-point classifier scores on different hardware) breaks bit-exact reproducibility; record outputs, not just code.</li>
+    <li>Petabyte-scale lineage at document level is itself a large dataset; store it as a table, not as graph metadata.</li>
+  </ul>
+</div>
+
+<h3>Datasheets and Data Cards</h3>
+<ul>
+  <li>Datasheets for Datasets (Gebru et al. 2021) poses questions on motivation, composition, collection, preprocessing, uses, distribution and maintenance <span class="evidence documented">Documented</span>.</li>
+  <li>Minimum card content for a training mixture:
+    <ul>
+      <li>Sources, crawl dates, licences, and opt-out policy applied.</li>
+      <li>Every stage with version, config hash and removal rate.</li>
+      <li>Token counts per domain, mixture weights and epochs.</li>
+      <li>PII and toxicity policies with measured recall on labelled samples.</li>
+      <li>Decontamination: benchmarks checked, method, fraction removed.</li>
+      <li>Known biases and gaps (languages, dialects, domains removed by filters).</li>
+    </ul>
+  </li>
+</ul>
+
+<h3>Scale and Cost Notes</h3>
+<table>
+  <caption>Where the compute goes in a web pipeline (orders of magnitude; approximate and hardware-dependent).</caption>
+  <thead><tr><th>Stage</th><th>Bound by</th><th>Scaling notes</th></tr></thead>
+  <tbody>
+    <tr><td>Download WARC</td><td>Network / egress</td><td>Run in the same cloud region as the Common Crawl bucket to avoid egress fees</td></tr>
+    <tr><td>HTML extraction</td><td>CPU</td><td>Often the largest CPU cost; trafilatura is milliseconds per page</td></tr>
+    <tr><td>Language ID, heuristics</td><td>CPU</td><td>Cheap; microseconds to low milliseconds per doc</td></tr>
+    <tr><td>MinHash signatures</td><td>CPU</td><td>Linear in shingles × hashes; vectorise with NumPy or use Rust implementations</td></tr>
+    <tr><td>LSH shuffle + components</td><td>Shuffle / memory</td><td>The main distributed-systems problem; cap bucket sizes</td></tr>
+    <tr><td>Model-based quality</td><td>CPU (fastText) or GPU (encoders)</td><td>GPU classifiers dominate cost if used on the full corpus; run after cheap filters</td></tr>
+    <tr><td>Tokenisation and sharding</td><td>CPU</td><td>Store token IDs to avoid re-tokenising per run</td></tr>
+  </tbody>
+</table>
+<ul>
+  <li>Order stages by cost × selectivity, like a query optimiser: cheap selective filters first, GPU scoring last.</li>
+  <li>Budget rule of thumb: processing a full Common Crawl snapshot end to end takes on the order of thousands to tens of thousands of CPU-hours (approximate; depends heavily on the extractor).</li>
+</ul>
+
+<h3>Reference Open Datasets</h3>
+<table>
+  <caption>Open pretraining datasets and their distinguishing choices. Sizes approximate.</caption>
+  <thead><tr><th>Dataset</th><th>Source</th><th>Distinguishing choices</th></tr></thead>
+  <tbody>
+    <tr><td>C4 (2020)</td><td>One CC snapshot, WET</td><td>Line-level rules, bad-words list, ~750 GB English</td></tr>
+    <tr><td>The Pile (2020)</td><td>22 curated subsets</td><td>Domain diversity (papers, code, books, legal); ~825 GiB; per-subset epochs</td></tr>
+    <tr><td>RefinedWeb (2023)</td><td>CC WARC</td><td>Web-only; trafilatura; MinHash + exact substring dedup; ~600B-token public extract</td></tr>
+    <tr><td>Dolma (2024)</td><td>CC, code, papers, books, social, encyclopedic</td><td>~3T tokens; open toolkit and taggers; used for OLMo</td></tr>
+    <tr><td>FineWeb / FineWeb-Edu (2024)</td><td>96 CC snapshots</td><td>~15T tokens; per-snapshot MinHash; ablation-driven filters; LLM-annotated edu classifier (~1.3T tokens)</td></tr>
+    <tr><td>DCLM (2024)</td><td>CC pool (~240T tokens)</td><td>Benchmark for data curation; fastText quality classifier; DCLM-Baseline</td></tr>
+  </tbody>
+</table>
+</section>
+
+<!-- ================================================================ REVIEW -->
+<section class="review">
+<h1>Volume Review</h1>
+
+<h2>What You Learned</h2>
+<ul>
+  <li>At fixed compute every token has the same price, so curation is a budget allocation problem; pipelines are funnels with multiplicative survival rates.</li>
+  <li>WARC, WAT and WET formats; provenance fields to capture at collection; robots.txt and opt-out as recorded decisions.</li>
+  <li>Block-based extraction with link density, NFC vs NFKC normalisation, and language ID thresholds with their bias.</li>
+  <li>Gopher and C4 rules, their thresholds and the reason for each, and their domain collateral.</li>
+  <li>Perplexity and classifier filters, the FineWeb-Edu LLM-annotation pattern, and threshold selection against repetition.</li>
+  <li>MinHash as an unbiased Jaccard estimator, LSH banding <span class="math">1-(1-s^r)^b</span>, and measured precision/recall.</li>
+  <li>PII detection with validators, redaction vs removal, and audit trails.</li>
+  <li>Temperature-based mixtures, epochs per domain, and DoReMi-style optimisation.</li>
+  <li>Synthetic data patterns and the tail-loss mechanism of model collapse.</li>
+  <li>n-gram contamination checks, canaries and reporting; content-addressed manifests and lineage.</li>
+</ul>
+
+<h2>What You Built</h2>
+<ul>
+  <li>A WET reader with robots.txt checks and provenance records.</li>
+  <li>An HTML extractor with boilerplate removal, a Unicode normaliser and a stop-word language identifier.</li>
+  <li>Gopher-style and C4-style filters that return reasons.</li>
+  <li>A bigram perplexity filter and a naive Bayes quality classifier with threshold sweeps.</li>
+  <li>Exact and line-level dedup; MinHash + LSH from scratch with measured precision and recall.</li>
+  <li>A PII scrubber with Luhn validation and a redact/drop policy.</li>
+  <li>A temperature mixture sampler, a model-collapse simulator, a contamination index and a content-addressed manifest with verification — all under <code>forge.data</code>.</li>
+</ul>
+
+<h2>Important Code</h2>
+<table>
+  <caption>Listings to keep; later volumes reuse them inside <code>src/forge/data/</code>.</caption>
+  <thead><tr><th>Module</th><th>Forge path</th><th>Key function</th><th>Reused in</th></tr></thead>
+  <tbody>
+    <tr><td><code>extract</code></td><td><code>forge.data.extract</code></td><td><code>extract</code>, <code>normalise</code></td><td>Volume 14 (RAG ingestion)</td></tr>
+    <tr><td><code>heuristics</code></td><td><code>forge.data.heuristics</code></td><td><code>gopher</code>, <code>c4</code></td><td>Fine-tuning data cleaning</td></tr>
+    <tr><td><code>quality</code></td><td><code>forge.data.quality</code></td><td>perplexity / classifier filters</td><td>Ablation pipelines</td></tr>
+    <tr><td><code>minhash</code></td><td><code>forge.data.minhash</code></td><td><code>MinHasher</code>, <code>LSH</code></td><td>Dedup of eval sets and RAG corpora</td></tr>
+    <tr><td><code>pii</code></td><td><code>forge.data.pii</code></td><td><code>find_pii</code>, <code>redact</code></td><td>Guardrails and logging</td></tr>
+    <tr><td><code>mixture</code></td><td><code>forge.data.mixture</code></td><td>temperature sampler</td><td>Volume 6 training</td></tr>
+    <tr><td><code>contamination</code></td><td><code>forge.data.contamination</code></td><td><code>ContaminationIndex</code></td><td>Volume 10</td></tr>
+    <tr><td><code>manifest</code></td><td><code>forge.data.manifest</code></td><td>content-addressed manifests</td><td>Every training and evaluation run</td></tr>
+  </tbody>
+</table>
+
+<h2>Important Architecture</h2>
+<div class="arch">
+  <div class="arch-layer" data-label="Sources">
+    <div class="node external">Common Crawl WARC</div><div class="node external">APIs / dumps</div><div class="node external">Code</div><div class="node external">Licensed</div>
+  </div>
+  <div class="arch-layer" data-label="Map stages">
+    <div class="node service">Extract + LID</div><div class="node guard">Heuristics</div><div class="node model">Quality model</div><div class="node guard">PII / safety</div>
+  </div>
+  <div class="arch-layer" data-label="Shuffle stages">
+    <div class="node queue">MinHash LSH</div><div class="node queue">Substring dedup</div><div class="node eval">Decontamination</div>
+  </div>
+  <div class="arch-layer" data-label="Storage">
+    <div class="node store">Immutable shards</div><div class="node store">Manifests + lineage</div><div class="node obs">Stage metrics</div>
+  </div>
+  <div class="arch-layer" data-label="Consumers">
+    <div class="node service">Mixture sampler</div><div class="node gpu">Training</div><div class="node eval">Ablations</div>
+  </div>
+</div>
+
+<h2>Failure Modes</h2>
+<ul class="failure-modes">
+  <li>Extractor drops headings, tables or code; downstream filters cannot recover it.</li>
+  <li>Language and quality thresholds remove dialects and minority-group text disproportionately.</li>
+  <li>Heuristics remove maths and code; route specialist domains separately.</li>
+  <li>Quality classifiers overfit to benchmark-like style; gains partly contamination.</li>
+  <li>LSH parameters put the S-curve in the wrong place; recall collapses silently.</li>
+  <li>Transitive dedup components merge unrelated documents.</li>
+  <li>PII regexes without validators destroy numbers; without NER they miss names.</li>
+  <li>Mixture weights not recomputed after re-filtering; small domains over-repeated.</li>
+  <li>Synthetic data narrows distributions; model collapse.</li>
+  <li>Paraphrased benchmark contamination not caught by n-grams.</li>
+  <li>Unverified shards allow poisoning or silent corruption.</li>
+</ul>
+
+<h2>Evaluation</h2>
+<ul>
+  <li>Per stage: keep rate, removal reasons histogram, and human-reviewed precision/recall on stratified samples.</li>
+  <li>Dedup: precision/recall against exact Jaccard on a sampled pair set; component size distribution.</li>
+  <li>PII: recall per type and locale with confidence intervals.</li>
+  <li>End to end: proxy-model ablations with fixed token budgets and several seeds.</li>
+  <li>Contamination: fraction of benchmark items contaminated; clean vs contaminated score gap.</li>
+</ul>
+
+<h2>Practical Project</h2>
+<div class="frame exercise">
+  <ul>
+    <li>Take one WARC file (about 1 GB compressed) from a recent Common Crawl snapshot.</li>
+    <li>Run the <code>forge.data</code> pipeline: extract, LID, heuristics, MinHash dedup, PII scrub, contamination check against two public benchmarks.</li>
+    <li>Emit manifests for every stage and a generated data card with token counts and removal rates.</li>
+    <li>Replace your MinHash with <code>datasketch</code> and confirm the candidate sets agree to within sampling error.</li>
+    <li>Hand-label 200 removed documents per stage and report per-stage precision.</li>
+  </ul>
+</div>
+
+<h2>Exercises</h2>
+<ol>
+  <li>Derive the threshold approximation <span class="math">s^* \approx (1/b)^{1/r}</span> from the banding probability.</li>
+  <li>Choose <span class="math">b, r</span> with <span class="math">br \le 128</span> so that pairs with <span class="math">J=0.8</span> are caught with probability ≥ 0.99 and pairs with <span class="math">J=0.5</span> with probability ≤ 0.05.</li>
+  <li>Add a context rule to the extractor so headings between content blocks are kept. Measure the change on 20 hand-labelled pages.</li>
+  <li>Add IBAN detection with the mod-97 checksum to the PII scrubber.</li>
+  <li>Extend the collapse simulator to accumulate (not replace) real data each generation and compare support curves.</li>
+  <li>Replace n-gram contamination with MinHash similarity between benchmark items and documents. What does it catch that 8-grams do not?</li>
+  <li>Compute epochs per domain for <span class="math">T \in \{1,2,3,5\}</span> and pick the largest <span class="math">T</span> with no domain above four epochs.</li>
+</ol>
+
+<h2>Research Papers</h2>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">Deduplicating Training Data Makes Language Models Better</span>
+    <span class="paper-meta">Lee et al., 2022 · ACL</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Web corpora contain extensive exact and near duplication.</dd>
+    <dt>Previous limitation</dt><dd>Document-level exact dedup only; effects on memorisation unmeasured.</dd>
+    <dt>Approach</dt><dd>Suffix-array exact-substring dedup and MinHash near-dedup on C4 and others.</dd>
+    <dt>Contribution</dt><dd>Showed large duplicate fractions and train–test overlap; tooling released.</dd>
+    <dt>Practical impact</dt><dd>Dedup became a standard stage in every major pipeline.</dd>
+    <dt>Limitations</dt><dd>Evaluated at modest model scales; does not address semantic duplicates.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale</span>
+    <span class="paper-meta">Penedo et al., 2024 · NeurIPS Datasets and Benchmarks</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Open web datasets lagged proprietary ones; pipeline choices were undocumented.</dd>
+    <dt>Previous limitation</dt><dd>Few ablations per design decision.</dd>
+    <dt>Approach</dt><dd>Ablation-driven pipeline over 96 CC snapshots; LLM-annotated educational classifier.</dd>
+    <dt>Contribution</dt><dd>FineWeb and FineWeb-Edu, DataTrove code and ablation results.</dd>
+    <dt>Practical impact</dt><dd>Popularised LLM-annotated quality filtering.</dd>
+    <dt>Limitations</dt><dd>English-centric; filters tuned to specific benchmarks.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">DataComp-LM: In Search of the Next Generation of Training Sets for Language Models</span>
+    <span class="paper-meta">Li et al., 2024</span></div>
+  <dl>
+    <dt>Problem</dt><dd>Data curation methods were compared under inconsistent training setups.</dd>
+    <dt>Previous limitation</dt><dd>No controlled benchmark for data, only for models.</dd>
+    <dt>Approach</dt><dd>Fixed training recipes at several scales; participants vary only the data from a common pool.</dd>
+    <dt>Contribution</dt><dd>Shows model-based filtering (fastText classifier) is a key ingredient; DCLM-Baseline.</dd>
+    <dt>Practical impact</dt><dd>Made data curation an empirical benchmark discipline.</dd>
+    <dt>Limitations</dt><dd>Benchmark-driven filtering risks optimising to the evaluation suite.</dd>
+  </dl>
+</section>
+<section class="paper-card">
+  <div class="paper-head"><span class="paper-tag">RESEARCH PAPER</span>
+    <span class="paper-title">AI Models Collapse When Trained on Recursively Generated Data</span>
+    <span class="paper-meta">Shumailov et al., 2024 · Nature</span></div>
+  <dl>
+    <dt>Problem</dt><dd>What happens as generated content feeds future training.</dd>
+    <dt>Previous limitation</dt><dd>Anecdotal concern without a mechanism.</dd>
+    <dt>Approach</dt><dd>Theory on simple models plus experiments with language models and VAEs over generations.</dd>
+    <dt>Contribution</dt><dd>Tails vanish first; errors compound across generations.</dd>
+    <dt>Practical impact</dt><dd>Provenance and real-data retention became explicit concerns.</dd>
+    <dt>Limitations</dt><dd>Replacement setting; accumulation of real data mitigates much of the effect.</dd>
+  </dl>
+</section>
+<p>Also read: Rae et al. 2021 (Gopher/MassiveText); Raffel et al. 2020 (T5/C4); Gao et al. 2020 (The Pile); Penedo et al. 2023 (RefinedWeb); Soldaini et al. 2024 (Dolma); Wenzek et al. 2019 (CCNet); Broder 1997 (MinHash); Xie et al. 2023 (DoReMi); Gunasekar et al. 2023 (Textbooks Are All You Need); Shumailov et al. 2024 (model collapse, card above); Carlini et al. 2021 (training-data extraction); Carlini et al. 2024 (poisoning web-scale datasets); Longpre et al. 2023 (A Pretrainer's Guide to Training Data); Muennighoff et al. 2023 (data-constrained scaling); Gebru et al. 2021 (Datasheets).</p>
+
+<h2>Interview Questions</h2>
+<ol>
+  <li>Why does data quality matter more at fixed compute than at fixed data?</li>
+  <li>Why extract from WARC instead of using WET? What does it cost?</li>
+  <li>Explain each Gopher rule and one class of good documents it wrongly removes.</li>
+  <li>Compare perplexity filtering with classifier filtering. What bias does each introduce?</li>
+  <li>Prove that MinHash collision probability equals Jaccard similarity.</li>
+  <li>Given 128 hashes, how do you choose bands and rows for a 0.8 threshold?</li>
+  <li>How would you run MinHash dedup on 10 billion documents in Spark? Where is the shuffle?</li>
+  <li>Why validate card numbers with Luhn? When should you drop rather than redact?</li>
+  <li>Derive epochs per domain under temperature sampling. What goes wrong at high temperature?</li>
+  <li>What is model collapse and how do you mitigate it in a pipeline?</li>
+  <li>How do you detect paraphrased benchmark contamination?</li>
+  <li>A user requests deletion of their page. Walk through what your lineage system must do.</li>
+</ol>
+
+<h2>Next Volume</h2>
+<p>Volume 6, LLM Pretraining and Distributed Training, consumes the mixtures built here: scaling laws
+decide how many tokens you need, and parallelism and checkpointing decide how to push them through a
+cluster. The manifests and resumable samplers from this volume are the contract between data and
+training runs.</p>
+<p class="facet">Prerequisites from this volume</p>
+<ul>
+  <li>Versioned, content-addressed datasets (Chapter 11).</li>
+  <li>Mixture sampling and epoch accounting (Chapter 8).</li>
+  <li>Decontamination against evaluation sets (Chapter 10).</li>
+</ul>
+</section>
+
+</body>
+</html>
