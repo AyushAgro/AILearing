@@ -5,6 +5,8 @@ import { getCatalog } from "@/lib/content";
 
 type Params = { module: string };
 
+export const dynamicParams = false;
+
 export function generateStaticParams() {
   return getCatalog().modules.map((mod) => ({ module: mod.slug }));
 }

@@ -7,6 +7,8 @@ import type { ModuleMeta } from "@/lib/types";
 type Params = { module: string; page: string };
 type Flat = NonNullable<ReturnType<typeof getPageContext>>["prev"];
 
+export const dynamicParams = false;
+
 export function generateStaticParams() {
   return getModules().flatMap((mod) => mod.pages.map((page) => ({ module: mod.slug, page: page.slug })));
 }
